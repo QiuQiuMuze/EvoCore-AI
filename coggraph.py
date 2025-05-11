@@ -7,7 +7,8 @@ from env import GridEnvironment
 import torch.nn.functional as F
 import numpy as np
 import logging
-from collections import deque
+from collections import deque, Counter
+
 
 class LimitedDebugHandler(logging.Handler):
     def __init__(self, capacity=100):
@@ -96,6 +97,11 @@ class CogGraph:
     - 调度每一轮所有 CogUnit 的更新、分裂、死亡，并传递输出
     """
     def __init__(self):
+        self.debug = False
+        self.reverse_connections = {}  # to_id -> set(from_ids)
+        self.sensor_count = 0
+        self.processor_count = 0
+        self.emitter_count = 0
         self.energy_pool = 0.0  # 中央能量池
         # self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
         self.env_size = 5  # 初始环境 5x5
@@ -110,11 +116,44 @@ class CogGraph:
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
 
+    def _update_global_counts(self):
+        total = len(self.units)
+        self.sensor_count    = sum(1 for u in self.units if u.get_role()=="sensor")
+        self.processor_count = sum(1 for u in self.units if u.get_role()=="processor")
+        self.emitter_count   = sum(1 for u in self.units if u.get_role()=="emitter")
+        for u in self.units:
+            u.global_sensor_count    = self.sensor_count
+            u.global_processor_count = self.processor_count
+            u.global_emitter_count   = self.emitter_count
+            u.global_unit_count      = total
+
+    def _log_stats_and_conns(self):
+        """集中打印一次统计 & 连接强度，避免散落在内层循环里重复计算"""
+        # 只有在 debug 模式下才输出
+        if not self.debug:
+            return
+        # 每 50 步 或者前 10 步才打印
+        if self.current_step % 50 != 0 and self.current_step >= 10:
+            return
+
+        # 快速算一次
+        s = sum(1 for u in self.units if u.get_role()=="sensor")
+        p = sum(1 for u in self.units if u.get_role()=="processor")
+        e = sum(1 for u in self.units if u.get_role()=="emitter")
+        logger.info(f"[统计] step={self.current_step} | sensor:{s}, processor:{p}, emitter:{e}")
+
+        # 再把所有连接强度 dump 一遍
+        logger.debug("[连接强度]")
+        for frm, to_dict in self.connections.items():
+            for to, strg in to_dict.items():
+                logger.debug(f"  {frm} → {to} = {strg:.3f}")
+
     def add_unit(self, unit: CogUnit):
         # 将单元加入图结构中
         self.units.append(unit)
         self.unit_map[unit.id] = unit
         self.connections[unit.id] = {}
+        self._update_global_counts()
 
     def _get_min_target_counts(self):
         """
@@ -172,6 +211,15 @@ class CogGraph:
         for k in self.connections:
             if unit.id in self.connections[k]:
                 del self.connections[k][unit.id]
+                self.reverse_connections.get(unit.id, set()).discard(k)
+        self._update_global_counts()
+
+        # 把这个被删单元当成“from”的所有反向索引都清理掉
+        for to_id, from_set in self.reverse_connections.items():
+            if unit.id in from_set:
+                from_set.discard(unit.id)
+        # 然后再把自己那条 key 删掉
+        self.reverse_connections.pop(unit.id, None)
 
     def connect(self, from_unit: CogUnit, to_unit: CogUnit):
         # 仅允许合法结构连接
@@ -200,12 +248,16 @@ class CogGraph:
                 key=lambda uid: self.connections[from_unit.id][uid]
             )
             del self.connections[from_unit.id][weakest_id]
+            self.reverse_connections.get(weakest_id, set()).discard(from_unit.id)
+
             logger.debug(f"[连接替换] {from_unit.id} 移除最弱连接 {weakest_id}")
 
         # 建立新连接，初始权重为 1.0
         self.connections[from_unit.id][to_unit.id] = 1.0
         strength = self.connections[from_unit.id][to_unit.id]
         logger.debug(f"[连接建立] {from_unit.id} → {to_unit.id} (strength={strength:.2f})")
+        # 同步维护反向索引
+        self.reverse_connections.setdefault(to_unit.id, set()).add(from_unit.id)
 
     def total_energy(self):
         return sum(unit.energy for unit in self.units if unit.age < 240)
@@ -328,6 +380,7 @@ class CogGraph:
 
         for u in new_units:
             self.add_unit(u)
+        self._update_global_counts()
 
     def restructure_common_subgraphs(self):
         """
@@ -437,7 +490,9 @@ class CogGraph:
                     self.remove_unit(e1)
                     self.remove_unit(e2)
 
-                    return  # 每轮只重构一组，避免冲突
+                    # 重构后更新全局计数
+                    self._update_global_counts()
+                    return  # 每轮只重构一组…
 
     def assign_subsystems(self, min_size=3, max_size=10):
         """
@@ -505,6 +560,7 @@ class CogGraph:
             from_unit, to_unit = conn
             if to_unit in self.connections.get(from_unit, {}):
                 del self.connections[from_unit][to_unit]  # ✅ 删除 dict 的 key
+                self.reverse_connections.get(to_unit, set()).discard(from_unit.id)
 
             logger.debug(f"[剪枝] 连接 {from_unit} → {to_unit} 被剪掉")
             # 也删掉 usage记录
@@ -684,6 +740,7 @@ class CogGraph:
                 if tgt: self.connect(unit, tgt)
 
             conv_done += 1
+            self._update_global_counts()
 
 
     def trace_info_paths(self):
@@ -732,6 +789,9 @@ class CogGraph:
                 del pool[:half]
 
     def step(self, input_tensor: torch.Tensor):
+        env_state = torch.from_numpy(self.env.get_state()).float().unsqueeze(0)
+        goal_tensor = self.task.encode_goal(self.env_size).unsqueeze(0)
+
         if self.current_step == 10000:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
@@ -901,16 +961,8 @@ class CogGraph:
                 u.age = 0  # ← 关键：清零年龄，让它从头开始，避免进入老化死亡窗口
 
 
-        # 计算当前各角色单元总数，供紧急增殖判断使用
-        sensor_count = sum(1 for u in self.units if u.get_role() == "sensor")
-        processor_count = sum(1 for u in self.units if u.get_role() == "processor")
-        emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
-        for unit in self.units:
-            unit.global_sensor_count = sensor_count
-            unit.global_processor_count = processor_count
-            unit.global_emitter_count = emitter_count
-        for unit in self.units:
-            unit.global_unit_count = len(self.units)
+        # （此处删除上面那整块计数与赋值，Step 里不再更新全局计数）
+
 
         new_units = []  # 新生成的单元（复制）
         pending = {"sensor": [], "processor": [], "emitter": []}  # NEW: 待复制父单元
@@ -928,23 +980,28 @@ class CogGraph:
 
 
         for unit in self.units[:]:
-            env_state = torch.from_numpy(self.env.get_state()).float()
-            goal_tensor = self.task.encode_goal(self.env_size)
-            unit_input = torch.cat([env_state, goal_tensor], dim=0).unsqueeze(0)
+
+            unit_input = torch.cat([env_state, goal_tensor], dim=1)
 
             # 如果该单元有上游连接（被其他单元指向）
-            incoming = [uid for uid in self.unit_map if unit.id in self.connections.get(uid, {})]
-            for uid in list(self.unit_map):
-                if unit.id in self.connections.get(uid, {}):  # dict not list
+            # O(1) 反向查找所有调用过我的
+            # 1. 把 reverse_connections 里 stale 的 uid 丢掉，剩下才是真正有效的 incoming
+            raw = list(self.reverse_connections.get(unit.id, set()))
+            incoming = []
+            for uid in raw:
+                # 先检查：uid 还在 unit_map 里？uid→unit.id 这条连边还真在 connections 里？
+                if uid in self.unit_map and unit.id in self.connections.get(uid, {}):
+                    incoming.append(uid)
+                    # 更新 usage & strength
                     self.connection_usage[(uid, unit.id)] = self.current_step
-
-                    self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)  # 上限
+                    self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
+                else:
+                    # 要么单元被删了，要么连边被剪了 —— 顺便清理反向索引
+                    self.reverse_connections[unit.id].discard(uid)
 
             if unit.get_role() == "sensor":
-                env_state = torch.from_numpy(self.env.get_state()).float()
-                goal_tensor = self.task.encode_goal(self.env_size)
-                sensor_input = torch.cat([env_state, goal_tensor], dim=0)
-                unit_input = sensor_input.unsqueeze(0)
+                # 同样使用 dim=1 拼接，再加一个 batch 维度
+                unit_input = torch.cat([env_state, goal_tensor], dim=1)
 
             elif incoming:
                 weighted_outputs = []
@@ -972,8 +1029,9 @@ class CogGraph:
 
             # 执行单元的更新逻辑
             # === 统计调用频率（这里可以更精细，比如 sliding window）===
-            incoming = [uid for uid in self.unit_map if unit.id in self.connections.get(uid, {})]
-            unit.recent_calls = len(incoming)  # 表示这个单元在这一步被多少上游调用
+            # O(1) 查 self.reverse_connections
+            incoming = self.reverse_connections.get(unit.id, ())
+            unit.recent_calls = len(incoming)
             unit.connection_count = len(self.connections.get(unit.id, {}))  # 直接下游连接数量
             # 更新调用历史记录
             unit.call_history.append(unit.recent_calls)
@@ -1054,6 +1112,8 @@ class CogGraph:
                     last_used = self.connection_usage.get((from_id, to_id), -1)
                     if self.current_step - last_used > threshold:
                         del self.connections[from_id][to_id]  # ✅ 正确删除方式
+                        self.reverse_connections.get(to_id, set()).discard(from_id)
+
                         logger.debug(f"[死连接清除] {from_id} → {to_id}")
                         # 删除连接后，给 from_unit 轻微能量惩罚
                         if from_id in self.unit_map:
@@ -1065,6 +1125,7 @@ class CogGraph:
                         self.connections[from_id][to_id] *= 0.95
                         if self.connections[from_id][to_id] < 0.1:
                             del self.connections[from_id][to_id]
+                            self.reverse_connections.get(to_id, set()).discard(from_id)
                             logger.debug(f"[连接衰减清除] {from_id} → {to_id}")
 
         # 简易任务奖励：如果 emitter 输出靠近某个目标向量，则发放奖励
@@ -1121,28 +1182,18 @@ class CogGraph:
                         elif unit.get_role() == "processor":
                             unit.energy += 0.06  # 给 processor 更多能量，鼓励参与
 
+        # === 重度维护：只在部分步数执行，避免每步循环开销 ===
+        # —— 定期合并 & 重构（核心算法，必须保留） ——
+        if self.current_step % 100 == 0:
+            self.merge_redundant_units()
+            self.restructure_common_subgraphs()
 
-        self.trace_info_paths()
-        # ✅ 执行结构冗余合并
-        self.merge_redundant_units()
-        self.restructure_common_subgraphs()
+        # —— 可选路径追踪（纯调试，不影响状态） ——
+        if self.debug and self.current_step % 50 == 0:
+            self.trace_info_paths()
 
-        # ✅ 打印当前各类型细胞数量
-        from collections import Counter
-        role_counts = Counter([unit.get_role() for unit in self.units])
-        logger.debug("[细胞统计] 当前各类数量：", dict(role_counts))
-
-        logger.debug("[连接强度]")
-        for from_id, to_dict in self.connections.items():
-            for to_id, strength in to_dict.items():
-                logger.debug(f"  {from_id} → {to_id} = {strength:.3f}")
-                # 统计各类单元数量
-                sensor_count = sum(1 for u in self.units if u.get_role() == "sensor")
-                processor_count = sum(1 for u in self.units if u.get_role() == "processor")
-                emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
-                if self.current_step % 50 == 0 or self.current_step < 10:
-                    logger.info(
-                        f"[统计] step={self.current_step} | sensor: {sensor_count}, processor: {processor_count}, emitter: {emitter_count}")
+        # —— 统一统计 & 连接打印（仅 debug） ——
+        self._log_stats_and_conns()
 
         self.rebalance_cell_types()
 
