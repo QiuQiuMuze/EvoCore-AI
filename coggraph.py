@@ -6,7 +6,15 @@ import random
 from env import GridEnvironment
 import torch.nn.functional as F
 
+
+
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
+N_STATE_CHANNELS = 3
+N_GOAL_CHANNELS = 1
+INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
+
+
+
 
 
 class TaskInjector:
@@ -30,6 +38,18 @@ class TaskInjector:
         return (x, y) == self.target_position
 
 
+
+# 理想比例  emitter : processor : sensor = 1 : 2 : 1
+IDEAL_RATIO = {"emitter": 1, "processor": 2, "sensor": 1}
+DENOM = sum(IDEAL_RATIO.values())      # =4
+
+# 每轮允许转换的最高比例（15%）
+MAX_CONV_FRAC = 0.15
+
+# Δ 容差系数：需要至少 diff ≥ ceil(TOL_FRAC*total) 才触发
+TOL_FRAC = 0.05      # 小规模时自动退化成 1
+
+
 class CogGraph:
     """
     CogGraph 管理所有 CogUnit 的集合和连接关系：
@@ -38,12 +58,14 @@ class CogGraph:
     - 调度每一轮所有 CogUnit 的更新、分裂、死亡，并传递输出
     """
     def __init__(self):
+
+        self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
         self.env_size = 5  # 初始环境 5x5
         self.env = GridEnvironment(size=self.env_size)  # 创建环境
         self.task = TaskInjector(target_position=(self.env_size - 1, self.env_size - 1))  # 初始目标点
         self.target_vector = self.task.encode_goal(self.env_size)  # 初始目标向量
-        self.max_total_energy = 200  # 初始最大总能量
-        self.target_vector = torch.ones(50)
+        self.max_total_energy = 300  # 初始最大总能量
+        self.target_vector = self.task.encode_goal(self.env_size)
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
@@ -57,6 +79,19 @@ class CogGraph:
         self.connections[unit.id] = {}
 
     def remove_unit(self, unit: CogUnit):
+
+        if unit.id not in self.unit_map:
+            return  # 已经被删除
+        if hasattr(self, "memory_pool") and unit.age > 30:
+            self.memory_pool.append({
+                "gene": unit.gene.copy(),
+                "output": unit.last_output.clone(),
+                "role": unit.role,
+                "hidden_size": unit.hidden_size
+            })
+
+            print(f"[记忆池] {unit.id} 死亡，遗产记录已保存（共 {len(self.memory_pool)} 条）")
+
         # 从图中移除单元及其连接
         self.units = [u for u in self.units if u.id != unit.id]
         if unit.id in self.connections:
@@ -66,6 +101,11 @@ class CogGraph:
         for k in self.connections:
             if unit.id in self.connections[k]:
                 del self.connections[k][unit.id]
+
+        # 🪢 限制记忆池大小
+        if len(self.memory_pool) > 200:
+            removed = self.memory_pool.pop(0)
+            print(f"[记忆池维护] 超出容量，移除最旧遗产（role={removed['role']}）")
 
     def connect(self, from_unit: CogUnit, to_unit: CogUnit):
         if from_unit.id not in self.connections:
@@ -90,6 +130,38 @@ class CogGraph:
 
     def total_energy(self):
         return sum(unit.energy for unit in self.units)
+
+    # ========== 维度适配辅助 ==========
+    def _goal_dim(self) -> int:
+        """返回当前目标向量长度 (= env_size²)"""
+        return self.env_size * self.env_size
+
+    def _align_to_goal_dim(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        把任意长度的向量对齐到 env_size²：
+        - 如果恰好相等 → 原样
+        - 如果能整除 → reshape(k, goal_dim) 后求均值 → goal_dim
+          （默认 4 通道时相当于把 4 个通道压缩成 1 通道）
+        - 如果更长但无法整除 → 截断到前 goal_dim
+        - 如果更短 → 右侧补零
+        """
+        goal_dim = self._goal_dim()
+        length = tensor.shape[-1]
+
+        if length == goal_dim:
+            return tensor
+
+        if length % goal_dim == 0:
+            k = length // goal_dim
+            return tensor.reshape(-1, k, goal_dim).mean(dim=1).squeeze(0)
+
+        if length > goal_dim:            # 截断
+            return tensor[..., :goal_dim]
+
+        # length < goal_dim  → 右补零
+        pad = (0, goal_dim - length)
+        return torch.nn.functional.pad(tensor, pad)
+
 
     def merge_redundant_units(self):
         merged_pairs = set()
@@ -216,7 +288,7 @@ class CogGraph:
                 out2 = p2.get_output()
 
                 # 🔥 自动补零到当前环境 target_dim
-                target_dim = self.env_size * self.env_size * 2
+                target_dim = self.env_size * self.env_size * INPUT_CHANNELS
 
                 if out1.shape[-1] < target_dim:
                     padding = (0, target_dim - out1.shape[-1])
@@ -228,20 +300,30 @@ class CogGraph:
 
                 sim_p = F.cosine_similarity(out1, out2, dim=-1).item()
 
+                # 统一计算 processor 输出与 emitter 输出的相似性，确保维度一致
+                out1 = p1.get_output()
+                out2 = p2.get_output()
                 out_e1 = e1.get_output()
                 out_e2 = e2.get_output()
 
-                # 🔥 补零到当前环境预期尺寸
-                target_dim = self.env_size * self.env_size * 2
+                max_dim = max(
+                    out1.shape[-1], out2.shape[-1],
+                    out_e1.shape[-1], out_e2.shape[-1],
+                    self.env_size * self.env_size * INPUT_CHANNELS
+                )
 
-                if out_e1.shape[-1] < target_dim:
-                    padding = (0, target_dim - out_e1.shape[-1])
-                    out_e1 = F.pad(out_e1, padding, value=0)
+                def pad_to(tensor, target_dim):
+                    if tensor.shape[-1] < target_dim:
+                        padding = (0, target_dim - tensor.shape[-1])
+                        return F.pad(tensor, padding, value=0)
+                    return tensor
 
-                if out_e2.shape[-1] < target_dim:
-                    padding = (0, target_dim - out_e2.shape[-1])
-                    out_e2 = F.pad(out_e2, padding, value=0)
+                out1 = pad_to(out1, max_dim)
+                out2 = pad_to(out2, max_dim)
+                out_e1 = pad_to(out_e1, max_dim)
+                out_e2 = pad_to(out_e2, max_dim)
 
+                sim_p = F.cosine_similarity(out1, out2, dim=-1).item()
                 sim_e = F.cosine_similarity(out_e1, out_e2, dim=-1).item()
 
                 if sim_p > 0.95 and sim_e > 0.95:
@@ -265,7 +347,7 @@ class CogGraph:
                     self.connect(new_p, new_e)
 
                     # 将所有连接到 p1 / p2 的上游指向 new_p
-                    for uid in self.unit_map:
+                    for uid in list(self.unit_map):
                         if p1.id in self.connections.get(uid, {}) or p2.id in self.connections.get(uid, {}):
                             self.connect(self.unit_map[uid], new_p)
 
@@ -311,8 +393,11 @@ class CogGraph:
             if depth > max_depth or unit in cluster:
                 continue
             cluster.add(unit)
-            for neighbor in self.connections.get(unit, []):
-                stack.append((neighbor, depth + 1))
+            for neighbor_id in self.connections.get(unit.id, {}):
+                neighbor = self.unit_map.get(neighbor_id)
+                if neighbor:
+                    stack.append((neighbor, depth + 1))
+
         return list(cluster)
 
     def prune_connections(self, prune_ratio=0.2, strengthen_ratio=1.5):
@@ -339,8 +424,9 @@ class CogGraph:
         # 剪掉低效连接
         for conn in to_prune:
             from_unit, to_unit = conn
-            if to_unit in self.connections.get(from_unit, []):
-                self.connections[from_unit].remove(to_unit)
+            if to_unit in self.connections.get(from_unit, {}):
+                del self.connections[from_unit][to_unit]  # ✅ 删除 dict 的 key
+
             print(f"[剪枝] 连接 {from_unit} → {to_unit} 被剪掉")
             # 也删掉 usage记录
             if conn in self.connection_usage:
@@ -388,7 +474,6 @@ class CogGraph:
                     candidates.sort(key=connection_strength, reverse=True)
 
                     target = candidates[0]  # 能量最高者
-                    self.connect(unit, target)
                     if target.id not in current_connections:
                         self.connect(unit, target)
                         print(f"[新连接] {unit.id} → {target.id}")
@@ -406,68 +491,107 @@ class CogGraph:
                     print(f"[突变连接] {from_unit.id} → {to_unit.id}")
 
 
-
     # === 分化机制：结构失衡时的角色调整 ===
     def rebalance_cell_types(self):
         from collections import Counter
-        role_counts = Counter([unit.get_role() for unit in self.units])
+        total = len(self.units)
+        if total < 15:
+            return  # 太小先自由生长
 
-        sensor_count = role_counts.get("sensor", 0)
-        processor_count = role_counts.get("processor", 0)
-        emitter_count = role_counts.get("emitter", 0)
+        # 动态迟滞窗口  ──────────────────────────
+        #   总数   <50   <200   <500   500+
+        #   hi    1.50  1.30   1.15   1.08
+        #   lo    0.50  0.70   0.85   0.92
+        if total < 50:
+            hi, lo = 1.50, 0.50
+        elif total < 200:
+            hi, lo = 1.30, 0.70
+        elif total < 500:
+            hi, lo = 1.15, 0.85
+        else:
+            hi, lo = 1.10, 0.90
 
-        total = sensor_count + processor_count + emitter_count
-        if total < 5:
-            return  # 系统太小，不进行调控
+        # Δ 容差（至少相差 Δ_cell 才算“真的多／少”）
+        delta_cell = max(1, int(total * TOL_FRAC))
+
+        # 本轮最多转换
+        max_conv = max(1, int(total * MAX_CONV_FRAC))
+        conv_done = 0
 
         def pick_weakest(units):
-            return min(units, key=lambda u: (u.energy, getattr(u, "avg_recent_calls", 0.0)))
+            return min(units, key=lambda u: (u.energy,
+                                             getattr(u, "avg_recent_calls", 0.0)))
 
-        # 🧠 1️⃣ 如果 processor 太多，分化为 sensor 或 emitter（谁少就分化成谁）
-        if (processor_count > sensor_count * 2.5 or processor_count > emitter_count * 2.5):
-            candidates = [u for u in self.units if u.get_role() == "processor"]
-            if not candidates:
-                return
-            target = pick_weakest(candidates)
+        while conv_done < max_conv:
+            # ── 重新计数
+            cnt = Counter(u.get_role() for u in self.units)
+            s_cnt = cnt.get("sensor", 0)
+            p_cnt = cnt.get("processor", 0)
+            e_cnt = cnt.get("emitter", 0)
 
-            if sensor_count < emitter_count:
-                print(f"[分化] processor {target.id} → sensor（平衡）")
-                target.role = "sensor"
-                target.gene["sensor_bias"] = 1.0
-            else:
-                print(f"[分化] processor {target.id} → emitter（平衡）")
-                target.role = "emitter"
-                target.gene["emitter_bias"] = 1.0
+            desired = {
+                "sensor": total * IDEAL_RATIO["sensor"] / DENOM,
+                "processor": total * IDEAL_RATIO["processor"] / DENOM,
+                "emitter": total * IDEAL_RATIO["emitter"] / DENOM,
+            }
 
-            target.age = 0
-            target.energy += 0.2
-            return
+            # ratio & diff
+            ratio = {
+                "sensor": s_cnt / (desired["sensor"] or 1),
+                "processor": p_cnt / (desired["processor"] or 1),
+                "emitter": e_cnt / (desired["emitter"] or 1),
+            }
+            diff = {
+                "sensor": s_cnt - desired["sensor"],
+                "processor": p_cnt - desired["processor"],
+                "emitter": e_cnt - desired["emitter"],
+            }
 
-        # 🧠 2️⃣ sensor 太多，分化为 emitter
-        if sensor_count > emitter_count * 1.5:
-            candidates = [u for u in self.units if u.get_role() == "sensor"]
-            if not candidates:
-                return
-            target = pick_weakest(candidates)
-            print(f"[分化] sensor {target.id} → emitter（平衡）")
-            target.role = "emitter"
-            target.gene["emitter_bias"] = 1.0
-            target.age = 0
-            target.energy += 0.2
-            return
+            # 1) 满足 ratio>hi 且 diff≥Δ 才算“over”   2) ratio<lo 且 diff≤-Δ 算“under”
+            overs = [r for r in ratio if ratio[r] > hi and diff[r] >= delta_cell]
+            unders = [r for r in ratio if ratio[r] < lo and diff[r] <= -delta_cell]
 
-        # 🧠 3️⃣ emitter 太多，分化为 sensor
-        if emitter_count > sensor_count * 1.5:
-            candidates = [u for u in self.units if u.get_role() == "emitter"]
-            if not candidates:
-                return
-            target = pick_weakest(candidates)
-            print(f"[分化] emitter {target.id} → sensor（平衡）")
-            target.role = "sensor"
-            target.gene["sensor_bias"] = 1.0
-            target.age = 0
-            target.energy += 0.2
-            return
+            if not overs or not unders:
+                break  # 落入迟滞带 or Δ 太小，结束
+
+            # 选最过量 & 最不足
+            giver_role = max(overs, key=lambda r: diff[r])  # diff 最大
+            receiver_role = min(unders, key=lambda r: diff[r])  # diff 最小(负数)
+
+            # 取 giver_role 最弱者
+            cand = [u for u in self.units if u.get_role() == giver_role]
+            if not cand:
+                break
+            unit = pick_weakest(cand)
+
+            # ── 转化
+            old = unit.get_role()
+            unit.role = receiver_role
+            unit.age = 0
+            unit.energy += 0.2
+            unit.gene[f"{receiver_role}_bias"] = 1.0
+            print(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
+
+            # 清旧连 & 简易新连
+            for uid, out_edges in list(self.connections.items()):
+                out_edges.pop(unit.id, None)
+                self.connection_usage.pop((uid, unit.id), None)
+            self.connections[unit.id] = {}
+
+            if receiver_role == "processor":
+                tgt = max((u for u in self.units if u.get_role() == "emitter"),
+                          default=None, key=lambda u: u.energy)
+                if tgt: self.connect(unit, tgt)
+            elif receiver_role == "emitter":
+                src = max((u for u in self.units if u.get_role() == "processor"),
+                          default=None, key=lambda u: u.energy)
+                if src: self.connect(src, unit)
+            elif receiver_role == "sensor":
+                tgt = max((u for u in self.units if u.get_role() == "processor"),
+                          default=None, key=lambda u: u.energy)
+                if tgt: self.connect(unit, tgt)
+
+            conv_done += 1
 
     def trace_info_paths(self):
         print(f"[信息路径追踪] 步数 {self.current_step}")
@@ -482,6 +606,24 @@ class CogGraph:
                 for sid in proc_from:
                     print(f"  sensor:{sid} → processor:{pid} → emitter:{emitter.id}")
 
+    def _select_clone_parents(self, pending_by_role):
+        """
+        从待复制父单元中，按照 10% 配额 & 能量/活跃度排序挑出真正允许复制的。
+        返回 List[CogUnit]
+        """
+        total_cells = len(self.units)
+        if total_cells <= 15:  # 小规模阶段不设限
+            return [u for lst in pending_by_role.values() for u in lst]
+
+        approved = []
+        for role, cand in pending_by_role.items():
+            if not cand:
+                continue
+            role_count = sum(1 for u in self.units if u.role == role)
+            cap = max(1, role_count // 15)  # 15 %，向下取整，至少 1
+            cand.sort(key=lambda u: (u.energy, u.avg_recent_calls), reverse=True)
+            approved.extend(cand[:cap])
+        return approved
 
     def step(self, input_tensor: torch.Tensor):
         if self.current_step == 10000:
@@ -499,7 +641,7 @@ class CogGraph:
                 tax = total_e * 0.01
                 loss_per_unit = tax / max(len(self.units), 1)
                 for unit in self.units:
-                    unit.energy -= loss_per_unit
+                    unit.energy -= loss_per_unit  # ✅ 实际扣能量
                 print(f"[能量税] 第 {self.current_step} 步，总能量过高，扣除 {tax:.2f} 能量")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
@@ -507,6 +649,8 @@ class CogGraph:
             old_size = self.env_size
             self.env_size = min(self.env_size + 5, 20)  # 每次+5，最大到20x20
             self.env = GridEnvironment(size=self.env_size)  # 重新生成环境
+            self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
+
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
             self.target_vector = self.task.encode_goal(self.env_size)
@@ -515,7 +659,7 @@ class CogGraph:
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             old_max = self.max_total_energy
-            self.max_total_energy *= 1.1
+            self.max_total_energy *= 2
             print(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
 
         # 若当前步数非常早期，给予基础能量补偿
@@ -523,7 +667,7 @@ class CogGraph:
             for unit in self.units:
                 if unit.get_role() != "sensor":
                     unit.energy += 0.1
-                    print(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.01")
+                    print(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             old_target = self.target_vector.clone()
@@ -557,6 +701,7 @@ class CogGraph:
 
         self.current_step += 1
 
+
         # 计算当前各角色单元总数，供紧急增殖判断使用
         sensor_count = sum(1 for u in self.units if u.get_role() == "sensor")
         processor_count = sum(1 for u in self.units if u.get_role() == "processor")
@@ -565,20 +710,12 @@ class CogGraph:
             unit.global_sensor_count = sensor_count
             unit.global_processor_count = processor_count
             unit.global_emitter_count = emitter_count
+        for unit in self.units:
+            unit.global_unit_count = len(self.units)
 
         new_units = []  # 新生成的单元（复制）
+        pending = {"sensor": [], "processor": [], "emitter": []}  # NEW: 待复制父单元
         output_buffer = {}  # 缓存每个单元的输出 {unit_id: output_tensor}
-
-        # ✅ 统计当前各角色单元数量
-        emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
-        processor_count = sum(1 for u in self.units if u.get_role() == "processor")
-        sensor_count = sum(1 for u in self.units if u.get_role() == "sensor")
-
-        # ✅ 写入到所有单元的属性里，供 should_split() 使用
-        for unit in self.units:
-            unit.global_emitter_count = emitter_count
-            unit.global_processor_count = processor_count
-            unit.global_sensor_count = sensor_count
 
         # === 系统总能量限制，保护 clone ===
         allow_clone = self.total_energy() < self.max_total_energy
@@ -590,18 +727,18 @@ class CogGraph:
         for unit in self.units:
             unit.global_emitter_count = emitter_count
 
+
         for unit in self.units[:]:
             env_state = torch.from_numpy(self.env.get_state()).float()
             goal_tensor = self.task.encode_goal(self.env_size)
             unit_input = torch.cat([env_state, goal_tensor], dim=0).unsqueeze(0)
 
             # 如果该单元有上游连接（被其他单元指向）
-            incoming = [uid for uid in self.unit_map if unit.id in self.connections.get(uid, [])]
-            for uid in incoming:
-                self.connection_usage[(uid, unit.id)] = self.current_step
-                # 增强强度
-                for uid in incoming:
-                    self.connections[uid][unit.id] *= 1.05  # 增强 5%
+            incoming = [uid for uid in self.unit_map if unit.id in self.connections.get(uid, {})]
+            for uid in list(self.unit_map):
+                if unit.id in self.connections.get(uid, {}):  # dict not list
+                    self.connection_usage[(uid, unit.id)] = self.current_step
+
                     self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)  # 上限
 
             if unit.get_role() == "sensor":
@@ -616,9 +753,10 @@ class CogGraph:
                 for uid in incoming:
                     strength = self.connections[uid][unit.id]
                     output = self.unit_map[uid].get_output().squeeze(0)  # 统一为 [8]
-                    if output.shape[0] != self.env_size * self.env_size * 2:
-                        # 如果输出维度小于当前环境预期，补零
-                        padding = (0, self.env_size * self.env_size * 2 - output.shape[0])
+                    target_len = self.env_size * self.env_size * INPUT_CHANNELS
+                    if output.shape[0] != target_len:
+                        padding = (0, target_len - output.shape[0])
+
                         output = torch.nn.functional.pad(output, padding, value=0)
 
                     weighted_outputs.append(output * strength)
@@ -629,7 +767,7 @@ class CogGraph:
                 else:
                     unit_input = torch.zeros_like(input_tensor).unsqueeze(0)
             else:
-                # 强制使用零输入触发更新，避免因无输入永远不更新
+            # 强制使用零输入触发更新，避免因无输入永远不更新
                 unit_input = torch.zeros(unit.input_size).unsqueeze(0)
                 print(f"[零输入] {unit.id} 无上游连接，使用零输入更新")
 
@@ -669,7 +807,7 @@ class CogGraph:
             elif unit.role == "emitter":
                 bias_factor = unit.gene.get("emitter_bias", 1.0)
 
-            decay = (var * 0.1 + call_density * 0.008 + conn_strength_sum * 0.004) * dim_scale * bias_factor
+            decay = (var * 0.1 + call_density * 0.005 + conn_strength_sum * 0.003) * dim_scale * bias_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)
@@ -688,34 +826,7 @@ class CogGraph:
 
             # === 判断是否需要复制 ===
             if allow_clone and unit.should_split():
-                # 检查环境是否扩展过，决定是否给新input_size
-                expected_input_size = self.env_size * self.env_size * 2
-                new_input_size = None
-                if unit.input_size != expected_input_size:
-                    new_input_size = expected_input_size
-
-                # 记录上下游连接
-                incoming_ids = [uid for uid in self.unit_map if unit.id in self.connections.get(uid, {})]
-                outgoing_ids = list(self.connections.get(unit.id, {}).keys())
-
-                # 克隆新细胞
-                child = unit.clone(new_input_size=new_input_size)
-                new_units.append(child)
-
-                # 父子连接
-                self.connect(unit, child)
-
-                # ✅ 克隆继承上游连接
-                for uid in incoming_ids:
-                    if uid in self.unit_map:
-                        self.connect(self.unit_map[uid], child)
-                        print(f"[连接继承] 上游 {uid} → 子单元 {child.id}")
-
-                # ✅ 克隆继承下游连接
-                for uid in outgoing_ids:
-                    if uid in self.unit_map:
-                        self.connect(child, self.unit_map[uid])
-                        print(f"[连接继承] 子单元 {child.id} → 下游 {uid}")
+                pending[unit.role].append(unit)   # 只记录父单元，不立即 clone
 
 
             else:
@@ -727,9 +838,6 @@ class CogGraph:
                 print(f"[死亡] {unit.id} 被移除")
                 self.remove_unit(unit)
 
-        # 将所有新生成的单元加入图结构
-        for unit in new_units:
-            self.add_unit(unit)
 
         self.auto_connect()
         # === 死连接清理 ===
@@ -745,6 +853,7 @@ class CogGraph:
                         if from_id in self.unit_map:
                             self.unit_map[from_id].energy -= 0.01  # 可调参数
                             print(f"[惩罚] {from_id} 因连接失效，能量 -0.01")
+
                     else:
                         # ✅ 削弱仍在用但表现差的连接
                         self.connections[from_id][to_id] *= 0.95
@@ -790,13 +899,14 @@ class CogGraph:
                     for unit in self.units:
                         if unit.get_role() == "emitter":
                             unit.energy += 0.02
+
                     print(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.02 能量")
 
             else:
                 print(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
 
-            if task.evaluate(env, outputs):
-                print(f"[任务完成] 达成目标位置 {task.target_position}，奖励 +0.1")
+            if self.task.evaluate(self.env, outputs):
+                print(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励 +0.1")
                 for unit in self.units:
                     if unit.get_role() == "processor":
                         unit.energy += 0.1
@@ -821,35 +931,97 @@ class CogGraph:
                 emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
                 print(f"[统计] sensor: {sensor_count}, processor: {processor_count}, emitter: {emitter_count}")
 
+
         self.rebalance_cell_types()
+        # === 10 %-限额复制（>15 细胞才触发） ===
+        selected_parents = self._select_clone_parents(pending)
+        for parent in selected_parents:
+            expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+
+            child = parent.clone(
+                new_input_size=expected_input if parent.input_size != expected_input else None
+            )
+            # 父子连接（含继承上下游）
+            self.connect(parent, child)
+            # 继承上游
+            for uid in list(self.unit_map):
+                if parent.id in self.connections.get(uid, {}):
+                    self.connect(self.unit_map[uid], child)
+            # 继承下游
+            for uid in self.connections.get(parent.id, {}):
+                if uid in self.unit_map:
+                    self.connect(child, self.unit_map[uid])
+            new_units.append(child)
+            # —— 最终一次性把所有 child 加入图结构 ——
+        for unit in new_units:
+            unit.memory_pool = self.memory_pool  # 自动注入遗传记忆池
+            self.add_unit(unit)
+
+
+
+    def upscale_old_units(self, new_input_size):
+        """将所有 input_size 小于当前环境预期尺寸的单元升维（只升不降）"""
+        for unit in self.units:
+            if unit.input_size < new_input_size:
+                print(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
+
+                # 保留旧输出部分，补零到新维度
+                old_output = unit.last_output
+                if old_output.dim() == 2 and old_output.shape[0] == 1:
+                    old_output = old_output.squeeze(0)
+
+                padded_output = torch.zeros(new_input_size)
+                padded_output[:old_output.shape[0]] = old_output
+                unit.last_output = padded_output
+
+                # 同理，state 也升维
+                if unit.state.shape[0] < new_input_size:
+                    padded_state = torch.zeros(new_input_size)
+                    old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
+                    padded_state[:old_state.shape[0]] = old_state
+                    unit.state = padded_state
+
+                # 重建网络结构（隐藏层维度不变）
+                unit.function = torch.nn.Sequential(
+                    torch.nn.Linear(new_input_size, unit.hidden_size),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(unit.hidden_size, new_input_size)
+                )
+
+                unit.input_size = new_input_size
 
     def summary(self):
         # 打印当前图结构概况
+
         print(f"[图结构] 当前单元数: {len(self.units)}")
         for unit in self.units:
             print(f" - {unit} → 连接数: {len(self.connections[unit.id])}")
 
     def collect_emitter_outputs(self):
-        outputs = []
+        """收集所有 emitter 输出并自动对齐到目标维度"""
+        aligned = []
         for unit in self.units:
-            if unit.get_role() == "emitter":
-                output = unit.get_output()
-                if output.shape[-1] == self.target_vector.shape[0]:
-                    if output.dim() == 1:
-                        output = output.unsqueeze(0)
-                    outputs.append(output)
+            if unit.get_role() != "emitter":
+                continue
 
-                else:
-                    print(
-                        f"[警告] emitter {unit.id} 输出维度 {output.shape[-1]} 与目标 {self.target_vector.shape[0]} 不匹配，忽略")
+            raw = unit.get_output().squeeze(0) if unit.get_output().dim() == 2 else unit.get_output()
+            vec = self._align_to_goal_dim(raw)
 
-        if outputs:
-            stacked = torch.stack(outputs)
-            print("[输出检查] Emitter 输出均值（前5维）:", stacked.mean(dim=0)[:5])
+            if vec.shape[-1] != self._goal_dim():
+                # 理论不会发生，安全检查
+                print(f"[警告] 对齐失败 {unit.id} 长度 {vec.shape[-1]}")
+                continue
+
+            aligned.append(vec.unsqueeze(0))
+
+        if aligned:
+            stacked = torch.cat(aligned, dim=0)      # [N, goal_dim]
+            print("[输出检查] Emitter 对齐后均值(前5) :", stacked.mean(dim=0)[:5])
             return stacked
         else:
             print("[输出检查] 当前没有活跃的 emitter 单元")
             return None
+
 
 
 def interpret_emitter_output(output_tensor):
@@ -861,9 +1033,11 @@ def interpret_emitter_output(output_tensor):
         output_tensor = output_tensor.squeeze(1)  # 变成 [N, 8]
 
     for i, out in enumerate(output_tensor):
-        action_index = torch.argmax(out).item()
-        action = action_names[action_index]
-        print(f"[行为触发] 第 {i+1} 个 emitter 执行动作: {action}")
+        raw_index = torch.argmax(out).item()
+        action_index = raw_index % 4  # 🌟 折叠到 0~3
+        action = ["上", "下", "左", "右"][action_index]  # 或者自定义动作名称
+        print(f"[行为触发] 第 {i + 1} 个 emitter 执行动作: {action}（原始 index = {raw_index}）")
+
 
 def environment_feedback(output_tensor, graph):
     """
@@ -891,17 +1065,20 @@ if __name__ == "__main__":
     graph = CogGraph()
 
     # 初始化单元
-    # 初始化单元
-    sensor = CogUnit(input_size=graph.env_size * graph.env_size * 2, role="sensor")
-    emitter = CogUnit(input_size=graph.env_size * graph.env_size * 2, role="emitter")
-    emitter.energy = 2.0
+    sensor = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+, role="sensor")
+    emitter = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+, role="emitter")
+
 
     # 多个 processor
     processor_list = []
-    for _ in range(5):
-        p = CogUnit(input_size=graph.env_size * graph.env_size * 2, role="processor")
-        p.energy = 2.0  # ✅ 直接给予启动资金
+    for _ in range(4):
+        p = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+, role="processor")
         processor_list.append(p)
+
+
 
     # 加入图结构
     graph.add_unit(sensor)
@@ -914,10 +1091,19 @@ if __name__ == "__main__":
         graph.connect(sensor, p)
         graph.connect(p, emitter)
 
-    # 运行模拟
-    for step in range(200):
-        print(f"\n==== 第 {step+1} 步 ====")
+    # --- 新增：额外种子 ---
+    extra_sensors = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
+                             role="sensor") for _ in range(1)]  # 再补 1 个
+    extra_emitters = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
+                              role="emitter") for _ in range(1)]  # 再补 1 个
+    for u in extra_sensors + extra_emitters:
+        graph.add_unit(u)
+        # 让每个 sensor → processor[0]，processor[-1] → 每个 emitter，保证信息通路
+        graph.connect(u, processor_list[0]) if u.role == "sensor" else graph.connect(processor_list[-1], u)
 
+    # 运行模拟
+    for step in range(500):
+        print(f"\n==== 第 {step+1} 步 ====")
         # 1️⃣ 获取环境状态，输入 sensor
         state = env.get_state()
         input_tensor = torch.cat([
@@ -931,7 +1117,8 @@ if __name__ == "__main__":
         # 3️⃣ 收集 emitter 输出，转换为动作
         emitter_output = graph.collect_emitter_outputs()
         if emitter_output is not None:
-            action_index = torch.argmax(emitter_output.mean(dim=0)).item()
+            raw_idx = torch.argmax(emitter_output.mean(dim=0)).item()
+            action_index = raw_idx % 4  # 折叠到 0-3
             print(f"[行动决策] 执行动作: {action_index}")
 
             # 4️⃣ 执行动作，改变环境
@@ -955,3 +1142,4 @@ from collections import Counter
 final_counts = Counter([unit.get_role() for unit in graph.units])
 print("\n🧬 最终细胞总数统计：", dict(final_counts))
 print("🔢 总细胞数 =", len(graph.units))
+

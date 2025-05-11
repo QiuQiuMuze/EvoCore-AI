@@ -3,6 +3,33 @@ import torch
 import uuid
 import random
 
+# === Split-Gate 动态阈值表（过量上限）===========================
+# 比例 k_es：Emitter <-> Sensor   ／  k_p： 相对 Processor/2
+SPLIT_HI_ES_TABLE = { 50: 1.40, 200: 1.25, 500: 1.15, float("inf"): 1.08 }
+SPLIT_HI_P_TABLE  = { 50: 1.25, 200: 1.15, 500: 1.10, float("inf"): 1.05 }
+
+TOL_FRAC_SPLIT = 0.05      # 至少差值 Δ≥ceil(total×5 %) （且 ≥1）
+# ===============================================================
+
+def _get_hi(table, total):
+    """按照总细胞数返回当前阶段的 hi 阈值"""
+    for lim, val in table.items():
+        if total < lim:
+            return val
+    return table[float("inf")]
+
+
+
+# ── 角色分裂最低能量阈值 以及 最低调用频率 ────────────
+ROLE_SPLIT_RULE = {
+    "sensor":    {"min_e": 1.2, "min_calls": 0},   # 轻量，几乎不限制调用频率
+    "processor": {"min_e": 1.6, "min_calls": 1},   # 中等
+    "emitter":   {"min_e": 2.2, "min_calls": 2},   # 最重，门槛最高
+}
+# ----------------------------------------------------
+
+
+
 class CogUnit:
     """
     CogUnit 是 EvoCore 的最小认知单元：
@@ -48,6 +75,9 @@ class CogUnit:
 
         self.last_output = torch.zeros(input_size)
 
+        if "mutation_rate" not in self.gene:
+            self.gene["mutation_rate"] = 0.05
+
     def get_position(self):
         return self.position
 
@@ -72,6 +102,7 @@ class CogUnit:
             for param in self.function.parameters():
                 if param.grad is not None:
                     param.copy_(param - lr * param.grad)
+
 
         print(f"[Mini-Learn] {self.id} loss={loss.item():.4f} (lr={lr})")
 
@@ -178,37 +209,67 @@ class CogUnit:
         return self.last_output
 
     def should_split(self):
+
+
         emitter_count = getattr(self, "global_emitter_count", 1)
         processor_count = getattr(self, "global_processor_count", 1)
         sensor_count = getattr(self, "global_sensor_count", 1)
+        total = getattr(self, "global_unit_count", 1)
 
         role = self.get_role()
 
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 1:
             print(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 0.3  # 💡 补给能量
+            self.energy += 1.5  # 💡 补给能量
             return True
 
         if role == "processor" and processor_count <= 1:
             print(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 1.0
+            self.energy += 1.5
             return True
 
         if role == "sensor" and sensor_count <= 1:
             print(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 0.3
+            self.energy += 1.5
             return True
 
+        # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
+        total = getattr(self, "global_unit_count", sensor_count + processor_count + emitter_count)
+
+        hi_es = _get_hi(SPLIT_HI_ES_TABLE, total)  # emitter <-> sensor
+        hi_p = _get_hi(SPLIT_HI_P_TABLE, total)  # 相对 processor/2
+        half_p = processor_count / 2
+
+        # 差值必须 ≥1 且 ≥ceil(total×TOL) 才算“真的多”
+        def _delta_enough(x, y):
+            delta = x - y
+            return delta >= max(1, int(total * TOL_FRAC_SPLIT))
+
+        overpop = False
         if role == "emitter":
-            if self.energy < 2.0 or self.avg_recent_calls < 2.0:
-                return False
+            if (_delta_enough(emitter_count, sensor_count * hi_es) or
+                    _delta_enough(emitter_count, half_p * hi_p)):
+                overpop = True
+        elif role == "sensor":
+            if (_delta_enough(sensor_count, emitter_count * hi_es) or
+                    _delta_enough(sensor_count, half_p * hi_p)):
+                overpop = True
+        elif role == "processor":
+            # processor 超标：其一半相对 e/s 也超标
+            if (_delta_enough(half_p, emitter_count * hi_p) or
+                    _delta_enough(half_p, sensor_count * hi_p)):
+                overpop = True
 
-        # ✅ 通用分裂条件
-        if self.energy < 1.5:
+        if overpop:
             return False
+        # ================================================================
 
-        if self.get_role() != "sensor" and self.avg_recent_calls < 1:
+        # 角色专属能量 + 调用门槛 ----------------------
+        rule = ROLE_SPLIT_RULE[role]
+        if self.energy < rule["min_e"]:
+            return False
+        if role != "sensor" and self.avg_recent_calls < rule["min_calls"]:
             return False
 
         if len(self.output_history) >= 3:
@@ -219,34 +280,48 @@ class CogUnit:
         return True
 
     def should_die(self) -> bool:
-        # 🧠 智能寿命机制：年老且不活跃就死
-        if hasattr(self, "dynamic_aging") and self.dynamic_aging:
-            if self.age > 150 and getattr(self, "avg_recent_calls", 0.0) < 0.5:
-                return True
 
-        if self.energy <= 0.0 or self.age > 600 or (self.get_role() != "sensor" and self.inactive_steps > 20):
-            return True
-
-        # 平均调用频率太低（仅针对 processor 和 emitter）
-        if self.role == "emitter" and getattr(self, "global_emitter_count", 1) <= 1:
+        if self.role == "emitter" and getattr(self, "global_emitter_count", 1) <= 2:
             if self.age < 600:
                 return False  # 不杀唯一 emitter
 
-        elif self.role == "processor":
-            if self.age >= 600:
-                if getattr(self, "avg_recent_calls", 0.0) < 0.05:
-                    return True
+        elif self.role == "processor" and getattr(self, "global_processor_count", 1) <= 4:
+            if self.age < 600:
+                return False
+
+
+        elif self.role == "sensor" and getattr(self, "global_processor_count", 1) <= 2:
+            if self.age < 600:
+                return False
+
+        # 🧠 智能寿命机制：年老且不活跃就死
+
+        if self.energy <= 0.0 or self.age > 300:
+            return True
+        # 平均调用频率太低（仅针对 processor 和 emitter）
+        if self.role in ["processor", "emitter"] and self.inactive_steps > 20:
+            return True
 
         # 输出完全重复（仅针对 processor 和 emitter）
         if self.role in ["processor", "emitter"] and getattr(self, "current_step", 0) > 600:
             if len(self.output_history) >= 4:
-                diffs = [
-                    torch.norm(self.output_history[i] - self.output_history[i + 1]).item()
-                    for i in range(len(self.output_history) - 1)
-                ]
+                diffs = []
+                for i in range(len(self.output_history) - 1):
+                    a = self.output_history[i]
+                    b = self.output_history[i + 1]
+                    target_dim = max(a.shape[-1], b.shape[-1])
+                    if a.shape[-1] < target_dim:
+                        padding = (0, target_dim - a.shape[-1])
+                        a = torch.nn.functional.pad(a, padding, value=0)
+                    if b.shape[-1] < target_dim:
+                        padding = (0, target_dim - b.shape[-1])
+                        b = torch.nn.functional.pad(b, padding, value=0)
+                    diffs.append(torch.norm(a - b).item())
+
                 if max(diffs) < 0.01:
                     print(f"[退化死亡] {self.id} 输出变化极小 → 被淘汰")
                     return True
+        return False
 
     def clone(self, role_override=None, new_input_size=None):
         role = role_override or self.role
@@ -261,20 +336,25 @@ class CogUnit:
         clone_unit.gene = {k: v for k, v in self.gene.items()}
 
         # 🌱 突变机制（小概率触发）
-        if random.random() < self.gene["mutation_rate"]:
+        if random.random() < self.gene.get("mutation_rate", 0.05):
+
             # role 突变（避免 sensor → emitter 太突兀）
-            possible_roles = ["sensor", "processor", "emitter"]
-            possible_roles.remove(self.role)
-            clone_unit.role = random.choice(possible_roles)
+            if self.role == "stem":
+                role = "stem"  # 保持 stem，不允许突变
+            else:
+                possible_roles = ["sensor", "processor", "emitter"]
+                possible_roles.remove(self.role)
+                clone_unit.role = random.choice(possible_roles)
             print(f"[突变] 角色突变 {self.role} → {clone_unit.role}")
 
-        if random.random() < self.gene["mutation_rate"]:
+        if random.random() < self.gene.get("mutation_rate", 0.05):
             # hidden_size 微调 ±2（范围限制）
             delta = random.choice([-2, 2])
             clone_unit.hidden_size = max(4, min(64, self.hidden_size + delta))
             print(f"[突变] hidden_size 突变为 {clone_unit.hidden_size}")
 
-        if random.random() < self.gene["mutation_rate"]:
+        if random.random() < self.gene.get("mutation_rate", 0.05):
+
             # 基因突变
             for key in ["sensor_bias", "processor_bias", "emitter_bias"]:
                 mutation = random.uniform(-0.1, 0.1)
@@ -292,6 +372,43 @@ class CogUnit:
             clone_unit.last_output = self.last_output.clone()
 
         self.energy *= 0.4
+
+        # 🎯 融合最近死亡单元的遗产（种族记忆）
+        if hasattr(self, "memory_pool") and len(self.memory_pool) >= 3:
+            memory = random.choice(self.memory_pool[-5:])  # 取最近5条遗产之一
+            for key in ["sensor_bias", "processor_bias", "emitter_bias"]:
+                g1 = self.gene.get(key, 1.0)
+                g2 = memory["gene"].get(key, 1.0)
+                clone_unit.gene[key] = 0.7 * g1 + 0.3 * g2  # 融合遗传
+            print(f"[遗传融合] {self.id} 结合记忆池基因 → 子基因：{clone_unit.gene}")
+
+            if "output" in memory:
+                o1 = self.last_output.squeeze(0) if self.last_output.dim() == 2 else self.last_output
+                o2 = memory["output"].squeeze(0) if memory["output"].dim() == 2 else memory["output"]
+
+                target_dim = max(o1.shape[0], o2.shape[0])
+                if o1.shape[0] < target_dim:
+                    o1 = torch.nn.functional.pad(o1, (0, target_dim - o1.shape[0]), value=0)
+                if o2.shape[0] < target_dim:
+                    o2 = torch.nn.functional.pad(o2, (0, target_dim - o2.shape[0]), value=0)
+
+                clone_unit.last_output = 0.6 * o1 + 0.4 * o2
+                print(f"[行为遗传] 融合行为模板 → output 前5维: {clone_unit.last_output[:5]}")
+
+            if random.random() < self.gene["mutation_rate"] * 2:
+                if "hidden_size" in memory:
+                    h1 = self.hidden_size
+                    h2 = memory.get("hidden_size", h1)
+                    new_hidden = int(0.7 * h1 + 0.3 * h2)
+                    new_hidden = max(4, min(128, new_hidden))
+                    clone_unit.hidden_size = new_hidden
+                    print(f"[隐层遗传] hidden_size 继承为 {new_hidden}")
+                    # 重新构建网络
+                    clone_unit.function = torch.nn.Sequential(
+                        torch.nn.Linear(clone_unit.input_size, new_hidden),
+                        torch.nn.ReLU(),
+                        torch.nn.Linear(new_hidden, clone_unit.input_size)
+                    )
 
         print(f"[分裂] {self.id} → {clone_unit.id} (input_size={input_size}, 父能量留40%，子能量得60%，角色: {role})")
         return clone_unit

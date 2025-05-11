@@ -88,6 +88,7 @@ class GridEnvironment:
         grid = np.full((self.size, self.size), '.', dtype=str)
         x, y = self.agent_pos
         grid[y, x] = 'A'
+
         print('\n'.join(' '.join(row) for row in grid))
         print()
 
