@@ -5,6 +5,44 @@ import torch
 import random
 from env import GridEnvironment
 import torch.nn.functional as F
+import numpy as np
+import logging
+from collections import deque
+
+class LimitedDebugHandler(logging.Handler):
+    def __init__(self, capacity=100):
+        super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
+        self.buffer = deque(maxlen=capacity)
+
+    def emit(self, record):
+        if record.levelno == logging.DEBUG:
+            try:
+                msg = self.format(record)
+                self.buffer.append(msg)
+            except Exception:
+                pass  # 防止格式化报错
+
+    def dump_to_console(self):
+        print("\n==== [最近 Debug 日志] ====")
+        for msg in self.buffer:
+            print(msg)
+
+# === 设置 root logger ===
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
+
+# ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
+debug_handler = LimitedDebugHandler(capacity=100)
+debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(debug_handler)
+
+# ✅ 添加正常输出 Handler（只显示 INFO 及以上）
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(console_handler)
+
 
 
 
@@ -44,7 +82,7 @@ IDEAL_RATIO = {"emitter": 1, "processor": 2, "sensor": 1}
 DENOM = sum(IDEAL_RATIO.values())      # =4
 
 # 每轮允许转换的最高比例（15%）
-MAX_CONV_FRAC = 0.15
+MAX_CONV_FRAC = 0.4
 
 # Δ 容差系数：需要至少 diff ≥ ceil(TOL_FRAC*total) 才触发
 TOL_FRAC = 0.05      # 小规模时自动退化成 1
@@ -58,13 +96,13 @@ class CogGraph:
     - 调度每一轮所有 CogUnit 的更新、分裂、死亡，并传递输出
     """
     def __init__(self):
-
-        self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
+        self.energy_pool = 0.0  # 中央能量池
+        # self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
         self.env_size = 5  # 初始环境 5x5
         self.env = GridEnvironment(size=self.env_size)  # 创建环境
         self.task = TaskInjector(target_position=(self.env_size - 1, self.env_size - 1))  # 初始目标点
         self.target_vector = self.task.encode_goal(self.env_size)  # 初始目标向量
-        self.max_total_energy = 300  # 初始最大总能量
+        self.max_total_energy = 250  # 初始最大总能量
         self.target_vector = self.task.encode_goal(self.env_size)
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
@@ -78,19 +116,52 @@ class CogGraph:
         self.unit_map[unit.id] = unit
         self.connections[unit.id] = {}
 
+    def _get_min_target_counts(self):
+        """
+        根据当前 max_total_energy 和角色比例，返回每类角色的最小建议数量。
+        """
+        total_target = int(self.max_total_energy / 2.6 * 0.9)  # 系统最大细胞数 × 0.9 安全系数
+
+        # 理想比例：1(sensor) : 2(processor) : 1(emitter) → 总共 4 份
+        IDEAL_RATIO = {"sensor": 1, "processor": 2, "emitter": 1}
+        DENOM = sum(IDEAL_RATIO.values())  # = 4
+
+        target_counts = {
+            role: int(total_target * IDEAL_RATIO[role] / DENOM)
+            for role in IDEAL_RATIO
+        }
+        return target_counts
+
     def remove_unit(self, unit: CogUnit):
+
 
         if unit.id not in self.unit_map:
             return  # 已经被删除
-        if hasattr(self, "memory_pool") and unit.age > 30:
-            self.memory_pool.append({
-                "gene": unit.gene.copy(),
-                "output": unit.last_output.clone(),
-                "role": unit.role,
-                "hidden_size": unit.hidden_size
-            })
 
-            print(f"[记忆池] {unit.id} 死亡，遗产记录已保存（共 {len(self.memory_pool)} 条）")
+        # ✅ 遗产机制：寿终正寝时，能量分配给年轻后辈
+        if getattr(unit, "death_by_aging", False) and unit.energy > 0.0:
+            heirs = [u for u in self.units if u.role == unit.role and u.age < 240 and u.id != unit.id]
+            if heirs:
+                per_gain = unit.energy / len(heirs)
+                for u in heirs:
+                    u.energy += per_gain
+                logger.info(
+                    f"[寿终能量继承] {unit.id} 死亡（{unit.role}） → 能量 {unit.energy:.2f} 分给 {len(heirs)} 个同类年轻单元，每人 +{per_gain:.2f}")
+
+        # ✅ 加入到同类局部记忆池
+        if unit.is_worthy_of_memory():
+            for other in self.units:
+                if other.role == unit.role:
+                    other.local_memory_pool.append({
+                        "gene": unit.gene.copy(),
+                        "output": unit.last_output.clone(),
+                        "role": unit.role,
+                        "hidden_size": unit.hidden_size,
+                        "score": 0
+                    })
+                    # 控制大小：每个单元池最多150条
+                    if len(other.local_memory_pool) >= 150:
+                        other.local_memory_pool.pop(0)
 
         # 从图中移除单元及其连接
         self.units = [u for u in self.units if u.id != unit.id]
@@ -102,12 +173,20 @@ class CogGraph:
             if unit.id in self.connections[k]:
                 del self.connections[k][unit.id]
 
-        # 🪢 限制记忆池大小
-        if len(self.memory_pool) > 200:
-            removed = self.memory_pool.pop(0)
-            print(f"[记忆池维护] 超出容量，移除最旧遗产（role={removed['role']}）")
-
     def connect(self, from_unit: CogUnit, to_unit: CogUnit):
+        # 仅允许合法结构连接
+        valid_links = {
+            "sensor": ["processor"],
+            "processor": ["processor", "emitter"],
+            "emitter": []
+        }
+        from_role = from_unit.get_role()
+        to_role = to_unit.get_role()
+
+        if to_role not in valid_links.get(from_role, []):
+            logger.debug(f"[非法连接阻止] 不允许 {from_role} → {to_role}，跳过连接 {from_unit.id} → {to_unit.id}")
+            return  # 🚫 阻止非法连接
+
         if from_unit.id not in self.connections:
             self.connections[from_unit.id] = {}  # to_id → strength
 
@@ -121,15 +200,15 @@ class CogGraph:
                 key=lambda uid: self.connections[from_unit.id][uid]
             )
             del self.connections[from_unit.id][weakest_id]
-            print(f"[连接替换] {from_unit.id} 移除最弱连接 {weakest_id}")
+            logger.debug(f"[连接替换] {from_unit.id} 移除最弱连接 {weakest_id}")
 
         # 建立新连接，初始权重为 1.0
         self.connections[from_unit.id][to_unit.id] = 1.0
         strength = self.connections[from_unit.id][to_unit.id]
-        print(f"[连接建立] {from_unit.id} → {to_unit.id} (strength={strength:.2f})")
+        logger.debug(f"[连接建立] {from_unit.id} → {to_unit.id} (strength={strength:.2f})")
 
     def total_energy(self):
-        return sum(unit.energy for unit in self.units)
+        return sum(unit.energy for unit in self.units if unit.age < 240)
 
     # ========== 维度适配辅助 ==========
     def _goal_dim(self) -> int:
@@ -209,7 +288,7 @@ class CogGraph:
                     continue
 
                 # ✅ 满足条件，执行合并
-                print(f"[合并触发] {u1.id} 和 {u2.id} 合并为新单元")
+                logger.info(f"[合并触发] {u1.id} 和 {u2.id} 合并为新单元")
 
                 merged = CogUnit(role=u1.get_role())
                 merged.position = (
@@ -234,17 +313,17 @@ class CogGraph:
                 for to_id in self.connections.get(u1.id, {}):
                     if to_id in self.unit_map:  # ✅ 防止连接到已被删除的单元
                         self.connect(merged, self.unit_map[to_id])
-                        print(f"[连接重定向] {merged.id} → {to_id}（继承自 {u1.id}）")
+                        logger.debug(f"[连接重定向] {merged.id} → {to_id}（继承自 {u1.id}）")
 
                 for to_id in self.connections.get(u2.id, {}):
                     if to_id in self.unit_map:
                         self.connect(merged, self.unit_map[to_id])
-                        print(f"[连接重定向] {merged.id} → {to_id}（继承自 {u2.id}）")
+                        logger.debug(f"[连接重定向] {merged.id} → {to_id}（继承自 {u2.id}）")
 
         # 执行删除 & 添加
         for uid in merged_pairs:
             if uid in self.unit_map:
-                print(f"[合并删除] {uid}")
+                logger.info(f"[合并删除] {uid}")
                 self.remove_unit(self.unit_map[uid])
 
         for u in new_units:
@@ -328,7 +407,7 @@ class CogGraph:
 
                 if sim_p > 0.95 and sim_e > 0.95:
                     # ✅ 满足重构条件
-                    print(f"[重构触发] 子图 ({p1.id}→{e1.id}) 与 ({p2.id}→{e2.id}) 相似，开始重构")
+                    logger.info(f"[重构触发] 子图 ({p1.id}→{e1.id}) 与 ({p2.id}→{e2.id}) 相似，开始重构")
 
                     # 创建新单元
                     new_p = CogUnit(role="processor")
@@ -352,7 +431,7 @@ class CogGraph:
                             self.connect(self.unit_map[uid], new_p)
 
                     # 删除原子图
-                    print(f"[重构删除] 删除原子图 ({p1.id}→{e1.id}) 和 ({p2.id}→{e2.id})")
+                    logger.info(f"[重构删除] 删除原子图 ({p1.id}→{e1.id}) 和 ({p2.id}→{e2.id})")
                     self.remove_unit(p1)
                     self.remove_unit(p2)
                     self.remove_unit(e1)
@@ -379,7 +458,7 @@ class CogGraph:
                 for u in cluster:
                     u.subsystem_id = subsystem_id
                 subsystem_count += 1
-                print(f"[子系统生成] 新子系统 {subsystem_id}，包含 {len(cluster)} 个单元")
+                logger.info(f"[子系统生成] 新子系统 {subsystem_id}，包含 {len(cluster)} 个单元")
                 visited.update(u.id for u in cluster)
 
     def _dfs_collect_cluster(self, start_unit, max_depth=2):
@@ -427,7 +506,7 @@ class CogGraph:
             if to_unit in self.connections.get(from_unit, {}):
                 del self.connections[from_unit][to_unit]  # ✅ 删除 dict 的 key
 
-            print(f"[剪枝] 连接 {from_unit} → {to_unit} 被剪掉")
+            logger.debug(f"[剪枝] 连接 {from_unit} → {to_unit} 被剪掉")
             # 也删掉 usage记录
             if conn in self.connection_usage:
                 del self.connection_usage[conn]
@@ -435,37 +514,46 @@ class CogGraph:
         # 强化高效连接（可选：比如增加能量传递权重等）
         for conn in to_strengthen:
             # 简单打印标记，可以后续加真实权重系统
-            print(f"[强化] 连接 {conn[0]} → {conn[1]} 被强化")
+            logger.debug(f"[强化] 连接 {conn[0]} → {conn[1]} 被强化")
 
-        print(f"[剪枝] 剪掉 {len(to_prune)} 条弱连接，强化 {len(to_strengthen)} 条强连接")
+        logger.info(f"[剪枝] 剪掉 {len(to_prune)} 条弱连接，强化 {len(to_strengthen)} 条强连接")
 
     def auto_connect(self):
+        def euclidean(p1, p2):
+            return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+
         for unit in self.units:
-            # 只处理 processor 节点
-            if unit.get_role() != "processor":
+            role = unit.get_role()
+
+            if role == "processor":
+                # processor 寻找下游连接对象（processor 或 emitter）
+                target_roles = ["processor", "emitter"]
+            elif role == "emitter":
+                # emitter 不应该主动连接（skip）
                 continue
+            else:
+                continue  # sensor 不参与
 
-            # 获取已有连接数（下游）
             current_connections = self.connections[unit.id]
-            if len(current_connections) < 2:
-                # 随机找一个 emitter 或 processor 来连接
-                def euclidean(p1, p2):
-                    return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
+            if len(current_connections) < 2:
                 u_pos = unit.get_position()
                 candidates = [
                     u for u in self.units
-                    if u.id != unit.id and u.get_role() in ["processor", "emitter"] and abs(u.input_size - unit.input_size) <= 100
-                       and u.id not in self.connections[unit.id]
-                       and euclidean(u_pos, u.get_position()) < 3
+                    if u.id != unit.id and u.get_role() in target_roles
+                       and abs(u.input_size - unit.input_size) <= 100
+                       and u.id not in current_connections
+                       and euclidean(u.get_position(), u_pos) < 3
                 ]
-                if not candidates:
-                    # ✅ 没有近邻也允许全局搜索 emitter 建连
-                    candidates = [u for u in self.units if
-                                  u.id != unit.id and u.get_role() in ["processor", "emitter"] and u.id not in
-                                  self.connections[unit.id]]
 
-                # 按能量从高到低排序，优先选择最有价值连接目标
+                if not candidates:
+                    # 没有近邻 → 全局搜索
+                    candidates = [
+                        u for u in self.units
+                        if u.id != unit.id and u.get_role() in target_roles
+                           and u.id not in current_connections
+                    ]
+
                 if candidates:
                     def connection_strength(u):
                         incoming_count = sum(u.id in self.connections.get(fid, {}) for fid in self.unit_map)
@@ -473,12 +561,16 @@ class CogGraph:
 
                     candidates.sort(key=connection_strength, reverse=True)
 
-                    target = candidates[0]  # 能量最高者
-                    if target.id not in current_connections:
-                        self.connect(unit, target)
-                        print(f"[新连接] {unit.id} → {target.id}")
-        # === 随机突变连接：processor 有小概率连接新目标 ===
-        if random.random() < 0.1:  # 10% 概率触发突变
+                    for target in candidates:
+                        if target.id not in current_connections:
+                            prev_conn_count = len(self.connections[unit.id])
+                            self.connect(unit, target)
+                            if len(self.connections[unit.id]) > prev_conn_count:
+                                logger.debug(f"[新连接] {unit.id} → {target.id}")
+                                break  # ✅ 成功建立连接就跳出
+
+        # === 随机突变连接（只允许 processor 发起） ===
+        if random.random() < 0.1:
             from_candidates = [u for u in self.units if u.get_role() == "processor"]
             to_candidates = [u for u in self.units if u.get_role() in ["processor", "emitter"]]
 
@@ -486,10 +578,9 @@ class CogGraph:
                 from_unit = random.choice(from_candidates)
                 to_unit = random.choice(to_candidates)
 
-                if to_unit.id not in self.connections.get(from_unit.id, []):
+                if to_unit.id not in self.connections.get(from_unit.id, {}):
                     self.connect(from_unit, to_unit)
-                    print(f"[突变连接] {from_unit.id} → {to_unit.id}")
-
+                    logger.debug(f"[突变连接] {from_unit.id} → {to_unit.id}")
 
     # === 分化机制：结构失衡时的角色调整 ===
     def rebalance_cell_types(self):
@@ -503,13 +594,13 @@ class CogGraph:
         #   hi    1.50  1.30   1.15   1.08
         #   lo    0.50  0.70   0.85   0.92
         if total < 50:
-            hi, lo = 1.50, 0.50
+            hi, lo = 1.30, 0.60
         elif total < 200:
-            hi, lo = 1.30, 0.70
+            hi, lo = 1.08, 0.92
         elif total < 500:
-            hi, lo = 1.15, 0.85
+            hi, lo = 1.05, 0.95
         else:
-            hi, lo = 1.10, 0.90
+            hi, lo = 1.03, 0.97
 
         # Δ 容差（至少相差 Δ_cell 才算“真的多／少”）
         delta_cell = max(1, int(total * TOL_FRAC))
@@ -524,7 +615,8 @@ class CogGraph:
 
         while conv_done < max_conv:
             # ── 重新计数
-            cnt = Counter(u.get_role() for u in self.units)
+            young_units = [u for u in self.units if u.age < 240]
+            cnt = Counter(u.get_role() for u in young_units)
             s_cnt = cnt.get("sensor", 0)
             p_cnt = cnt.get("processor", 0)
             e_cnt = cnt.get("emitter", 0)
@@ -570,7 +662,7 @@ class CogGraph:
             unit.age = 0
             unit.energy += 0.2
             unit.gene[f"{receiver_role}_bias"] = 1.0
-            print(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
+            logger.info(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
 
             # 清旧连 & 简易新连
             for uid, out_edges in list(self.connections.items()):
@@ -593,8 +685,9 @@ class CogGraph:
 
             conv_done += 1
 
+
     def trace_info_paths(self):
-        print(f"[信息路径追踪] 步数 {self.current_step}")
+        logger.debug(f"[信息路径追踪] 步数 {self.current_step}")
         for emitter in self.units:
             if emitter.get_role() != "emitter":
                 continue
@@ -604,45 +697,90 @@ class CogGraph:
             for pid in emit_from:
                 proc_from = [sid for sid in self.unit_map if pid in self.connections.get(sid, {})]
                 for sid in proc_from:
-                    print(f"  sensor:{sid} → processor:{pid} → emitter:{emitter.id}")
+                    logger.debug(f"  sensor:{sid} → processor:{pid} → emitter:{emitter.id}")
 
     def _select_clone_parents(self, pending_by_role):
         """
-        从待复制父单元中，按照 10% 配额 & 能量/活跃度排序挑出真正允许复制的。
-        返回 List[CogUnit]
+        从待复制父单元中，按照配额 & 能量/活跃度排序挑出真正允许复制的。
+        若细胞能量超过 3.0，强制允许复制，不受比例限制。
         """
         total_cells = len(self.units)
-        if total_cells <= 15:  # 小规模阶段不设限
-            return [u for lst in pending_by_role.values() for u in lst]
+        approved = set()
 
-        approved = []
-        for role, cand in pending_by_role.items():
-            if not cand:
-                continue
-            role_count = sum(1 for u in self.units if u.role == role)
-            cap = max(1, role_count // 15)  # 15 %，向下取整，至少 1
-            cand.sort(key=lambda u: (u.energy, u.avg_recent_calls), reverse=True)
-            approved.extend(cand[:cap])
-        return approved
+        if total_cells <= 15:
+            for lst in pending_by_role.values():
+                approved.update(lst)
+        else:
+            for role, cand in pending_by_role.items():
+                if not cand:
+                    continue
+                young_units = [u for u in self.units if u.role == role and u.age < 240]
+                role_count = len(young_units)
+                cap = max(1, (2 * role_count) // 5)  # 40%
+                cand.sort(key=lambda u: (u.energy, u.avg_recent_calls), reverse=True)
+                approved.update(cand[:cap])
+
+        return list(approved)
+
+    def trim_weak_memories(self):
+        """环境发生变化时，清除所有细胞记忆池中的一半最弱记忆"""
+        for unit in self.units:
+            if hasattr(unit, "local_memory_pool") and unit.local_memory_pool:
+                pool = unit.local_memory_pool
+                pool.sort(key=lambda m: m["score"])
+                half = len(pool) // 2
+                del pool[:half]
 
     def step(self, input_tensor: torch.Tensor):
         if self.current_step == 10000:
             self.subsystem_competition = True
-            print("[进化] 子系统竞争机制已激活（Subsystem Competition）")
+            logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
         if self.current_step == 2000:
             for unit in self.units:
                 unit.dynamic_aging = True
-            print("[进化] 动态寿命机制已激活（Dynamic Aging）")
+            logger.info("[进化] 动态寿命机制已激活（Dynamic Aging）")
 
-        if self.current_step > 3000 and self.current_step % 100 == 0:
-            total_e = self.total_energy()
-            if total_e > self.max_total_energy * 2.5:  # 超过初始最大能量2.5倍
-                tax = total_e * 0.01
-                loss_per_unit = tax / max(len(self.units), 1)
-                for unit in self.units:
-                    unit.energy -= loss_per_unit  # ✅ 实际扣能量
-                print(f"[能量税] 第 {self.current_step} 步，总能量过高，扣除 {tax:.2f} 能量")
+        if self.current_step > 200 and self.current_step % 10 == 0:
+            total_cell_energy = self.total_energy()
+            pool_energy = self.energy_pool  # ✅ 使用真实能量池
+            total_e = total_cell_energy + pool_energy
+
+            if self.current_step > 200 and self.current_step % 10 == 0:
+                total_cell_energy = self.total_energy()
+                pool_energy = self.energy_pool
+                total_e = total_cell_energy + pool_energy
+                max_e = self.max_total_energy
+
+                if total_e > max_e:
+                    excess = total_e - max_e
+                    tiers = [
+                        (0.00, 0.15, 0.01),  # 超出 0~15% 部分收 1%
+                        (0.15, 0.35, 0.05),  # 超出 15~35% 部分收 5%
+                        (0.35, 0.55, 0.10),  # 超出 35~55% 部分收 10%
+                        (0.50, float("inf"), 0.50)  # 超出 55% 部分收 50%
+                    ]
+
+                    tax = 0.0
+                    for lower, upper, rate in tiers:
+                        lower_abs = max_e * lower
+                        upper_abs = max_e * upper
+                        if excess > lower_abs:
+                            taxed_amount = min(excess, upper_abs) - lower_abs
+                            tax += taxed_amount * rate
+
+                    if pool_energy >= tax:
+                        self.energy_pool -= tax
+                        logger.info(
+                            f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 累进税 {tax:.2f}（池足够，剩余池能 {self.energy_pool:.2f}）")
+                    else:
+                        tax_from_cells = tax - self.energy_pool
+                        self.energy_pool = 0.0
+                        loss_per_unit = tax_from_cells / max(len(self.units), 1)
+                        for unit in self.units:
+                            unit.energy -= loss_per_unit
+                        logger.info(
+                            f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step > 0 and self.current_step % 500 == 0:
@@ -654,27 +792,27 @@ class CogGraph:
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
             self.target_vector = self.task.encode_goal(self.env_size)
-            print(
+            logger.info(
                 f"[Curriculum升级] 第 {self.current_step} 步：环境大小 {old_size}x{old_size} → {self.env_size}x{self.env_size}，新目标 {new_target}")
 
-        if self.current_step > 0 and self.current_step % 100 == 0:
+        if self.current_step > 0 and self.current_step % 1000 == 0:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
-            print(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
+            logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
 
         # 若当前步数非常早期，给予基础能量补偿
         if self.current_step < 10:
             for unit in self.units:
                 if unit.get_role() != "sensor":
                     unit.energy += 0.1
-                    print(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
+                    logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             old_target = self.target_vector.clone()
             self.target_vector = torch.rand_like(self.target_vector)
 
             similarity = torch.cosine_similarity(old_target, self.target_vector, dim=0).item()
-            print(f"[目标变化] 第 {self.current_step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
+            logger.info(f"[目标变化] 第 {self.current_step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             self.prune_connections()
@@ -683,7 +821,7 @@ class CogGraph:
             self.assign_subsystems()
 
         if hasattr(self, "subsystem_competition") and self.subsystem_competition:
-            if self.current_step % 1000 == 0:
+            if self.current_step % 100 == 0:
                 subsystem_energies = {}
                 for unit in self.units:
                     if unit.subsystem_id:
@@ -692,7 +830,7 @@ class CogGraph:
 
                 if len(subsystem_energies) >= 5:  # 至少5个子系统才竞争
                     weakest = min(subsystem_energies, key=lambda x: subsystem_energies[x])
-                    print(f"[子系统竞争] 淘汰能量最弱的子系统 {weakest}")
+                    logger.info(f"[子系统竞争] 淘汰能量最弱的子系统 {weakest}")
 
                     # 删除弱子系统的所有单元
                     self.units = [u for u in self.units if u.subsystem_id != weakest]
@@ -700,6 +838,67 @@ class CogGraph:
                     self.connections = {u.id: {} for u in self.units}
 
         self.current_step += 1
+
+        if self.current_step > 2000 and self.current_step % 40 == 0:
+            total = len(self.units)
+            max_elites = max(1, int(total * 0.08))  # 最多8%
+
+            # 收集所有有记忆的分数，用于计算阈值
+            all_scores = [
+                u.local_memory_pool[-1]["score"]
+                for u in self.units
+                if len(u.local_memory_pool) >= 1
+            ]
+            score_threshold = np.percentile(all_scores, 90)
+
+            candidates = []
+            for u in self.units:
+                # 条件1：至少5次记忆
+                if len(u.local_memory_pool) < 5:
+                    continue
+                last_score = u.local_memory_pool[-1]["score"]
+                # 条件2：高分门槛
+                if last_score < score_threshold:
+                    continue
+                # 条件3：活跃度
+                if getattr(u, "avg_recent_calls", 0) < 2.0:
+                    continue
+
+                # 条件4：输出质量 role-specific
+                # 先从 local_memory_pool 最近几条里重算 quality
+                hist = [m["output"].view(-1) for m in u.local_memory_pool[-5:]]
+                # 对齐
+                max_len = max(t.numel() for t in hist)
+                aligned = [t if t.numel() == max_len else torch.nn.functional.pad(t, (0, max_len - t.numel())) for t in
+                           hist]
+                diffs = [(aligned[i] - aligned[i + 1]).norm().item() for i in range(len(aligned) - 1)]
+                if u.role == "processor":
+                    diversity = sum(diffs) / len(diffs)
+                    if diversity < 0.1:
+                        continue
+                elif u.role == "sensor":
+                    variation = torch.var(torch.stack(aligned), dim=0).mean().item()
+                    if variation < 0.05:
+                        continue
+                elif u.role == "emitter":
+                    avg_diff = sum(diffs) / len(diffs)
+                    stability = 1.0 if 0.01 < avg_diff < 0.5 else 0.0
+                    if stability < 1.0:
+                        continue
+
+                # 全部通过，加入候选
+                candidates.append((u, last_score))
+
+            # 按分数降序选 top K
+            elites = [u for u, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:max_elites]]
+
+            # 重置旧标记 & 标新精英
+            for u in self.units:
+                u.is_elite = False
+            # 标记新精英 & 重置年龄
+            for u in elites:
+                u.is_elite = True
+                u.age = 0  # ← 关键：清零年龄，让它从头开始，避免进入老化死亡窗口
 
 
         # 计算当前各角色单元总数，供紧急增殖判断使用
@@ -769,7 +968,7 @@ class CogGraph:
             else:
             # 强制使用零输入触发更新，避免因无输入永远不更新
                 unit_input = torch.zeros(unit.input_size).unsqueeze(0)
-                print(f"[零输入] {unit.id} 无上游连接，使用零输入更新")
+                logger.debug(f"[零输入] {unit.id} 无上游连接，使用零输入更新")
 
             # 执行单元的更新逻辑
             # === 统计调用频率（这里可以更精细，比如 sliding window）===
@@ -807,22 +1006,29 @@ class CogGraph:
             elif unit.role == "emitter":
                 bias_factor = unit.gene.get("emitter_bias", 1.0)
 
-            decay = (var * 0.1 + call_density * 0.005 + conn_strength_sum * 0.003) * dim_scale * bias_factor
+            step_factor = 1.0 + 0.0005 * max(0, self.current_step - 500)
+            unit_factor = 1.0 + 0.005 * max(0, len(self.units) - 50)
+
+            # 代谢公式加入动态因子
+            decay = (var * 0.25 + call_density * 0.04 + conn_strength_sum * 0.02) \
+                    * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)
 
-            print(
+            logger.debug(
                 f"[代谢] {unit.id} var={var:.3f}, freq={freq}, conn={conn}, strength_sum={conn_strength_sum:.2f} → -{decay:.3f} 能量")
 
             unit.update(unit_input)
+
+
             # ✅ 加强连接权重（使用次数越多越强）
             for uid in incoming:
                 if unit.id in self.connections.get(uid, {}):
                     self.connections[uid][unit.id] *= 1.05  # 增强
                     self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
             output_buffer[unit.id] = unit.get_output()
-            print(unit)
+            logger.debug(str(unit))
 
             # === 判断是否需要复制 ===
             if allow_clone and unit.should_split():
@@ -831,11 +1037,11 @@ class CogGraph:
 
             else:
                 if not allow_clone:
-                    print(f"[系统保护] 总能量过高，禁止 {unit.id} 分裂")
+                    logger.debug(f"[系统保护] 总能量过高，禁止 {unit.id} 分裂")
 
             # === 判断是否死亡 ===
             if unit.should_die():
-                print(f"[死亡] {unit.id} 被移除")
+                logger.debug(f"[死亡] {unit.id} 被移除")
                 self.remove_unit(unit)
 
 
@@ -848,18 +1054,18 @@ class CogGraph:
                     last_used = self.connection_usage.get((from_id, to_id), -1)
                     if self.current_step - last_used > threshold:
                         del self.connections[from_id][to_id]  # ✅ 正确删除方式
-                        print(f"[死连接清除] {from_id} → {to_id}")
+                        logger.debug(f"[死连接清除] {from_id} → {to_id}")
                         # 删除连接后，给 from_unit 轻微能量惩罚
                         if from_id in self.unit_map:
-                            self.unit_map[from_id].energy -= 0.01  # 可调参数
-                            print(f"[惩罚] {from_id} 因连接失效，能量 -0.01")
+                            self.unit_map[from_id].energy -= 0.015  # 可调参数
+                            logger.debug(f"[惩罚] {from_id} 因连接失效，能量 -0.01")
 
                     else:
                         # ✅ 削弱仍在用但表现差的连接
                         self.connections[from_id][to_id] *= 0.95
                         if self.connections[from_id][to_id] < 0.1:
                             del self.connections[from_id][to_id]
-                            print(f"[连接衰减清除] {from_id} → {to_id}")
+                            logger.debug(f"[连接衰减清除] {from_id} → {to_id}")
 
         # 简易任务奖励：如果 emitter 输出靠近某个目标向量，则发放奖励
         target_vector = self.target_vector
@@ -869,7 +1075,7 @@ class CogGraph:
             distance = torch.norm(avg_output - target_vector)
 
             # 线性衰减式奖励分数（距离 0→奖励满分1，距离3→奖励为0）
-            reward_score = max(0.0, 1.0 - distance / 10.0)
+            reward_score = max(0.0, 1.0 - distance / 5.0)
 
             if reward_score > 0.0:
                 dim_scale = self.target_vector.size(0) / 50  # 50 → 原始基准
@@ -881,9 +1087,9 @@ class CogGraph:
                     if unit.get_role() == "processor":
                         unit.energy += 0.04 * dim_scale * reward_score * dilution_factor
                     elif unit.get_role() == "emitter":
-                        unit.energy += 0.02 * dim_scale * reward_score * dilution_factor
+                        unit.energy += 0.04 * dim_scale * reward_score * dilution_factor
 
-                print(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
+                logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
 
             # ✅ 增加多样性惩罚（含数量判断）
             action_indices = [torch.argmax(out).item() for out in outputs]
@@ -893,23 +1099,28 @@ class CogGraph:
                 if action_indices.count(common_action) > len(action_indices) * 0.9:
                     for unit in self.units:
                         if unit.get_role() == "emitter":
-                            unit.energy -= 0.02
-                            print(f"[惩罚] emitter {unit.id} 因输出单一行为被扣能量")
+                            unit.energy -= 0.05
+                            logger.debug(f"[惩罚] emitter {unit.id} 因输出单一行为被扣能量")
                 elif len(set(action_indices)) > len(action_indices) * 0.6:
                     for unit in self.units:
                         if unit.get_role() == "emitter":
-                            unit.energy += 0.02
+                            unit.energy += 0.01
 
-                    print(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.02 能量")
+                    logger.debug(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.01 能量")
 
             else:
-                print(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
+                logger.debug(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
 
             if self.task.evaluate(self.env, outputs):
-                print(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励 +0.1")
-                for unit in self.units:
-                    if unit.get_role() == "processor":
-                        unit.energy += 0.1
+                if self.task.evaluate(self.env, outputs):
+                    logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励 +0.1")
+
+                    for unit in self.units:
+                        if unit.get_role() == "emitter":
+                            unit.energy += 0.05  # 提高 emitter 奖励
+                        elif unit.get_role() == "processor":
+                            unit.energy += 0.06  # 给 processor 更多能量，鼓励参与
+
 
         self.trace_info_paths()
         # ✅ 执行结构冗余合并
@@ -919,21 +1130,51 @@ class CogGraph:
         # ✅ 打印当前各类型细胞数量
         from collections import Counter
         role_counts = Counter([unit.get_role() for unit in self.units])
-        print("[细胞统计] 当前各类数量：", dict(role_counts))
+        logger.debug("[细胞统计] 当前各类数量：", dict(role_counts))
 
-        print("[连接强度]")
+        logger.debug("[连接强度]")
         for from_id, to_dict in self.connections.items():
             for to_id, strength in to_dict.items():
-                print(f"  {from_id} → {to_id} = {strength:.3f}")
+                logger.debug(f"  {from_id} → {to_id} = {strength:.3f}")
                 # 统计各类单元数量
                 sensor_count = sum(1 for u in self.units if u.get_role() == "sensor")
                 processor_count = sum(1 for u in self.units if u.get_role() == "processor")
                 emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
-                print(f"[统计] sensor: {sensor_count}, processor: {processor_count}, emitter: {emitter_count}")
-
+                if self.current_step % 50 == 0 or self.current_step < 10:
+                    logger.info(
+                        f"[统计] step={self.current_step} | sensor: {sensor_count}, processor: {processor_count}, emitter: {emitter_count}")
 
         self.rebalance_cell_types()
-        # === 10 %-限额复制（>15 细胞才触发） ===
+
+        # === 🔁 分裂 or 储能：强制处理能量超标单元 ===
+        while True:
+            over_energy_units = [u for u in self.units if u.energy > 3.0]
+            if not over_energy_units:
+                break
+
+            min_counts = self._get_min_target_counts()
+            role_counts = Counter(u.get_role() for u in self.units if u.age < 240)
+
+            for unit in over_energy_units:
+                role = unit.get_role()
+                if role_counts.get(role, 0) < min_counts[role] or self.total_energy() < self.max_total_energy:
+                    # ✅ 当前角色数量不足 或 系统能量未超载 → 强制分裂
+                    expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+                    child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None)
+                    self.connect(unit, child)
+                    self.auto_connect()
+                    self.add_unit(child)
+                    logger.info(f"[强制分裂] {unit.id} ({role}) → 数量不足/系统未满 → 复制")
+
+                else:
+                    # ⚠️ 系统能量过载 & 当前角色数量足够 → 储能
+                    contribution = unit.energy * 0.5
+                    unit.energy *= 0.5
+                    self.energy_pool += contribution
+                    logger.debug(
+                        f"[能量转移] {unit.id} ({role}) 系统过载 → 存入能量池 {contribution:.2f}，保留 {unit.energy:.2f}")
+
+        # === 40 %-限额复制（>15 细胞才触发） ===
         selected_parents = self._select_clone_parents(pending)
         for parent in selected_parents:
             expected_input = self.env_size * self.env_size * INPUT_CHANNELS
@@ -943,27 +1184,28 @@ class CogGraph:
             )
             # 父子连接（含继承上下游）
             self.connect(parent, child)
-            # 继承上游
-            for uid in list(self.unit_map):
-                if parent.id in self.connections.get(uid, {}):
-                    self.connect(self.unit_map[uid], child)
-            # 继承下游
-            for uid in self.connections.get(parent.id, {}):
-                if uid in self.unit_map:
-                    self.connect(child, self.unit_map[uid])
+            self.auto_connect()  # ✅ 让新单元自行寻找连接对象
+
             new_units.append(child)
             # —— 最终一次性把所有 child 加入图结构 ——
         for unit in new_units:
-            unit.memory_pool = self.memory_pool  # 自动注入遗传记忆池
             self.add_unit(unit)
 
-
+        # === 🪫 能量池补给机制：支持能量低的细胞 ===
+        if self.energy_pool > 0.0:
+            weak_units = [u for u in self.units if u.energy < 0.8]
+            if weak_units:
+                per_unit = min(0.2, self.energy_pool / len(weak_units))
+                for u in weak_units:
+                    u.energy += per_unit
+                    self.energy_pool -= per_unit
+                logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     def upscale_old_units(self, new_input_size):
         """将所有 input_size 小于当前环境预期尺寸的单元升维（只升不降）"""
         for unit in self.units:
             if unit.input_size < new_input_size:
-                print(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
+                logger.info(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
 
                 # 保留旧输出部分，补零到新维度
                 old_output = unit.last_output
@@ -993,9 +1235,9 @@ class CogGraph:
     def summary(self):
         # 打印当前图结构概况
 
-        print(f"[图结构] 当前单元数: {len(self.units)}")
+        logger.debug(f"[图结构] 当前单元数: {len(self.units)}")
         for unit in self.units:
-            print(f" - {unit} → 连接数: {len(self.connections[unit.id])}")
+            logger.debug(f" - {unit} → 连接数: {len(self.connections[unit.id])}")
 
     def collect_emitter_outputs(self):
         """收集所有 emitter 输出并自动对齐到目标维度"""
@@ -1009,17 +1251,17 @@ class CogGraph:
 
             if vec.shape[-1] != self._goal_dim():
                 # 理论不会发生，安全检查
-                print(f"[警告] 对齐失败 {unit.id} 长度 {vec.shape[-1]}")
+                logger.warning(f"[警告] 对齐失败 {unit.id} 长度 {vec.shape[-1]}")
                 continue
 
             aligned.append(vec.unsqueeze(0))
 
         if aligned:
             stacked = torch.cat(aligned, dim=0)      # [N, goal_dim]
-            print("[输出检查] Emitter 对齐后均值(前5) :", stacked.mean(dim=0)[:5])
+            logger.debug("[输出检查] Emitter 对齐后均值(前5) :", stacked.mean(dim=0)[:5])
             return stacked
         else:
-            print("[输出检查] 当前没有活跃的 emitter 单元")
+            logger.debug("[输出检查] 当前没有活跃的 emitter 单元")
             return None
 
 
@@ -1036,7 +1278,7 @@ def interpret_emitter_output(output_tensor):
         raw_index = torch.argmax(out).item()
         action_index = raw_index % 4  # 🌟 折叠到 0~3
         action = ["上", "下", "左", "右"][action_index]  # 或者自定义动作名称
-        print(f"[行为触发] 第 {i + 1} 个 emitter 执行动作: {action}（原始 index = {raw_index}）")
+        logger.debug(f"[行为触发] 第 {i + 1} 个 emitter 执行动作: {action}（原始 index = {raw_index}）")
 
 
 def environment_feedback(output_tensor, graph):
@@ -1053,7 +1295,7 @@ def environment_feedback(output_tensor, graph):
         if out[5] > 0.3 and out[13] < -0.1:  # 自定义规则
             emitter = [u for u in graph.units if u.get_role() == "emitter"][i]
             emitter.energy += 0.05  # 简单奖励
-            print(f"[奖励] emitter {emitter.id} 因 ↑+→ 被奖励 +0.05 能量")
+            logger.debug(f"[奖励] emitter {emitter.id} 因 ↑+→ 被奖励 +0.05 能量")
 
 
 
@@ -1102,8 +1344,8 @@ if __name__ == "__main__":
         graph.connect(u, processor_list[0]) if u.role == "sensor" else graph.connect(processor_list[-1], u)
 
     # 运行模拟
-    for step in range(500):
-        print(f"\n==== 第 {step+1} 步 ====")
+    for step in range(20000):
+        logger.info(f"\n==== 第 {step+1} 步 ====")
         # 1️⃣ 获取环境状态，输入 sensor
         state = env.get_state()
         input_tensor = torch.cat([
@@ -1119,7 +1361,7 @@ if __name__ == "__main__":
         if emitter_output is not None:
             raw_idx = torch.argmax(emitter_output.mean(dim=0)).item()
             action_index = raw_idx % 4  # 折叠到 0-3
-            print(f"[行动决策] 执行动作: {action_index}")
+            logger.debug(f"[行动决策] 执行动作: {action_index}")
 
             # 4️⃣ 执行动作，改变环境
             env.step(action_index)
@@ -1128,18 +1370,19 @@ if __name__ == "__main__":
                 if unit.get_role() == "emitter":
                     unit.energy += env.agent_energy_gain
                     unit.energy -= env.agent_energy_penalty
-                    print(f"[环境反馈] {unit.id} +{env.agent_energy_gain:.2f} -{env.agent_energy_penalty:.2f}")
+                    logger.debug(f"[环境反馈] {unit.id} +{env.agent_energy_gain:.2f} -{env.agent_energy_penalty:.2f}")
 
         # 5️⃣ 打印环境图示
         env.render()
 
         # 如果没有单元剩下，退出d
         if not graph.units:
-            print("[终止] 所有单元死亡。")
+            logger.info("[终止] 所有单元死亡。")
             break
 
 from collections import Counter
 final_counts = Counter([unit.get_role() for unit in graph.units])
 print("\n🧬 最终细胞总数统计：", dict(final_counts))
 print("🔢 总细胞数 =", len(graph.units))
+print(f"\n🧪 模拟结束后能量池剩余：{graph.energy_pool:.2f}")
 
