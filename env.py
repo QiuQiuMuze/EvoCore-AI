@@ -1,3 +1,4 @@
+# env.py
 import numpy as np
 import random
 import logging
@@ -40,8 +41,10 @@ logger.addHandler(console_handler)
 
 
 class GridEnvironment:
-    def __init__(self, size=10):
+    action_space_n = 4  # 上/下/左/右
+    def __init__(self, size=10, max_steps: int | None = None):
         self.size = size
+        self.max_steps = max_steps
         self.resources = set()
         self.hazards = set()
         self.step_count = 0
@@ -60,6 +63,12 @@ class GridEnvironment:
     def reset(self):
         # agent 初始化在随机位置
         self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        # --- 新增: 重置计数 & 能量字段 ---
+        self.step_count = 0
+        self.agent_energy_gain = 0.0
+        self.agent_energy_penalty = 0.0
+        # --- 返回初始观测 ---
+        return self.get_state()
 
     def step(self, action):
         """
@@ -97,6 +106,19 @@ class GridEnvironment:
         self.step_count += 1
         if self.step_count % 100 == 0:
             self.refresh_environment()
+        # --- 计算奖励 & 下一状态 ---
+        reward = self.agent_energy_gain - self.agent_energy_penalty
+        next_state = self.get_state()
+        # --- 终止条件 (done) ---
+        done = False
+        # ① 资源全部收集完
+        if not self.resources:
+            done = True
+        # ② 超过 max_steps（若指定）
+        elif self.max_steps is not None and self.step_count >= self.max_steps:
+            done = True
+
+        return next_state, reward, done, {}
 
     def get_state(self):
         """
@@ -120,7 +142,7 @@ class GridEnvironment:
 
         # 堆叠三层，并展开为 1D 向量
         stacked = np.stack([agent_layer, resource_layer, hazard_layer], axis=0)
-        return stacked.flatten()
+        return stacked.flatten().astype(np.float32)
 
     def render(self):
         grid = np.full((self.size, self.size), '.', dtype=str)

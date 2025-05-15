@@ -6,6 +6,14 @@ import logging
 import logging
 from collections import deque
 
+# ======== CogUnit 全局功能开关 ========
+ENABLE_MINI_LEARN = False   # ← 关闭自编码训练
+FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
+# 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
+MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
+# ====================================
+
+
 class LimitedDebugHandler(logging.Handler):
     def __init__(self, capacity=100):
         super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
@@ -121,6 +129,20 @@ class CogUnit:
 
         if "mutation_rate" not in self.gene:
             self.gene["mutation_rate"] = 0.05
+        self.device = torch.device("cpu")  # 默认跟随 CPU
+
+    # ---------------- 新增 ----------------
+    def to(self, device):
+        """把内部权重 & 状态迁移到指定设备（cpu / cuda）"""
+        device = torch.device(device)
+        self.device = device
+        self.function.to(device)
+        self.state = self.state.to(device)
+        self.last_output = self.last_output.to(device)
+        # 若还有其他缓存张量，也一并 .to(device)
+        return self
+    # -------------------------------------
+
 
     def get_position(self):
         return self.position
@@ -163,6 +185,11 @@ class CogUnit:
 
 
     def update(self, input_tensor: torch.Tensor):
+        if FOLLOW_INPUT_DEVICE:
+            # 若输入在 GPU，但 self.function 还在 CPU，就迁过去
+            if self.function[0].weight.device != input_tensor.device:
+                self.to(input_tensor.device)
+
         """更新 CogUnit 状态"""
         if input_tensor.dim() == 1:
             input_tensor = input_tensor.unsqueeze(0)
@@ -239,18 +266,23 @@ class CogUnit:
         if self.get_role() == "emitter":
             bias = self.gene.get("emitter_bias", 1.0)
             lr = 0.001 * (2.0 - min(1.5, bias))
-            self.mini_learn(input_tensor, self.last_output.detach(), lr=lr)
+            if ENABLE_MINI_LEARN:
+                self.mini_learn(input_tensor, self.last_output.detach(), lr=lr)
 
         else:
             # processor/sensor 仍是自编码式
             bias = self.gene.get("processor_bias", 1.0) if self.role == "processor" else self.gene.get("sensor_bias",
                                                                                                        1.0)
             lr = 0.001 * (2.0 - min(1.5, bias))  # bias 越高，学习率越低，代表更“稳健”，越低则更易激动
-            self.mini_learn(input_tensor, input_tensor, lr=lr)
+            if ENABLE_MINI_LEARN:
+                self.mini_learn(input_tensor, input_tensor, lr=lr)
 
     def get_output(self) -> torch.Tensor:
         """返回给下游单元使用的输出 (shape=[1, input_size])"""
+        if MAX_OUTPUT_DIM is not None and self.last_output.numel() > MAX_OUTPUT_DIM:
+            return self.last_output[:MAX_OUTPUT_DIM]
         return self.last_output
+
 
     def should_split(self):
 
@@ -550,6 +582,11 @@ class CogUnit:
         self.energy *= 0.4
         # ✅ 继承局部记忆池（只保留最新的 75 条）
         clone_unit.local_memory_pool = [m for m in self.local_memory_pool if "score" in m][-75:]
+
+        # --------------------
+        # ⚡ 将子细胞迁移到与母体相同的 device
+        clone_unit.to(self.device)
+        # --------------------
 
         # 🎯 改为融合 local memory（局部记忆池）
         if hasattr(self, "local_memory_pool") and len(self.local_memory_pool) >= 1:

@@ -96,7 +96,42 @@ class CogGraph:
     - 管理连接（可拓展为图）
     - 调度每一轮所有 CogUnit 的更新、分裂、死亡，并传递输出
     """
-    def __init__(self):
+
+    # -------------------------------------------------------------------
+    # 自动生成种子细胞（sensor=1, processor=4, emitter=1，可调）
+    def _init_seed_units(self,
+                         n_sensor: int = 2,
+                         n_processor: int = 4,
+                         n_emitter: int = 2,
+                         device: str = "cpu"):
+
+        expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+
+        # 1) 创建
+        sensors = [CogUnit(input_size=expected_input, role="sensor") for _ in range(n_sensor)]
+        processors = [CogUnit(input_size=expected_input, role="processor") for _ in range(n_processor)]
+        emitters = [CogUnit(input_size=expected_input, role="emitter") for _ in range(n_emitter)]
+
+        # 2) 迁移到目标 device
+        for u in sensors + processors + emitters:
+            u.to(device)
+
+        # 3) 加入图
+        for u in sensors + processors + emitters:
+            self.add_unit(u)
+
+        # 4) 连接：sensor → processor → emitter
+        for s in sensors:
+            for p in processors:
+                self.connect(s, p)
+        for p in processors:
+            for e in emitters:
+                self.connect(p, e)
+
+    # -------------------------------------------------------------------
+    def __init__(self, device: str = "cpu"):
+        self.device = torch.device(device)
+        # === RL 接口：Processor 输出的统一维度 ===
         self.debug = False
         self.reverse_connections = {}  # to_id -> set(from_ids)
         self.sensor_count = 0
@@ -115,6 +150,10 @@ class CogGraph:
         self.units = []
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
+        self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
+        # --- 在 __init__() 的最后调用 ---
+        self._init_seed_units(device=device)
+
 
     def _update_global_counts(self):
         total = len(self.units)
@@ -149,6 +188,12 @@ class CogGraph:
                 logger.debug(f"  {frm} → {to} = {strg:.3f}")
 
     def add_unit(self, unit: CogUnit):
+        # --- 若图中已有单元，则让新单元跟随它们的 device ---
+        if self.units:
+            target_device = self.units[0].device
+            if unit.device != target_device:
+                unit.to(target_device)
+        # -----------------------------------------------
         # 将单元加入图结构中
         self.units.append(unit)
         self.unit_map[unit.id] = unit
@@ -293,6 +338,82 @@ class CogGraph:
         pad = (0, goal_dim - length)
         return torch.nn.functional.pad(tensor, pad)
 
+    # ------------------------------------------------------------------
+    # 🆕 供强化学习调用的简化接口
+    def reset_state(self):
+        """
+        每个 episode 开始时调用。这里只清零瞬时计数器，
+        不重置能量 / age 等长期指标。
+        """
+        for u in self.units:
+            u.call_history.clear()
+            u.inactive_steps = 0
+
+
+
+    def sensor_forward(self, env_state_np):
+        """
+        Args:
+            env_state_np : np.ndarray 或 torch.Tensor (size=N)
+        Returns:
+            torch.Tensor (size = env_state_np.size) —— 作为 sensor 输出
+        """
+        dev = self.device  # ← 统一目标设备
+        x = torch.as_tensor(env_state_np, dtype=torch.float32, device=dev).view(-1)
+        if x.numel() < self.processor_hidden_size:
+            pad = (0, self.processor_hidden_size - x.numel())
+            x = torch.nn.functional.pad(x, pad)
+        else:
+            x = x[: self.processor_hidden_size]
+        sensors = [u for u in self.units if u.get_role() == "sensor"]
+        if sensors:
+            outs = []
+            for s in sensors:
+                s.update(x.unsqueeze(0))
+                outs.append(s.get_output().view(-1))
+            return torch.stack(outs).mean(dim=0)
+        return x.to(dev)
+
+    def processor_forward(self, sensor_out):
+        """
+        Args:
+            sensor_out : torch.Tensor 1-D
+        Returns:
+            torch.Tensor (size = self.processor_hidden_size)
+        """
+        dev = self.device  # ← 统一目标设备
+        sensor_out = sensor_out.to(dev)
+        processors = [u for u in self.units if u.get_role() == "processor"]
+        if processors:
+            inp = sensor_out.unsqueeze(0)  # (1,D)
+            outs = []
+            for p in processors:
+                p.update(inp)
+                outs.append(p.get_output().view(-1))
+            merged = torch.stack(outs).mean(dim=0)
+        else:
+            merged = sensor_out
+
+        # —— 统一到 processor_hidden_size ——
+        if merged.numel() < self.processor_hidden_size:
+            pad = (0, self.processor_hidden_size - merged.numel())
+            merged = torch.nn.functional.pad(merged, pad)
+        else:
+            merged = merged[: self.processor_hidden_size]
+        return merged.to(dev)
+
+    def emitter_forward(self, processor_out):
+        """
+        把 processor_out 递给所有 emitter 做一次更新；
+        不要求返回值（若你想调试，可 return 平均输出）。
+        """
+        dev = self.device  # ← 统一目标设备
+        processor_out = processor_out.to(dev)
+        emitters = [u for u in self.units if u.get_role() == "emitter"]
+        if emitters:
+            inp = processor_out.unsqueeze(0)  # (1,D)
+            for e in emitters:
+                e.update(inp)
 
     def merge_redundant_units(self):
         merged_pairs = set()
@@ -789,8 +910,8 @@ class CogGraph:
                 del pool[:half]
 
     def step(self, input_tensor: torch.Tensor):
-        env_state = torch.from_numpy(self.env.get_state()).float().unsqueeze(0)
-        goal_tensor = self.task.encode_goal(self.env_size).unsqueeze(0)
+        env_state = torch.from_numpy(self.env.get_state()).float().to(self.device).unsqueeze(0)
+        goal_tensor = self.task.encode_goal(self.env_size).unsqueeze(0).to(self.device)
 
         if self.current_step == 10000:
             self.subsystem_competition = True
@@ -1350,90 +1471,90 @@ def environment_feedback(output_tensor, graph):
 
 
 
-if __name__ == "__main__":
-    env = GridEnvironment(size=5)
-    # 初始化任务目标（例如目标位置在右下角 (4, 4)）
-    task = TaskInjector(target_position=(4, 4))
-    goal_tensor = task.encode_goal(env.size)  # 生成 25维 one-hot 向量
-    graph = CogGraph()
-
-    # 初始化单元
-    sensor = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
-, role="sensor")
-    emitter = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
-, role="emitter")
-
-
-    # 多个 processor
-    processor_list = []
-    for _ in range(4):
-        p = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
-, role="processor")
-        processor_list.append(p)
-
-
-
-    # 加入图结构
-    graph.add_unit(sensor)
-    graph.add_unit(emitter)
-    for p in processor_list:
-        graph.add_unit(p)
-
-    # 建立连接
-    for p in processor_list:
-        graph.connect(sensor, p)
-        graph.connect(p, emitter)
-
-    # --- 新增：额外种子 ---
-    extra_sensors = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
-                             role="sensor") for _ in range(1)]  # 再补 1 个
-    extra_emitters = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
-                              role="emitter") for _ in range(1)]  # 再补 1 个
-    for u in extra_sensors + extra_emitters:
-        graph.add_unit(u)
-        # 让每个 sensor → processor[0]，processor[-1] → 每个 emitter，保证信息通路
-        graph.connect(u, processor_list[0]) if u.role == "sensor" else graph.connect(processor_list[-1], u)
-
-    # 运行模拟
-    for step in range(20000):
-        logger.info(f"\n==== 第 {step+1} 步 ====")
-        # 1️⃣ 获取环境状态，输入 sensor
-        state = env.get_state()
-        input_tensor = torch.cat([
-            torch.from_numpy(state).float(),
-            goal_tensor
-        ], dim=0)
-
-        # 2️⃣ 启动认知系统（感知 + 决策）
-        graph.step(input_tensor)
-
-        # 3️⃣ 收集 emitter 输出，转换为动作
-        emitter_output = graph.collect_emitter_outputs()
-        if emitter_output is not None:
-            raw_idx = torch.argmax(emitter_output.mean(dim=0)).item()
-            action_index = raw_idx % 4  # 折叠到 0-3
-            logger.debug(f"[行动决策] 执行动作: {action_index}")
-
-            # 4️⃣ 执行动作，改变环境
-            env.step(action_index)
-            # 🔁 将环境能量变化反馈给 emitter
-            for unit in graph.units:
-                if unit.get_role() == "emitter":
-                    unit.energy += env.agent_energy_gain
-                    unit.energy -= env.agent_energy_penalty
-                    logger.debug(f"[环境反馈] {unit.id} +{env.agent_energy_gain:.2f} -{env.agent_energy_penalty:.2f}")
-
-        # 5️⃣ 打印环境图示
-        env.render()
-
-        # 如果没有单元剩下，退出d
-        if not graph.units:
-            logger.info("[终止] 所有单元死亡。")
-            break
-
-from collections import Counter
-final_counts = Counter([unit.get_role() for unit in graph.units])
-print("\n🧬 最终细胞总数统计：", dict(final_counts))
-print("🔢 总细胞数 =", len(graph.units))
-print(f"\n🧪 模拟结束后能量池剩余：{graph.energy_pool:.2f}")
-
+# if __name__ == "__main__":
+#     env = GridEnvironment(size=5)
+#     # 初始化任务目标（例如目标位置在右下角 (4, 4)）
+#     task = TaskInjector(target_position=(4, 4))
+#     goal_tensor = task.encode_goal(env.size)  # 生成 25维 one-hot 向量
+#     graph = CogGraph()
+#
+#     # 初始化单元
+#     sensor = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+# , role="sensor")
+#     emitter = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+# , role="emitter")
+#
+#
+#     # 多个 processor
+#     processor_list = []
+#     for _ in range(4):
+#         p = CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS
+# , role="processor")
+#         processor_list.append(p)
+#
+#
+#
+#     # 加入图结构
+#     graph.add_unit(sensor)
+#     graph.add_unit(emitter)
+#     for p in processor_list:
+#         graph.add_unit(p)
+#
+#     # 建立连接
+#     for p in processor_list:
+#         graph.connect(sensor, p)
+#         graph.connect(p, emitter)
+#
+#     # --- 新增：额外种子 ---
+#     extra_sensors = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
+#                              role="sensor") for _ in range(1)]  # 再补 1 个
+#     extra_emitters = [CogUnit(input_size=graph.env_size * graph.env_size * INPUT_CHANNELS,
+#                               role="emitter") for _ in range(1)]  # 再补 1 个
+#     for u in extra_sensors + extra_emitters:
+#         graph.add_unit(u)
+#         # 让每个 sensor → processor[0]，processor[-1] → 每个 emitter，保证信息通路
+#         graph.connect(u, processor_list[0]) if u.role == "sensor" else graph.connect(processor_list[-1], u)
+#
+#     # 运行模拟
+#     for step in range(20000):
+#         logger.info(f"\n==== 第 {step+1} 步 ====")
+#         # 1️⃣ 获取环境状态，输入 sensor
+#         state = env.get_state()
+#         input_tensor = torch.cat([
+#             torch.from_numpy(state).float(),
+#             goal_tensor
+#         ], dim=0)
+#
+#         # 2️⃣ 启动认知系统（感知 + 决策）
+#         graph.step(input_tensor)
+#
+#         # 3️⃣ 收集 emitter 输出，转换为动作
+#         emitter_output = graph.collect_emitter_outputs()
+#         if emitter_output is not None:
+#             raw_idx = torch.argmax(emitter_output.mean(dim=0)).item()
+#             action_index = raw_idx % 4  # 折叠到 0-3
+#             logger.debug(f"[行动决策] 执行动作: {action_index}")
+#
+#             # 4️⃣ 执行动作，改变环境
+#             env.step(action_index)
+#             # 🔁 将环境能量变化反馈给 emitter
+#             for unit in graph.units:
+#                 if unit.get_role() == "emitter":
+#                     unit.energy += env.agent_energy_gain
+#                     unit.energy -= env.agent_energy_penalty
+#                     logger.debug(f"[环境反馈] {unit.id} +{env.agent_energy_gain:.2f} -{env.agent_energy_penalty:.2f}")
+#
+#         # 5️⃣ 打印环境图示
+#         env.render()
+#
+#         # 如果没有单元剩下，退出d
+#         if not graph.units:
+#             logger.info("[终止] 所有单元死亡。")
+#             break
+#
+# from collections import Counter
+# final_counts = Counter([unit.get_role() for unit in graph.units])
+# print("\n🧬 最终细胞总数统计：", dict(final_counts))
+# print("🔢 总细胞数 =", len(graph.units))
+# print(f"\n🧪 模拟结束后能量池剩余：{graph.energy_pool:.2f}")
+#
