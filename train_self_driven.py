@@ -28,6 +28,22 @@ from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
 
+import torch.nn as nn
+
+def resize_input_proj(net: nn.Module, new_dim: int, device):
+    """
+    把 net.policy_net.input_proj 从（old_dim→d_model）换成 (new_dim→d_model)，
+    并把旧权重的前 min(old_dim,new_dim) 列搬过去，bias 完全复制。
+    """
+    old = net.policy_net.input_proj
+    d_model = old.out_features
+    new = nn.Linear(new_dim, d_model).to(device)
+    with torch.no_grad():
+        # 复制旧权重到新权重的前半部分
+        cols = min(old.in_features, new_dim)
+        new.weight[:, :cols].copy_(old.weight[:, :cols])
+        new.bias.copy_(old.bias)
+    net.policy_net.input_proj = new
 
 # -------------------------------------------------------------------------- #
 #                              参数解析                                      #
@@ -69,11 +85,17 @@ def _infer_input_dim(graph: CogGraph, env_state: torch.Tensor) -> int:
 #                              训练主函数                                    #
 # -------------------------------------------------------------------------- #
 def main(cfg):
+    import logging
+    logging.debug("✅ Logger 测试 Debug")
+    logging.info("✅ Logger 测试 Info")
+
     device = torch.device(cfg.device)
 
-    # 1) 初始化环境 & 图
-    env = GridEnvironment(size=5)
-    graph = CogGraph(device=cfg.device)  # 若需传入参数，请自行修改
+    # 1) 初始化 CogGraph 内部环境 & 图
+    graph = CogGraph(device=cfg.device)  # 内部已包含 env = GridEnvironment(size=5)
+    graph.debug = True
+    # —— 让 train 循环也用同一个 env 实例 ——
+    env = graph.env
 
     # ---- 新增 ----
     import CogUnit
@@ -85,11 +107,14 @@ def main(cfg):
     input_dim = _infer_input_dim(graph, init_state)
     agent = RLAgent(
         input_dim=input_dim,
-        num_actions=4,                   # GridEnvironment 定义了 4 个动作
+        num_actions=4,
         lr=cfg.lr,
         gamma=cfg.gamma,
-        device=device
-    )
+        d_model=64,
+        device=device)
+
+    # 在创建 agent 之后
+    last_dim = graph.processor_hidden_size  # 初始 D_old
 
     print(f"[Init] transformer input_dim = {input_dim}, device = {device}")
 
@@ -97,25 +122,49 @@ def main(cfg):
     reward_history = []
     for ep in range(1, cfg.episodes + 1):
 
-        env.reset()
+
         # 如 graph 有 reset_state() 请调用；否则新建实例或跳过
         if hasattr(graph, "reset_state"):
             graph.reset_state()
+        env.reset()
 
         state = torch.from_numpy(env.get_state()).float().to(cfg.device)
         ep_reward = 0.0
 
+        from env import logger
         for t in range(cfg.max_steps):
+            # ——— 打印当前 Episode/Step 信息 ———
+            logger.info(f"\n==== Episode {ep}  Step {t+1} ====")
 
-            # --- CogGraph 前向 ---
-            if hasattr(graph, "sensor_forward"):
-                sensor_out = graph.sensor_forward(state)
-                processor_out = graph.processor_forward(sensor_out)
-                # emitter 接收 processor_out（可返回动作建议或仅更新内部）
-                graph.emitter_forward(processor_out)
-            else:
-                # fallback：直接用 env 状态当作序列输入
-                sensor_out = processor_out = state
+            # ——— 构造 CogGraph.step() 的输入（含目标向量） ———
+          # 这里我们复用 graph.task.encode_goal，
+            # 生成 (env_size*env_size*INPUT_CHANNELS,) 的 one-hot goal
+            goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
+
+            # 把环境状态展平，再拼上目标向量
+            flat_state = state.view(-1)  # (env_size*env_size*INPUT_CHANNELS,)
+            inp = torch.cat([flat_state, goal_vec], dim=0).unsqueeze(0)  # (1, D)
+
+           # ——— 真正调用 step() ———
+            # 这一步会：
+            #   1) 按序 sensor→processor→emitter
+            #   2) 更新 self.current_step
+            #   3) 触发所有 logger.info/debug
+            graph.step(inp)
+            # ——— 检测隐藏维度变化 & 重置 input_proj ———
+            new_dim = graph.processor_hidden_size
+            if new_dim != last_dim:
+                print(f"[Resize] input_proj: {last_dim} → {new_dim}")
+                resize_input_proj(agent, new_dim, device)
+                last_dim = new_dim
+
+            # ——— 拿出前向输出，构造 transformer 输入序列 ———
+            sensor_out    = graph.sensor_forward(state)
+            processor_out = graph.processor_forward(sensor_out)
+
+            # ——— 可视化环境 ——（可选，和你最初版本对齐）———
+            env.render()
+
 
             # --- 构造 transformer 输入 ---
             state_seq = torch.stack([sensor_out, processor_out], dim=0)  # (seq_len=2, dim)
@@ -125,8 +174,26 @@ def main(cfg):
             action = agent.select_action(state_seq)
             env.step(action)
 
+            # ---------- reward shaping ----------
+            agent_pos = tuple(env.agent_pos)                    # (x, y)
+            goal_pos  = graph.task.target_position              # 资源目标
+            dist_res  = abs(agent_pos[0] - goal_pos[0]) + abs(agent_pos[1] - goal_pos[1])
+            proximity_bonus = 0.2 if dist_res <= 2 else 0.0     # 靠近资源
+
+            danger_dist = env.distance_to_nearest_danger(agent_pos)
+            if danger_dist <= 1:
+                danger_shaping = -0.2                           # 靠近危险
+            elif danger_dist >= 3:
+                danger_shaping = 0.1                            # 远离危险
+            else:
+                danger_shaping = 0.0
+            # --------------------------------------
+
             # 奖励：环境内部字段决定
-            reward = getattr(env, "agent_energy_gain", 0.0) - getattr(env, "agent_energy_penalty", 0.0)
+            reward = (getattr(env, "agent_energy_gain", 0.0)
+                      - getattr(env, "agent_energy_penalty", 0.0)
+                      + proximity_bonus + danger_shaping)
+
             agent.store_reward(reward)
             ep_reward += reward
 
@@ -159,7 +226,6 @@ if __name__ == "__main__":
     cfg = get_cfg()
     main(cfg)
     t0 = time.time()
-    main(cfg)
     print(f"Total runtime: {time.time() - t0:.1f} s")
 
 """

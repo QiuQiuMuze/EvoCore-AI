@@ -35,7 +35,7 @@ logger.addHandler(debug_handler)
 
 # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.WARNING)
 console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(console_handler)
 
@@ -67,7 +67,8 @@ class GridEnvironment:
         self.step_count = 0
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
-        # --- 返回初始观测 ---
+        self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
+        self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
         return self.get_state()
 
     def step(self, action):
@@ -98,7 +99,7 @@ class GridEnvironment:
             self.agent_energy_gain = 0.0
 
         if pos in self.hazards:
-            self.agent_energy_penalty = 0.2
+            self.agent_energy_penalty = 0.3
         else:
             self.agent_energy_penalty = 0.0
 
@@ -106,8 +107,32 @@ class GridEnvironment:
         self.step_count += 1
         if self.step_count % 100 == 0:
             self.refresh_environment()
+            self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
+            self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
+
         # --- 计算奖励 & 下一状态 ---
-        reward = self.agent_energy_gain - self.agent_energy_penalty
+        # —— 基础奖励 ——
+        base = self.agent_energy_gain - self.agent_energy_penalty
+
+        # —— reward shaping ——
+        pos = (x, y)
+        # 1) 资源引导：走得更近 +0.1, 走远了 –0.1
+        dist_res = self.distance_to_nearest_resource(pos)
+        delta_res = self.prev_dist_resource - dist_res
+        resource_shaping = 0.1 if delta_res > 0 else (-0.1 if delta_res < 0 else 0.0)
+        self.prev_dist_resource = dist_res
+
+        # 2) 危险引导（delta 版本）
+        danger_dist = self.distance_to_nearest_danger(pos)
+        delta_danger = self.prev_danger_dist - danger_dist
+        # 如果比上一帧更远则 +0.1，离得更近则 –0.1，否则 0
+        danger_shaping = 0.1 if delta_danger > 0 else (-0.1 if delta_danger < 0 else 0.0)
+        # 更新 prev_danger_dist 供下次比较
+        self.prev_danger_dist = danger_dist
+
+        # 合成最终 reward
+        reward = base + resource_shaping + danger_shaping
+
         next_state = self.get_state()
         # --- 终止条件 (done) ---
         done = False
@@ -150,6 +175,21 @@ class GridEnvironment:
         grid[y, x] = 'A'
 
         logger.debug('\n' + '\n'.join(' '.join(row) for row in grid) + '\n')
+
+    # ---------------------------------------------------------
+    def distance_to_nearest_danger(self, pos):
+        """曼哈顿距离最近危险格；若无危险返回 +∞"""
+        if not self.hazards:
+            return float("inf")
+        return min(abs(pos[0] - hx) + abs(pos[1] - hy) for hx, hy in self.hazards)
+    # ---------------------------------------------------------
+
+    def distance_to_nearest_resource(self, pos):
+        """曼哈顿距离最近资源格；若无资源返回 +∞"""
+        if not self.resources:
+            return float("inf")
+        return min(abs(pos[0] - rx) + abs(pos[1] - ry)
+                   for rx, ry in self.resources)
 
 
 if __name__ == "__main__":

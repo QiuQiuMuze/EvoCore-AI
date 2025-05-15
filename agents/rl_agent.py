@@ -16,10 +16,12 @@ RLAgent
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from torch.distributions import Categorical
 from typing import List
 
 from models.transformer_policy import TransformerPolicyNetwork
+
 
 
 class RLAgent:
@@ -29,22 +31,37 @@ class RLAgent:
         self,
         input_dim: int,
         num_actions: int,
-        lr: float = 1e-4,
+        lr: float = 3e-4,
         gamma: float = 0.99,
+        d_model: int = 64,
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = torch.device(device)
+        # 1) 先构造策略网
         self.policy_net = TransformerPolicyNetwork(
             input_dim=input_dim,
-            num_actions=num_actions
+            num_actions=num_actions,
+            d_model=d_model  # ← 真正用到传入的 d_model
         ).to(self.device)
 
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.gamma = gamma
+        # 2) 再构造值函数
+        self.value_head = nn.Sequential(
+            nn.Linear(input_dim, 1)
+        ).to(self.device)
+
+
+
+        # 3) 优化器把两部分参数都加进来
+        params = list(self.policy_net.parameters()) + list(self.value_head.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr)
+
+        self.gamma = gamma  # ← 保存折扣因子
 
         # —— 轨迹缓存 ——
         self.log_probs: List[torch.Tensor] = []
         self.rewards:   List[float]       = []
+        self.saved_states = []  # baseline 需要状态输入
+
 
     # --------------------------------------------------------------------- #
     #                           交互接口                                     #
@@ -65,6 +82,8 @@ class RLAgent:
         dist = Categorical(logits=logits)
         action = dist.sample()                       # Tensor([])
         self.log_probs.append(dist.log_prob(action)) # 缓存本步 log π(a|s)
+        state_feat = state_seq.detach().mean(dim=1)  # (1, input_dim)
+        self.saved_states.append(state_feat)  # ← 保存一份状态序列，用于 baseline 值函数
         return action.item()
 
     def store_reward(self, r: float) -> None:
@@ -92,22 +111,34 @@ class RLAgent:
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         return returns
 
-    def finish_episode(self) -> None:
-        """在 episode 结束时调用，执行一次策略梯度更新并清空缓存。"""
-        if not self.rewards:
-            return
+    def finish_episode(self):
+        R = 0
+        returns = []
+        for r in reversed(self.rewards):
+            R = r + self.gamma * R
+            returns.insert(0, R)
+        returns = torch.tensor(returns, device=self.device)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-        returns = self._compute_returns()  # (T,)
+        # 新 Actor-Critic 损失
+        policy_loss = []
+        value_loss = []
 
-        loss = -sum(lp * G for lp, G in zip(self.log_probs, returns))
+        for log_prob, state_feat, R in zip(self.log_probs, self.saved_states, returns):
+            value = self.value_head(state_feat).squeeze()
+            advantage = R - value.detach()
+            policy_loss.append(-log_prob * advantage)
+            value_loss.append(torch.nn.functional.mse_loss(value, R))
+
+        loss = torch.stack(policy_loss).sum() + 0.5 * torch.stack(value_loss).sum()
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # —— 清空缓存 —— #
         self.log_probs.clear()
         self.rewards.clear()
+        self.saved_states.clear()
 
     # --------------------------------------------------------------------- #
     #                          模型持久化                                    #
@@ -116,12 +147,14 @@ class RLAgent:
     def save(self, path: str) -> None:
         torch.save({
             "policy_state_dict": self.policy_net.state_dict(),
+            "value_state_dict": self.value_head.state_dict(),  # ← 新增
             "optimizer_state_dict": self.optimizer.state_dict(),
         }, path)
 
     def load(self, path: str, map_location: str | torch.device | None = None) -> None:
         checkpoint = torch.load(path, map_location=map_location or self.device)
         self.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+        self.value_head.load_state_dict(checkpoint["value_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
 

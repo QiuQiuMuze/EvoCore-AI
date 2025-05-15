@@ -8,41 +8,43 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 from collections import deque, Counter
+from env import logger
 
 
-class LimitedDebugHandler(logging.Handler):
-    def __init__(self, capacity=100):
-        super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
-        self.buffer = deque(maxlen=capacity)
 
-    def emit(self, record):
-        if record.levelno == logging.DEBUG:
-            try:
-                msg = self.format(record)
-                self.buffer.append(msg)
-            except Exception:
-                pass  # 防止格式化报错
-
-    def dump_to_console(self):
-        print("\n==== [最近 Debug 日志] ====")
-        for msg in self.buffer:
-            print(msg)
-
-# === 设置 root logger ===
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
-
-# ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
-debug_handler = LimitedDebugHandler(capacity=100)
-debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(debug_handler)
-
-# ✅ 添加正常输出 Handler（只显示 INFO 及以上）
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(console_handler)
+# class LimitedDebugHandler(logging.Handler):
+#     def __init__(self, capacity=100):
+#         super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
+#         self.buffer = deque(maxlen=capacity)
+#
+#     def emit(self, record):
+#         if record.levelno == logging.DEBUG:
+#             try:
+#                 msg = self.format(record)
+#                 self.buffer.append(msg)
+#             except Exception:
+#                 pass  # 防止格式化报错
+#
+#     def dump_to_console(self):
+#         print("\n==== [最近 Debug 日志] ====")
+#         for msg in self.buffer:
+#             print(msg)
+#
+# # === 设置 root logger ===
+# logger = logging.getLogger()
+# logger.setLevel(logging.INFO)
+# logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
+#
+# # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
+# debug_handler = LimitedDebugHandler(capacity=100)
+# debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
+# logger.addHandler(debug_handler)
+#
+# # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
+# console_handler = logging.StreamHandler()
+# console_handler.setLevel(logging.DEBUG)
+# console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+# logger.addHandler(console_handler)
 
 
 
@@ -160,6 +162,8 @@ class CogGraph:
         self.sensor_count    = sum(1 for u in self.units if u.get_role()=="sensor")
         self.processor_count = sum(1 for u in self.units if u.get_role()=="processor")
         self.emitter_count   = sum(1 for u in self.units if u.get_role()=="emitter")
+        # 动态计算目标容量：例如  max(50, total//2)  随细胞数线性增长
+        target_mem_cap = max(50, total // 2)
         for u in self.units:
             u.global_sensor_count    = self.sensor_count
             u.global_processor_count = self.processor_count
@@ -348,6 +352,15 @@ class CogGraph:
         for u in self.units:
             u.call_history.clear()
             u.inactive_steps = 0
+        # —— 若要每个 episode 从头开始，请取消下面注释 ——
+        # self.current_step = 0
+        # self.energy_pool   = self.initial_energy_pool  # 在 __init__ 中保存初始值
+        # self.connections   = {u.id: {} for u in self.units}
+        # self.reverse_connections = {u.id: set() for u in self.units}
+        # # 如有必要，也重置每个单元的 age / energy / subsystem_id 等
+        # for u in self.units:
+        # u.age = 0
+        # u.energy = u.initial_energy  # 需在 CogUnit 中保存初始能量
 
 
 
@@ -910,6 +923,8 @@ class CogGraph:
                 del pool[:half]
 
     def step(self, input_tensor: torch.Tensor):
+        self._update_global_counts()
+        self.current_step += 1
         env_state = torch.from_numpy(self.env.get_state()).float().to(self.device).unsqueeze(0)
         goal_tensor = self.task.encode_goal(self.env_size).unsqueeze(0).to(self.device)
 
@@ -922,46 +937,43 @@ class CogGraph:
                 unit.dynamic_aging = True
             logger.info("[进化] 动态寿命机制已激活（Dynamic Aging）")
 
+
+
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
-            pool_energy = self.energy_pool  # ✅ 使用真实能量池
+            pool_energy = self.energy_pool
             total_e = total_cell_energy + pool_energy
+            max_e = self.max_total_energy
 
-            if self.current_step > 200 and self.current_step % 10 == 0:
-                total_cell_energy = self.total_energy()
-                pool_energy = self.energy_pool
-                total_e = total_cell_energy + pool_energy
-                max_e = self.max_total_energy
+            if total_e > max_e:
+                excess = total_e - max_e
+                tiers = [
+                    (0.00, 0.15, 0.01),  # 超出 0~15% 部分收 1%
+                    (0.15, 0.35, 0.05),  # 超出 15~35% 部分收 5%
+                    (0.35, 0.55, 0.10),  # 超出 35~55% 部分收 10%
+                    (0.50, float("inf"), 0.50)  # 超出 55% 部分收 50%
+                ]
 
-                if total_e > max_e:
-                    excess = total_e - max_e
-                    tiers = [
-                        (0.00, 0.15, 0.01),  # 超出 0~15% 部分收 1%
-                        (0.15, 0.35, 0.05),  # 超出 15~35% 部分收 5%
-                        (0.35, 0.55, 0.10),  # 超出 35~55% 部分收 10%
-                        (0.50, float("inf"), 0.50)  # 超出 55% 部分收 50%
-                    ]
+                tax = 0.0
+                for lower, upper, rate in tiers:
+                    lower_abs = max_e * lower
+                    upper_abs = max_e * upper
+                    if excess > lower_abs:
+                        taxed_amount = min(excess, upper_abs) - lower_abs
+                        tax += taxed_amount * rate
 
-                    tax = 0.0
-                    for lower, upper, rate in tiers:
-                        lower_abs = max_e * lower
-                        upper_abs = max_e * upper
-                        if excess > lower_abs:
-                            taxed_amount = min(excess, upper_abs) - lower_abs
-                            tax += taxed_amount * rate
-
-                    if pool_energy >= tax:
-                        self.energy_pool -= tax
-                        logger.info(
-                            f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 累进税 {tax:.2f}（池足够，剩余池能 {self.energy_pool:.2f}）")
-                    else:
-                        tax_from_cells = tax - self.energy_pool
-                        self.energy_pool = 0.0
-                        loss_per_unit = tax_from_cells / max(len(self.units), 1)
-                        for unit in self.units:
-                            unit.energy -= loss_per_unit
-                        logger.info(
-                            f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
+                if pool_energy >= tax:
+                    self.energy_pool -= tax
+                    logger.info(
+                        f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 累进税 {tax:.2f}（池足够，剩余池能 {self.energy_pool:.2f}）")
+                else:
+                    tax_from_cells = tax - self.energy_pool
+                    self.energy_pool = 0.0
+                    loss_per_unit = tax_from_cells / max(len(self.units), 1)
+                    for unit in self.units:
+                        unit.energy -= loss_per_unit
+                    logger.info(
+                        f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step > 0 and self.current_step % 500 == 0:
@@ -969,6 +981,7 @@ class CogGraph:
             self.env_size = min(self.env_size + 5, 20)  # 每次+5，最大到20x20
             self.env = GridEnvironment(size=self.env_size)  # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
+            self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
 
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
@@ -1018,7 +1031,6 @@ class CogGraph:
                     self.unit_map = {u.id: u for u in self.units}
                     self.connections = {u.id: {} for u in self.units}
 
-        self.current_step += 1
 
         if self.current_step > 2000 and self.current_step % 40 == 0:
             total = len(self.units)
@@ -1081,8 +1093,7 @@ class CogGraph:
                 u.is_elite = True
                 u.age = 0  # ← 关键：清零年龄，让它从头开始，避免进入老化死亡窗口
 
-
-        # （此处删除上面那整块计数与赋值，Step 里不再更新全局计数）
+        # 恢复全局计数更新，避免 should_split 拿到过时值
 
 
         new_units = []  # 新生成的单元（复制）
@@ -1130,7 +1141,7 @@ class CogGraph:
                 for uid in incoming:
                     strength = self.connections[uid][unit.id]
                     output = self.unit_map[uid].get_output().squeeze(0)  # 统一为 [8]
-                    target_len = self.env_size * self.env_size * INPUT_CHANNELS
+                    target_len = self.processor_hidden_size
                     if output.shape[0] != target_len:
                         padding = (0, target_len - output.shape[0])
 
@@ -1189,7 +1200,7 @@ class CogGraph:
             unit_factor = 1.0 + 0.005 * max(0, len(self.units) - 50)
 
             # 代谢公式加入动态因子
-            decay = (var * 0.25 + call_density * 0.04 + conn_strength_sum * 0.02) \
+            decay = (var * 0.15 + call_density * 0.04 + conn_strength_sum * 0.02) \
                     * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
@@ -1304,10 +1315,6 @@ class CogGraph:
                             unit.energy += 0.06  # 给 processor 更多能量，鼓励参与
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
-        # —— 定期合并 & 重构（核心算法，必须保留） ——
-        if self.current_step % 100 == 0:
-            self.merge_redundant_units()
-            self.restructure_common_subgraphs()
 
         # —— 可选路径追踪（纯调试，不影响状态） ——
         if self.debug and self.current_step % 50 == 0:
@@ -1363,6 +1370,11 @@ class CogGraph:
         for unit in new_units:
             self.add_unit(unit)
 
+        # —— 定期合并 & 重构（核心算法，必须保留） ——
+        if self.current_step % 100 == 0:
+            self.merge_redundant_units()
+            self.restructure_common_subgraphs()
+
         # === 🪫 能量池补给机制：支持能量低的细胞 ===
         if self.energy_pool > 0.0:
             weak_units = [u for u in self.units if u.energy < 0.8]
@@ -1379,29 +1391,34 @@ class CogGraph:
             if unit.input_size < new_input_size:
                 logger.info(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
 
-                # 保留旧输出部分，补零到新维度
+                # 1. 升维 last_output
                 old_output = unit.last_output
                 if old_output.dim() == 2 and old_output.shape[0] == 1:
                     old_output = old_output.squeeze(0)
-
-                padded_output = torch.zeros(new_input_size)
+                padded_output = torch.zeros(new_input_size, device=old_output.device)
                 padded_output[:old_output.shape[0]] = old_output
                 unit.last_output = padded_output
 
-                # 同理，state 也升维
-                if unit.state.shape[0] < new_input_size:
-                    padded_state = torch.zeros(new_input_size)
-                    old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
-                    padded_state[:old_state.shape[0]] = old_state
-                    unit.state = padded_state
+                # 2. 检查 hidden_size 是否也要升高（只升不降）
+                if unit.state.shape[0] > unit.hidden_size:
+                    unit.hidden_size = unit.state.shape[0]
+                    logger.info(f"[升维] {unit.id} hidden_size 升至 {unit.hidden_size}")
 
-                # 重建网络结构（隐藏层维度不变）
+                # 3. 升维 state
+                old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
+                padded_state = torch.zeros(unit.hidden_size, device=old_state.device)
+                length = min(padded_state.shape[0], old_state.shape[0])
+                padded_state[:length] = old_state[:length]
+                unit.state = padded_state
+
+                # 4. 重建网络结构
                 unit.function = torch.nn.Sequential(
                     torch.nn.Linear(new_input_size, unit.hidden_size),
                     torch.nn.ReLU(),
                     torch.nn.Linear(unit.hidden_size, new_input_size)
                 )
 
+                # 5. 更新 input_size
                 unit.input_size = new_input_size
 
     def summary(self):
@@ -1472,6 +1489,7 @@ def environment_feedback(output_tensor, graph):
 
 
 # if __name__ == "__main__":
+#     print(logger.handlers)
 #     env = GridEnvironment(size=5)
 #     # 初始化任务目标（例如目标位置在右下角 (4, 4)）
 #     task = TaskInjector(target_position=(4, 4))

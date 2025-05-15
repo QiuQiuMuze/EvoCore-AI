@@ -2,8 +2,7 @@
 import torch
 import uuid
 import random
-import logging
-import logging
+from env import logger
 from collections import deque
 
 # ======== CogUnit 全局功能开关 ========
@@ -14,39 +13,39 @@ MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
 # ====================================
 
 
-class LimitedDebugHandler(logging.Handler):
-    def __init__(self, capacity=100):
-        super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
-        self.buffer = deque(maxlen=capacity)
-
-    def emit(self, record):
-        if record.levelno == logging.DEBUG:
-            try:
-                msg = self.format(record)
-                self.buffer.append(msg)
-            except Exception:
-                pass  # 防止格式化报错
-
-    def dump_to_console(self):
-        print("\n==== [最近 Debug 日志] ====")
-        for msg in self.buffer:
-            print(msg)
-
-# === 设置 root logger ===
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
-
-# ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
-debug_handler = LimitedDebugHandler(capacity=100)
-debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(debug_handler)
-
-# ✅ 添加正常输出 Handler（只显示 INFO 及以上）
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(console_handler)
+# class LimitedDebugHandler(logging.Handler):
+#     def __init__(self, capacity=100):
+#         super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
+#         self.buffer = deque(maxlen=capacity)
+#
+#     def emit(self, record):
+#         if record.levelno == logging.DEBUG:
+#             try:
+#                 msg = self.format(record)
+#                 self.buffer.append(msg)
+#             except Exception:
+#                 pass  # 防止格式化报错
+#
+#     def dump_to_console(self):
+#         print("\n==== [最近 Debug 日志] ====")
+#         for msg in self.buffer:
+#             print(msg)
+#
+# # === 设置 root logger ===
+# logger = logging.getLogger()
+# logger.setLevel(logging.DEBUG)
+# logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
+#
+# # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
+# debug_handler = LimitedDebugHandler(capacity=100)
+# debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
+# logger.addHandler(debug_handler)
+#
+# # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
+# console_handler = logging.StreamHandler()
+# console_handler.setLevel(logging.INFO)
+# console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+# logger.addHandler(console_handler)
 
 
 
@@ -89,7 +88,6 @@ class CogUnit:
     def __init__(self, input_size=50, hidden_size=16, role="processor"):
         self.is_elite = False
         self.local_memory_pool = []  # 每个单元的私有记忆池
-        self.memory_pool_limit = 150  # 每个细胞记忆池最多保留 N 条
 
         # 基因表达，表示对不同功能的偏好
         self.gene = {
@@ -196,17 +194,19 @@ class CogUnit:
 
         # 🚨 先检查 input_size 是否需要扩展（动态适配环境变化）
         current_input_size = input_tensor.shape[-1]
-        if current_input_size != self.input_size:
-            logger.info(f"[动态扩展] {self.id} 输入尺寸变化 {self.input_size} → {current_input_size}")
-
-            # 重建 function 网络
-            self.function = torch.nn.Sequential(
-                torch.nn.Linear(current_input_size, self.hidden_size),
-                torch.nn.ReLU(),
-                torch.nn.Linear(self.hidden_size, current_input_size)
-            )
+        if current_input_size > self.input_size:
+            logger.info(f"[动态扩展] {self.id} 输入尺寸增加 {self.input_size} → {current_input_size}")
             self.input_size = current_input_size
-            self.last_output = torch.zeros(current_input_size, device=input_tensor.device)
+            self.function = torch.nn.Sequential(
+                torch.nn.Linear(self.input_size, self.hidden_size),
+                torch.nn.ReLU(),
+                torch.nn.Linear(self.hidden_size, self.input_size)
+            )
+            self.last_output = torch.zeros(self.input_size, device=input_tensor.device)
+        elif current_input_size < self.input_size:
+            # 小于当前 input_size：补零 → 保持原有维度
+            pad = (0, self.input_size - current_input_size)
+            input_tensor = torch.nn.functional.pad(input_tensor, pad)
 
         # === Forward: 内部处理 ===
         raw_output = self.function(input_tensor)  # 正常forward
@@ -393,6 +393,8 @@ class CogUnit:
         return False
 
     def add_to_local_memory(self):
+        global_step = getattr(self, "current_step", 0)
+        self.memory_pool_limit = 50 + (global_step // 500) * 20  # 每 500 步 +20
         self.local_memory_pool = [m for m in self.local_memory_pool if "score" in m]
         # —— 对齐 output_history 到同一长度 ——
         import torch.nn.functional as F
@@ -555,11 +557,19 @@ class CogUnit:
         clone_unit.gene = {k: v for k, v in self.gene.items()}
 
         # 🌱 突变机制（小概率触发）
+        # ✅ 强制“只升不降”
         if random.random() < self.gene.get("mutation_rate", 0.01):
-            # hidden_size 微调 ±2（范围限制）
-            delta = random.choice([-2, 2])
-            clone_unit.hidden_size = max(4, min(64, self.hidden_size + delta))
-            logger.info(f"[突变] hidden_size 突变为 {clone_unit.hidden_size}")
+            delta = random.choice([2, 4])  # 只允许正增
+            new_hidden = self.hidden_size + delta
+            new_hidden = max(self.hidden_size, min(128, new_hidden))  # 保证不降
+            if new_hidden != self.hidden_size:
+                clone_unit.hidden_size = new_hidden
+                clone_unit.function = torch.nn.Sequential(
+                    torch.nn.Linear(clone_unit.input_size, new_hidden),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(new_hidden, clone_unit.input_size)
+                )
+                logger.info(f"[突变升维] hidden_size ↑ 为 {new_hidden}")
 
         if random.random() < self.gene.get("mutation_rate", 0.005):
 
@@ -616,16 +626,17 @@ class CogUnit:
                 if "hidden_size" in memory:
                     h1 = self.hidden_size
                     h2 = memory.get("hidden_size", h1)
-                    new_hidden = int(0.7 * h1 + 0.3 * h2)
-                    new_hidden = max(4, min(128, new_hidden))
-                    clone_unit.hidden_size = new_hidden
-                    clone_unit.function = torch.nn.Sequential(
-                        torch.nn.Linear(clone_unit.input_size, new_hidden),
-                        torch.nn.ReLU(),
-                        torch.nn.Linear(new_hidden, clone_unit.input_size)
-                    )
-                    clone_unit.gene["hidden_size_tag"] = new_hidden
-                    logger.debug(f"[网络融合] hidden_size 融合为 {new_hidden}")
+                    new_hidden = max(h1, int(0.7 * h1 + 0.3 * h2))  # ✅ 不允许降维
+                    new_hidden = min(128, new_hidden)
+                    if new_hidden != self.hidden_size:
+                        clone_unit.hidden_size = new_hidden
+                        clone_unit.function = torch.nn.Sequential(
+                            torch.nn.Linear(clone_unit.input_size, new_hidden),
+                            torch.nn.ReLU(),
+                            torch.nn.Linear(new_hidden, clone_unit.input_size)
+                        )
+                        clone_unit.gene["hidden_size_tag"] = new_hidden
+                        logger.debug(f"[网络融合] hidden_size 融合为 {new_hidden}")
         return clone_unit
 
     def get_role(self):

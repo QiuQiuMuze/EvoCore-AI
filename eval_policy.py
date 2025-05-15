@@ -9,6 +9,7 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     # 1) 重建组件
     env   = GridEnvironment(size=5)
     graph = CogGraph(device=device)
+    graph.debug = True
     input_dim = graph.processor_hidden_size
     agent = RLAgent(input_dim=input_dim, num_actions=env.action_space_n, device=device)
     agent.load(ckpt_path, map_location=device)
@@ -42,8 +43,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="checkpoints/agent_ep2000.pth")
     parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=4000) # 检测的最长步数
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     args = parser.parse_args()
     t0 = time.time()
-    evaluate(args.ckpt, episodes=args.episodes, device=args.device)
+    evaluate(args.ckpt,
+            episodes = args.episodes,
+            max_steps = args.max_steps,  # ← 传递
+            device = args.device)
     print(f"⏱  finished in {time.time()-t0:.1f}s")

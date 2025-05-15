@@ -23,7 +23,7 @@ class TransformerPolicyNetwork(nn.Module):
         self,
         input_dim: int,            # 传入 sensor / processor 的 state 向量维度（已统一）
         num_actions: int,          # 环境动作数量（你的 GridEnvironment.action_space_n）
-        d_model: int = 128,        # Transformer 隐藏维度
+        d_model: int = 64,        # Transformer 隐藏维度
         nhead: int = 4,            # 多头注意力头数
         num_layers: int = 2,       # Encoder 层数
         dim_feedforward: int = 256,
