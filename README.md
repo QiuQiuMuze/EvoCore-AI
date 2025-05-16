@@ -1,3 +1,6 @@
+**郭宗磊独立制作
+Independently created by Zonglei Guo**
+
 EvoCore 系统结构与模块功能总览
 
 项目简介：EvoCore = 可成长的 AI 胚胎体
