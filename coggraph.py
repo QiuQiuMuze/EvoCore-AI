@@ -1027,8 +1027,7 @@ class CogGraph:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
-        elif self.max_total_energy == 4000:
-            self.max_total_energy = 6000
+
 
         # 若当前步数非常早期，给予基础能量补偿
         if self.current_step < 10:
@@ -1236,7 +1235,7 @@ class CogGraph:
             unit_factor = 1.0 + 0.00004 * max(0, len(self.units) - 150)
 
             # 代谢公式加入动态因子
-            decay = (var * 0.20 + call_density * 0.09 + conn_strength_sum * 0.09) * dim_scale * bias_factor * step_factor * unit_factor
+            decay = (var * 0.35 + call_density * 0.17 + conn_strength_sum * 0.17) * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)

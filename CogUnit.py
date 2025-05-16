@@ -106,7 +106,7 @@ class CogUnit:
         self.position = (random.randint(0, 10), random.randint(0, 10))  # 可调范围
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
-        self.memory_pool_limit = self.memory_limit
+        self.memory_pool_limit = 50
         self.role = role
         self.id = uuid.uuid4()          # 唯一标识
         self.energy = 1.0               # 初始能量
@@ -184,6 +184,9 @@ class CogUnit:
 
 
     def update(self, input_tensor: torch.Tensor):
+        global_step = getattr(self, "current_step", 0)
+        self.memory_pool_limit = 50 + (global_step // 500) * 20  # 每 500 步 +20
+
         if FOLLOW_INPUT_DEVICE:
             # 若输入在 GPU，但 self.function 还在 CPU，就迁过去
             if self.function[0].weight.device != input_tensor.device:
@@ -239,6 +242,7 @@ class CogUnit:
         connection_count = getattr(self, "connection_count", 1)
 
         # ⚠️ 代谢已由 CogGraph 控制，这里不再消耗 energy
+
 
         # === 高频调用奖励机制 ===
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
@@ -363,7 +367,23 @@ class CogUnit:
 
         if self.role == "sensor":
             # 感知单元应关注输入响应频率 & 能量利用效率
-            return self.avg_recent_calls > 0.6
+            if len(self.output_history) < 2:
+                return False
+
+            # 3) 计算最近几次感知输出的 L1 变化量
+            changes = []
+            for i in range(1, len(self.output_history)):
+                prev = self.output_history[i-1]
+                curr = self.output_history[i]
+                changes.append((curr - prev).abs().sum().item())
+
+            avg_change = sum(changes) / len(changes)
+
+            # 只要平均变化量超过一个阈值，就记这条记忆
+            # —— 这个阈值可以根据 input_size 调整
+            SENSOR_CHANGE_THRESHOLD = 5.0
+            return avg_change > SENSOR_CHANGE_THRESHOLD
+
 
         elif self.role == "processor":
             # 处理单元应关注调用频率 & 输出多样性
@@ -394,8 +414,6 @@ class CogUnit:
         return False
 
     def add_to_local_memory(self):
-        global_step = getattr(self, "current_step", 0)
-        self.memory_pool_limit = 50 + (global_step // 500) * 20  # 每 500 步 +20
         self.local_memory_pool = [m for m in self.local_memory_pool if "score" in m]
         # —— 对齐 output_history 到同一长度 ——
         import torch.nn.functional as F
