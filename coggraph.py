@@ -208,7 +208,7 @@ class CogGraph:
         """
         根据当前 max_total_energy 和角色比例，返回每类角色的最小建议数量。
         """
-        total_target = int(self.max_total_energy / 2.6 * 0.9)  # 系统最大细胞数 × 0.9 安全系数
+        total_target = int(self.max_total_energy / 3.0 * 0.7)  # 系统最大细胞数 × 0.9 安全系数
 
         # 理想比例：1(sensor) : 2(processor) : 1(emitter) → 总共 4 份
         IDEAL_RATIO = {"sensor": 1, "processor": 2, "emitter": 1}
@@ -275,7 +275,7 @@ class CogGraph:
         # 仅允许合法结构连接
         valid_links = {
             "sensor": ["processor"],
-            "processor": ["processor", "emitter"],
+            "processor": ["emitter"],
             "emitter": []
         }
         from_role = from_unit.get_role()
@@ -718,7 +718,7 @@ class CogGraph:
 
             if role == "processor":
                 # processor 寻找下游连接对象（processor 或 emitter）
-                target_roles = ["processor", "emitter"]
+                target_roles = [ "emitter"]
             elif role == "emitter":
                 # emitter 不应该主动连接（skip）
                 continue
@@ -727,22 +727,36 @@ class CogGraph:
 
             current_connections = self.connections[unit.id]
 
-            if len(current_connections) < 2:
+            if len(current_connections) < MAX_CONNECTIONS:
                 u_pos = unit.get_position()
-                candidates = [
-                    u for u in self.units
-                    if u.id != unit.id and u.get_role() in target_roles
-                       and abs(u.input_size - unit.input_size) <= 100
-                       and u.id not in current_connections
-                       and euclidean(u.get_position(), u_pos) < 3
-                ]
 
-                if not candidates:
-                    # 没有近邻 → 全局搜索
+                # 前半数连接使用“近邻优先”
+                if len(current_connections) < MAX_CONNECTIONS / 2:
                     candidates = [
                         u for u in self.units
-                        if u.id != unit.id and u.get_role() in target_roles
+                        if u.id != unit.id
+                           and u.get_role() in target_roles
+                           and abs(u.input_size - unit.input_size) <= 100
                            and u.id not in current_connections
+                           and euclidean(u.get_position(), u_pos) < 3
+                    ]
+                    if not candidates:
+                        # 若附近无候选，则全局搜索
+                        candidates = [
+                            u for u in self.units
+                            if u.id != unit.id
+                               and u.get_role() in target_roles
+                               and u.id not in current_connections
+                        ]
+                else:
+                    # 后半数连接使用“远程优先”
+                    candidates = [
+                        u for u in self.units
+                        if u.id != unit.id
+                           and u.get_role() in target_roles
+                           and abs(u.input_size - unit.input_size) <= 100
+                           and u.id not in current_connections
+                           and euclidean(u.get_position(), u_pos) >= 3
                     ]
 
                 if candidates:
