@@ -1231,11 +1231,11 @@ class CogGraph:
             elif unit.role == "emitter":
                 bias_factor = unit.gene.get("emitter_bias", 1.0)
 
-            step_factor = 1.0 + 0.000005 * max(0, self.current_step - 2000)
-            unit_factor = 1.0 + 0.00004 * max(0, len(self.units) - 150)
+            step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
+            unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
 
             # 代谢公式加入动态因子
-            decay = (var * 0.35 + call_density * 0.17 + conn_strength_sum * 0.17) * dim_scale * bias_factor * step_factor * unit_factor
+            decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)

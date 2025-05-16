@@ -433,13 +433,17 @@ class CogUnit:
                 aligned_history.append(vec)
 
         if self.role == "sensor":
-            # 感知：稳定性 + 被调用频率（已对齐）
-            if aligned_history:
-                variation = torch.var(torch.stack(aligned_history), dim=0).mean().item()
-            else:
-                variation = 0
-            score = getattr(self, "avg_recent_calls", 0) * 0.3 + variation * 0.2
+            if len(aligned_history) >= 2:
+                # 假设 output_history 至少有 2 帧
+                hist = [t.view(-1) for t in self.output_history]
+                diffs = []
+                for i in range(len(hist) - 1):
+                    diffs.append((hist[i + 1] - hist[i]).norm().item())
+                variation = sum(diffs) / len(diffs)
 
+                score = variation
+            else:
+                score = 0
 
         elif self.role == "processor":
             # 处理：输出多样性 + 调用频率（已对齐）

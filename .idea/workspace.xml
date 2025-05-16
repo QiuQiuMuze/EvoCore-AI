@@ -7,7 +7,6 @@
     <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/CogUnit.py" beforeDir="false" afterPath="$PROJECT_DIR$/CogUnit.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -156,7 +155,7 @@
       <workItem from="1746674124269" duration="86909000" />
       <workItem from="1747200549921" duration="2819000" />
       <workItem from="1747292878337" duration="4983000" />
-      <workItem from="1747391096147" duration="5370000" />
+      <workItem from="1747391096147" duration="6639000" />
     </task>
     <servers />
   </component>

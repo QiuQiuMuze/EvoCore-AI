@@ -95,12 +95,12 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = 1.0  # 单步奖励
+            self.agent_energy_gain = 0.2  # 单步奖励
         else:
             self.agent_energy_gain = 0.0
 
         if pos in self.hazards:
-            self.agent_energy_penalty = 0.2
+            self.agent_energy_penalty = 0.3
         else:
             self.agent_energy_penalty = 0.0
 
