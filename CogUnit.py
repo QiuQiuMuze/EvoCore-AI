@@ -106,6 +106,7 @@ class CogUnit:
         self.position = (random.randint(0, 10), random.randint(0, 10))  # 可调范围
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
+        self.memory_pool_limit = self.memory_limit
         self.role = role
         self.id = uuid.uuid4()          # 唯一标识
         self.energy = 1.0               # 初始能量
@@ -243,7 +244,7 @@ class CogUnit:
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
         if avg_recent_calls >= 2.0 and self.energy > 0.0:
             self.energy += 0.01
-            logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.02")
+            logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.01")
 
         # === 输出扰动：模拟早期探索行为（前10步）===
         if hasattr(self, "current_step"):
@@ -257,7 +258,7 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output)
+        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.5
         self.energy += self_reward
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
@@ -297,17 +298,17 @@ class CogUnit:
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 1:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 1.5  # 💡 补给能量
+            self.energy += 1  # 💡 补给能量
             return True
 
         if role == "processor" and processor_count <= 1:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 1.5
+            self.energy += 1
             return True
 
         if role == "sensor" and sensor_count <= 1:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 1.5
+            self.energy += 1
             return True
 
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================

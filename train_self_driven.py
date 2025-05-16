@@ -172,7 +172,7 @@ def main(cfg):
 
             # --- 选动作 & 环境交互 ---
             action = agent.select_action(state_seq)
-            env.step(action)
+            env.step(action, cog_step=graph.current_step)
 
             # ---------- reward shaping ----------
             agent_pos = tuple(env.agent_pos)                    # (x, y)
@@ -241,4 +241,8 @@ Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEP
 确认 CogGraph 已实现 sensor_forward / processor_forward / emitter_forward。
 
 若想引入 early-stop（如达到目标点）、或更复杂的奖励，可在 env 内部扩展 done 与 info 返回值，再更新脚本对应部分。
+"""
+
+"""
+train_self_driven.py --episodes 100 --max-steps 3000 --save-every 10 --device cpu
 """

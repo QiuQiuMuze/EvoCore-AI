@@ -35,7 +35,7 @@ logger.addHandler(debug_handler)
 
 # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.WARNING)
+console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(console_handler)
 
@@ -48,10 +48,11 @@ class GridEnvironment:
         self.resources = set()
         self.hazards = set()
         self.step_count = 0
-        self.refresh_environment()
+        self.explored_cells_count = 0
+        self.refresh_environment(step=0, explored_cells_count=0)
         self.reset()
 
-    def refresh_environment(self):
+    def refresh_environment(self, step: int, explored_cells_count: int):
         """刷新资源与危险格子的位置（每隔一段时间）"""
         self.resources.clear()
         self.hazards.clear()
@@ -71,7 +72,7 @@ class GridEnvironment:
         self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
         return self.get_state()
 
-    def step(self, action):
+    def step(self, action, cog_step: int | None = None):
         """
         动作定义：
         0: 上 (y-1)
@@ -94,19 +95,21 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = 0.1  # 单步奖励
+            self.agent_energy_gain = 0.5  # 单步奖励
         else:
             self.agent_energy_gain = 0.0
 
         if pos in self.hazards:
-            self.agent_energy_penalty = 0.3
+            self.agent_energy_penalty = 0.1
         else:
             self.agent_energy_penalty = 0.0
 
         # 更新环境状态
         self.step_count += 1
-        if self.step_count % 100 == 0:
-            self.refresh_environment()
+        # 刷新周期基于 CogGraph 的轮数，否则退回用本地 step_count
+        step_for_refresh = cog_step if cog_step is not None else self.step_count
+        if step_for_refresh % 100 == 0:
+            self.refresh_environment(step_for_refresh, self.explored_cells_count)
             self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
             self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
 

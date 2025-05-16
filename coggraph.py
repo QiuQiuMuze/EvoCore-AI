@@ -248,7 +248,8 @@ class CogGraph:
                         "score": 0
                     })
                     # 控制大小：每个单元池最多150条
-                    if len(other.local_memory_pool) >= 150:
+                    if len(other.local_memory_pool) > other.memory_pool_limit:
+                        other.local_memory_pool.sort(key=lambda m: m["score"])
                         other.local_memory_pool.pop(0)
 
         # 从图中移除单元及其连接
@@ -483,7 +484,7 @@ class CogGraph:
                 )
                 merged.state = (u1.state + u2.state) / 2
                 merged.age = int((u1.age + u2.age) / 2)
-                merged.energy = u1.energy + u2.energy + 0.1  # 奖励合并能量
+                merged.energy = u1.energy + u2.energy + 0.01  # 奖励合并能量
                 merged.last_output = (u1.last_output + u2.last_output) / 2
 
                 # 加入新单元
@@ -604,8 +605,8 @@ class CogGraph:
                     new_e.state = (e1.state + e2.state) / 2
                     new_e.last_output = (e1.last_output + e2.last_output) / 2
 
-                    new_p.energy = p1.energy + p2.energy + 0.1
-                    new_e.energy = e1.energy + e2.energy + 0.1
+                    new_p.energy = p1.energy + p2.energy + 0.05
+                    new_e.energy = e1.energy + e2.energy + 0.05
 
                     # 插入新单元
                     self.add_unit(new_p)
@@ -762,7 +763,7 @@ class CogGraph:
         # === 随机突变连接（只允许 processor 发起） ===
         if random.random() < 0.1:
             from_candidates = [u for u in self.units if u.get_role() == "processor"]
-            to_candidates = [u for u in self.units if u.get_role() in ["processor", "emitter"]]
+            to_candidates = [u for u in self.units if u.get_role() in ["emitter"]]
 
             if from_candidates and to_candidates:
                 from_unit = random.choice(from_candidates)
@@ -850,7 +851,7 @@ class CogGraph:
             old = unit.get_role()
             unit.role = receiver_role
             unit.age = 0
-            unit.energy += 0.2
+            unit.energy += 0
             unit.gene[f"{receiver_role}_bias"] = 1.0
             logger.info(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
 
@@ -998,7 +999,7 @@ class CogGraph:
         if self.current_step < 10:
             for unit in self.units:
                 if unit.get_role() != "sensor":
-                    unit.energy += 0.1
+                    unit.energy += 0.05
                     logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
@@ -1196,12 +1197,11 @@ class CogGraph:
             elif unit.role == "emitter":
                 bias_factor = unit.gene.get("emitter_bias", 1.0)
 
-            step_factor = 1.0 + 0.0005 * max(0, self.current_step - 500)
-            unit_factor = 1.0 + 0.005 * max(0, len(self.units) - 50)
+            step_factor = 1.0 + 0.004 * max(0, self.current_step - 500)
+            unit_factor = 1.0 + 0.04 * max(0, len(self.units) - 50)
 
             # 代谢公式加入动态因子
-            decay = (var * 0.15 + call_density * 0.04 + conn_strength_sum * 0.02) \
-                    * dim_scale * bias_factor * step_factor * unit_factor
+            decay = (var * 0.35 + call_density * 0.17 + conn_strength_sum * 0.13) * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)

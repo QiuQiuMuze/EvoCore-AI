@@ -67,6 +67,24 @@ class RLAgent:
     #                           交互接口                                     #
     # --------------------------------------------------------------------- #
 
+    def expand_value_head(self, new_input_dim):
+        old_layer = self.value_head[0]  # 取 Sequential 中的 Linear 层
+        old_input_dim = old_layer.in_features
+
+        if new_input_dim <= old_input_dim:
+            return  # 不需要扩展
+
+        # 构建新 Linear 层（保留旧参数）
+        new_layer = torch.nn.Linear(new_input_dim, 1).to(old_layer.weight.device)
+
+        with torch.no_grad():
+            # 拷贝旧权重（只拷贝前 old_input_dim 部分）
+            new_layer.weight[:, :old_input_dim] = old_layer.weight
+            new_layer.bias = old_layer.bias
+
+        self.value_head = torch.nn.Sequential(new_layer)
+        print(f"[🔁 升维] value_head 输入维度 {old_input_dim} → {new_input_dim}")
+
     def select_action(self, state_seq: torch.Tensor) -> int:
         """
         给定状态序列，采样一个动作。
@@ -125,6 +143,7 @@ class RLAgent:
         value_loss = []
 
         for log_prob, state_feat, R in zip(self.log_probs, self.saved_states, returns):
+            self.expand_value_head(state_feat.shape[-1])  # 确保 value_head 支持当前输入维度
             value = self.value_head(state_feat).squeeze()
             advantage = R - value.detach()
             policy_loss.append(-log_prob * advantage)
