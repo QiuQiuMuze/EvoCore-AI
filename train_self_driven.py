@@ -244,5 +244,5 @@ Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEP
 """
 
 """
-train_self_driven.py --episodes 100 --max-steps 3000 --save-every 10 --device cpu
+python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cpu
 """

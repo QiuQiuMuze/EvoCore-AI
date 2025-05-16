@@ -130,3 +130,151 @@ EvoCore 架构目标是：
 5. 长期目标是形成结构可塑性 + 功能多样性的智能体
 
 最终将朝着：环境驱动、自主成长、结构演化、强化学习融合的“AI 胚胎体方向发展。
+
+
+
+EvoCore System Structure & Module Overview
+Project Introduction: EvoCore = A Growing AI Embryo
+EvoCore is not a traditional AI model. It is an intelligent agent with life cycle, structural evolution, energy regulation, self-learning, and death-rebirth ability.
+
+It works like an AI embryo. With environmental inputs, energy flow, and learning feedback, it keeps growing, differentiating, merging, dying, and rebirthing. It is a “living” model architecture.
+
+Project Structure Overview
+coggraph.py: Main controller of CogGraph, managing unit network structure, connections, lifecycle scheduling, energy control, and structural evolution.
+
+CogUnit.py: Behavior logic of single cell unit, including state update, energy metabolism, splitting, death, genetic memory, etc.
+
+env.py: Environment module, defines state input and reward mechanism.
+
+transformer_policy.py: Lightweight Transformer-based policy network.
+
+rl_agent.py: Reinforcement learning agent that uses Transformer for decision-making.
+
+train_self_driven.py: Main training script.
+
+eval_policy.py: Evaluation script for policy.
+
+utils.py: Helper functions.
+
+CogUnit (Cell Unit) Design & Mechanisms [CogUnit.py]
+Core Features
+
+Each unit has its own state, energy, age, gene, and memory_pool.
+
+Contains its own shallow MLP as function network to process input → output.
+
+Roles: sensor, processor, emitter.
+
+Energy System
+
+Each step, energy is consumed based on input complexity, connection strength, and call frequency.
+
+If energy > threshold → can split().
+
+If energy = 0 or aging → die().
+
+Energy tax is managed by coggraph.py (to control total system energy).
+
+Splitting Mechanism
+
+If unit meets energy and usage thresholds → it can clone().
+
+During cloning, it mixes local memory and mutates its gene (only allows increase in hidden size).
+
+Genetic Memory System
+
+Each unit keeps a local memory pool, saving high-quality output fragments.
+
+When cloning, it combines self-gene with memory preference (e.g., sensor_bias).
+
+Low-score memories will be removed gradually.
+
+CogGraph (Main Graph Logic) [coggraph.py]
+Lifecycle Scheduling
+
+Each step calls step(), updating all units, triggering growth, connection, pruning, or death.
+
+Simulates a living system step by step.
+
+Energy Regulation
+
+Total energy of the system has an upper limit (e.g., 250).
+
+If over limit → apply progressive energy tax or move excess to energy_pool.
+
+energy_pool can feed low-energy units (like rescue).
+
+Growth System
+
+Runs rebalance_cell_types() regularly to adjust sensor:processor:emitter ratio to 1:2:1.
+
+Auto-connect + random mutate + prune dead connections.
+
+Over-energy units must split and add new structure.
+
+Structural Evolution
+
+Similar units will be merged by merge_redundant_units().
+
+Similar subgraphs reconstructed by restructure_common_subgraphs() → processor + emitter become composite units.
+
+High-density subgraph will be marked as subsystem_id.
+
+Death Mechanism
+
+Low energy / old age / weak output → should_die() → remove the unit.
+
+Death can trigger energy redistribution and genetic memory saving.
+
+Reboot Mechanism (Planned)
+
+If system crashes, frequent deaths, or energy chaos → enter "death + restart" phase.
+
+Will save abstract memory for fast recovery after reboot.
+
+Learning Mechanism: Strategy Learning & Self-Optimization
+[transformer_policy.py]
+
+Uses TransformerEncoder with learnable positional encoding.
+
+Input is a sequence of CogUnit states (e.g., processor outputs).
+
+Output is action logits (e.g., move up/down/left/right).
+
+[rl_agent.py]
+
+Uses REINFORCE with baseline method.
+
+Includes policy network + value function (value head).
+
+Caches state, action log_prob, reward at each step → update policy after each episode.
+
+Training & Evaluation Flow
+Training Entry [train_self_driven.py]
+
+Initializes CogGraph, environment, and agent.
+
+Each step: environment → graph.step() → agent.select_action().
+
+After each episode → policy is updated with agent.finish_episode().
+
+Evaluation Entry [eval_policy.py]
+
+Loads saved model checkpoint.
+
+Runs specified number of episodes and calculates average reward.
+
+Core Philosophy of EvoCore
+The goals of EvoCore architecture:
+
+Replace static networks with self-growing structures from original cells.
+
+Use energy to control activity and system size.
+
+Include life-like mechanisms: clone, mutate, die, inherit.
+
+Support evolutionary learning: reinforcement + memory + feedback.
+
+Long-term goal is to create intelligent agents with structural plasticity and functional diversity.
+
+The final direction is to become a truly self-developing AI embryo — driven by environment, growing its structure, evolving, and learning continuously.
