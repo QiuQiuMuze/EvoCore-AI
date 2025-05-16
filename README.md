@@ -133,13 +133,13 @@ EvoCore 架构目标是：
 
 
 
-EvoCore System Structure & Module Overview
-Project Introduction: EvoCore = A Growing AI Embryo
+
+**Project Introduction: EvoCore = A Growing AI Embryo**
 EvoCore is not a traditional AI model. It is an intelligent agent with life cycle, structural evolution, energy regulation, self-learning, and death-rebirth ability.
 
 It works like an AI embryo. With environmental inputs, energy flow, and learning feedback, it keeps growing, differentiating, merging, dying, and rebirthing. It is a “living” model architecture.
 
-Project Structure Overview
+**Project Structure Overview**
 coggraph.py: Main controller of CogGraph, managing unit network structure, connections, lifecycle scheduling, energy control, and structural evolution.
 
 CogUnit.py: Behavior logic of single cell unit, including state update, energy metabolism, splitting, death, genetic memory, etc.
@@ -156,7 +156,7 @@ eval_policy.py: Evaluation script for policy.
 
 utils.py: Helper functions.
 
-CogUnit (Cell Unit) Design & Mechanisms [CogUnit.py]
+**CogUnit (Cell Unit) Design & Mechanisms** [CogUnit.py]
 Core Features
 
 Each unit has its own state, energy, age, gene, and memory_pool.
@@ -189,7 +189,7 @@ When cloning, it combines self-gene with memory preference (e.g., sensor_bias).
 
 Low-score memories will be removed gradually.
 
-CogGraph (Main Graph Logic) [coggraph.py]
+**CogGraph (Main Graph Logic)** [coggraph.py]
 Lifecycle Scheduling
 
 Each step calls step(), updating all units, triggering growth, connection, pruning, or death.
@@ -232,7 +232,7 @@ If system crashes, frequent deaths, or energy chaos → enter "death + restart" 
 
 Will save abstract memory for fast recovery after reboot.
 
-Learning Mechanism: Strategy Learning & Self-Optimization
+**Learning Mechanism: Strategy Learning & Self-Optimization**
 [transformer_policy.py]
 
 Uses TransformerEncoder with learnable positional encoding.
@@ -249,7 +249,7 @@ Includes policy network + value function (value head).
 
 Caches state, action log_prob, reward at each step → update policy after each episode.
 
-Training & Evaluation Flow
+**Training & Evaluation Flow**
 Training Entry [train_self_driven.py]
 
 Initializes CogGraph, environment, and agent.
@@ -258,14 +258,13 @@ Each step: environment → graph.step() → agent.select_action().
 
 After each episode → policy is updated with agent.finish_episode().
 
-Evaluation Entry [eval_policy.py]
+**Evaluation Entry** [eval_policy.py]
 
 Loads saved model checkpoint.
 
 Runs specified number of episodes and calculates average reward.
 
-Core Philosophy of EvoCore
-The goals of EvoCore architecture:
+**The goals of EvoCore architecture:**
 
 Replace static networks with self-growing structures from original cells.
 

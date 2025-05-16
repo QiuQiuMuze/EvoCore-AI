@@ -110,8 +110,8 @@ if __name__ == "__main__":
     print(f"⏱  finished in {time.time()-t0:.1f}s")
 """
 python eval_policy.py \
-  --ckpt checkpoints/agent_ep1.pth \
-  --episodes 1 \
+  --ckpt checkpoints/agent_final.pth \
+  --episodes 3 \
   --max-steps 3000 \
   --device cpu
 """
