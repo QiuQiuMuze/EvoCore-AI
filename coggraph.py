@@ -719,9 +719,8 @@ class CogGraph:
             if role == "processor":
                 # processor 寻找下游连接对象（processor 或 emitter）
                 target_roles = [ "emitter"]
-            elif role == "emitter":
-                # emitter 不应该主动连接（skip）
-                continue
+            elif role == "sensor":
+                target_roles = ["processor"]
             else:
                 continue  # sensor 不参与
 
@@ -799,13 +798,13 @@ class CogGraph:
         #   hi    1.50  1.30   1.15   1.08
         #   lo    0.50  0.70   0.85   0.92
         if total < 50:
-            hi, lo = 1.30, 0.60
+            hi, lo = 1.20, 0.80
         elif total < 200:
-            hi, lo = 1.08, 0.92
+            hi, lo = 1.12, 0.88
         elif total < 500:
-            hi, lo = 1.05, 0.95
+            hi, lo = 1.08, 0.92
         else:
-            hi, lo = 1.03, 0.97
+            hi, lo = 1.05, 0.95
 
         # Δ 容差（至少相差 Δ_cell 才算“真的多／少”）
         delta_cell = max(1, int(total * TOL_FRAC))
@@ -815,8 +814,21 @@ class CogGraph:
         conv_done = 0
 
         def pick_weakest(units):
-            return min(units, key=lambda u: (u.energy,
-                                             getattr(u, "avg_recent_calls", 0.0)))
+            # ✅ 优先选择年龄在 5-30 的弱细胞（非永生），否则全局选弱者
+            young_candidates = [u for u in self.units if u.get_role() == giver_role and 5 <= u.age <= 30 and not getattr(u, "is_elite", False)]
+            other_candidates = [u for u in units if u not in young_candidates and not getattr(u, "is_elite", False)]
+
+            def sort_key(u):
+                return (u.energy, getattr(u, "avg_recent_calls", 0.0))
+
+            if young_candidates:
+                return min(young_candidates, key=sort_key)
+            elif other_candidates:
+                return min(other_candidates, key=sort_key)
+            else:
+                return None  # 没有可用细胞，返回 None
+        # def pick_weakest(units):
+        #     return min(units, key=lambda u: (u.energy, getattr(u, "avg_recent_calls", 0.0)))
 
         while conv_done < max_conv:
             # ── 重新计数
@@ -930,6 +942,13 @@ class CogGraph:
 
     def trim_weak_memories(self):
         """环境发生变化时，清除所有细胞记忆池中的一半最弱记忆"""
+        if (
+                self.units
+                and hasattr(self.units[0], "local_memory_pool")
+                and len(self.units[0].local_memory_pool) < int(0.75 * self.units[0].memory_pool_limit)
+        ):
+            return  # ✅ 未达触发条件，直接退出
+
         for unit in self.units:
             if hasattr(unit, "local_memory_pool") and unit.local_memory_pool:
                 pool = unit.local_memory_pool
@@ -1004,10 +1023,12 @@ class CogGraph:
             logger.info(
                 f"[Curriculum升级] 第 {self.current_step} 步：环境大小 {old_size}x{old_size} → {self.env_size}x{self.env_size}，新目标 {new_target}")
 
-        if self.current_step > 0 and self.current_step % 1000 == 0:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
+        elif self.max_total_energy == 4000:
+            self.max_total_energy = 6000
 
         # 若当前步数非常早期，给予基础能量补偿
         if self.current_step < 10:
@@ -1211,11 +1232,11 @@ class CogGraph:
             elif unit.role == "emitter":
                 bias_factor = unit.gene.get("emitter_bias", 1.0)
 
-            step_factor = 1.0 + 0.004 * max(0, self.current_step - 500)
-            unit_factor = 1.0 + 0.04 * max(0, len(self.units) - 50)
+            step_factor = 1.0 + 0.000005 * max(0, self.current_step - 2000)
+            unit_factor = 1.0 + 0.00004 * max(0, len(self.units) - 150)
 
             # 代谢公式加入动态因子
-            decay = (var * 0.35 + call_density * 0.17 + conn_strength_sum * 0.13) * dim_scale * bias_factor * step_factor * unit_factor
+            decay = (var * 0.20 + call_density * 0.09 + conn_strength_sum * 0.09) * dim_scale * bias_factor * step_factor * unit_factor
 
             unit.energy -= decay
             unit.energy = max(unit.energy, 0.0)
@@ -1350,7 +1371,7 @@ class CogGraph:
 
             for unit in over_energy_units:
                 role = unit.get_role()
-                if role_counts.get(role, 0) < min_counts[role] or self.total_energy() < self.max_total_energy:
+                if role_counts.get(role, 0) < min_counts[role] and self.total_energy() < self.max_total_energy:
                     # ✅ 当前角色数量不足 或 系统能量未超载 → 强制分裂
                     expected_input = self.env_size * self.env_size * INPUT_CHANNELS
                     child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None)
