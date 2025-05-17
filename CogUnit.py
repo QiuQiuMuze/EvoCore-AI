@@ -262,7 +262,7 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.1
+        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.03
         self.energy += self_reward
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
@@ -302,17 +302,17 @@ class CogUnit:
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 1.0  # 💡 补给能量
+            self.energy += 0.1  # 💡 补给能量
             return True
 
         if role == "processor" and processor_count <= 16:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 1.0
+            self.energy += 0.1
             return True
 
         if role == "sensor" and sensor_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 1.0
+            self.energy += 0.1
             return True
 
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================

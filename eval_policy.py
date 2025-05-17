@@ -111,7 +111,7 @@ if __name__ == "__main__":
 """
 python eval_policy.py \
   --ckpt checkpoints/agent_final.pth \
-  --episodes 20 \
+  --episodes 2 \
   --max-steps 1000 \
   --device cpu
 """

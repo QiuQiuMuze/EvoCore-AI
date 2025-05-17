@@ -53,7 +53,7 @@ def get_cfg():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=10_000,
                         help="total training episodes")
-    parser.add_argument("--max-steps", type=int, default=256,
+    parser.add_argument("--max-steps", type=int, default=1000,
                         help="steps per episode")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="learning rate for policy network")
@@ -118,10 +118,10 @@ def main(cfg):
     icm = IntrinsicCuriosityModule(
         state_dim=input_dim,
         action_dim=agent.policy_net.fc_out.out_features,
-        hidden_dim=64,    # 隐藏层大小，你可以改成 d_model 或者 128
+        hidden_dim= 128,    # 隐藏层大小，你可以改成 d_model 或者 128
         lr=1e-4           # ICM 学习率
     ).to(device)
-    curiosity_beta = 0.05  # 内在奖励权重
+    curiosity_beta = 0.1  # 内在奖励权重
 
     last_dim = graph.processor_hidden_size  # 初始 D_old
 
@@ -129,6 +129,7 @@ def main(cfg):
 
     # 3) 训练循环
     reward_history = []
+    global_step = 0  # ← 新增：系统累计总步数
     for ep in range(1, cfg.episodes + 1):
 
 
@@ -143,7 +144,7 @@ def main(cfg):
         from env import logger
         for t in range(cfg.max_steps):
             # ——— 打印当前 Episode/Step 信息 ———
-            logger.info(f"\n==== Episode {ep}  Step {t+1} ====")
+            logger.warning(f"\n==== Episode {ep}  Step {t+1} ====")
 
             # ——— 构造 CogGraph.step() 的输入（含目标向量） ———
           # 这里我们复用 graph.task.encode_goal，
@@ -188,15 +189,14 @@ def main(cfg):
             agent_pos = tuple(env.agent_pos)                    # (x, y)
             goal_pos  = graph.task.target_position              # 资源目标
             dist_res  = abs(agent_pos[0] - goal_pos[0]) + abs(agent_pos[1] - goal_pos[1])
-            proximity_bonus = 0.2 if dist_res <= 2 else 0.0     # 靠近资源
+            proximity_bonus = 0.01 if dist_res <= 2 else 0.0     # 靠近资源
 
             danger_dist = env.distance_to_nearest_danger(agent_pos)
-            if danger_dist <= 1:
-                danger_shaping = -0.2                           # 靠近危险
+            if danger_dist <= 2:
+                danger_shaping = -0.05                        # 靠近危险
             elif danger_dist >= 3:
-                danger_shaping = 0.1                            # 远离危险
-            else:
-                danger_shaping = 0.0
+                danger_shaping = 0                            # 远离危险
+
             # --------------------------------------
 
             # # 奖励：环境内部字段决定
@@ -228,7 +228,14 @@ def main(cfg):
                              device=device)
             )
             # —— 4) 合并奖励并存储 ——
-            total_reward = ext_reward + curiosity_beta * ic_reward
+
+            # —— 增加全局步数 & 计算衰减因子 ——
+            global_step += 1
+            progress = min(global_step, 2500) / 2500
+            decay = 1.0 - 0.7 * progress
+
+            # —— 4) 合并奖励并存储 ——
+            total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
             agent.store_reward(total_reward)
             ep_reward += total_reward
 
@@ -282,5 +289,5 @@ Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEP
 """
 
 """
-python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cpu
+python train_self_driven.py --episodes 20 --max-steps 1000 --save-every 5 --device cpu
 """

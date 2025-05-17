@@ -9,7 +9,7 @@ import numpy as np
 import logging
 from collections import deque, Counter
 from env import logger
-
+from typing import List, Dict
 
 
 # class LimitedDebugHandler(logging.Handler):
@@ -134,6 +134,8 @@ class CogGraph:
     def __init__(self, device: str = "cpu"):
         self.device = torch.device(device)
         # === RL 接口：Processor 输出的统一维度 ===
+        self._pending_deaths: List[CogUnit] = []
+        self._death_energy_sum: Dict[str, float] = {}  # role -> total energy
         self.debug = False
         self.reverse_connections = {}  # to_id -> set(from_ids)
         self.sensor_count = 0
@@ -220,6 +222,26 @@ class CogGraph:
         }
         return target_counts
 
+    def finalize_deaths(self):
+        # 遍历每个 role，分配它们累加的能量
+        for role, total_energy in self._death_energy_sum.items():
+            heirs = [
+                u for u in self.units
+                if u.role == role and u.age < 240
+            ]
+            if heirs and total_energy > 0.0:
+                per_gain = total_energy / len(heirs)
+                for u in heirs:
+                    u.energy += per_gain
+                logger.info(
+                    f"[寿终能量继承] 本步共 {len(self._pending_deaths)} 个{role}死亡，"
+                    f"合计能量 {total_energy:.2f} → 平分给 {len(heirs)} 个后辈，每人 +{per_gain:.2f}"
+                )
+
+        # 清空，准备下一步
+        self._pending_deaths.clear()
+        self._death_energy_sum.clear()
+
     def remove_unit(self, unit: CogUnit):
 
 
@@ -227,14 +249,13 @@ class CogGraph:
             return  # 已经被删除
 
         # ✅ 遗产机制：寿终正寝时，能量分配给年轻后辈
+        # —— 收集“寿终”死亡单元能量 ——
         if getattr(unit, "death_by_aging", False) and unit.energy > 0.0:
-            heirs = [u for u in self.units if u.role == unit.role and u.age < 240 and u.id != unit.id]
-            if heirs:
-                per_gain = unit.energy / len(heirs)
-                for u in heirs:
-                    u.energy += per_gain
-                logger.info(
-                    f"[寿终能量继承] {unit.id} 死亡（{unit.role}） → 能量 {unit.energy:.2f} 分给 {len(heirs)} 个同类年轻单元，每人 +{per_gain:.2f}")
+            role = unit.role
+            self._pending_deaths.append(unit)
+            self._death_energy_sum[role] = (
+                    self._death_energy_sum.get(role, 0.0) + unit.energy
+            )
 
         # ✅ 加入到同类局部记忆池
         if unit.is_worthy_of_memory():
@@ -629,7 +650,7 @@ class CogGraph:
                     self._update_global_counts()
                     return  # 每轮只重构一组…
 
-    def assign_subsystems(self, min_size=3, max_size=10):
+    def assign_subsystems(self, min_size=3, max_size=20):
         """
         自动发现局部高密度连接区域，标记为子系统
         """
@@ -641,7 +662,7 @@ class CogGraph:
                 continue
 
             # 以当前unit为起点，做局部DFS
-            cluster = self._dfs_collect_cluster(unit, max_depth=2)
+            cluster = self._dfs_collect_cluster(unit, max_depth=4)
 
             if min_size <= len(cluster) <= max_size:
                 subsystem_id = f"subsys-{subsystem_count}"
@@ -651,7 +672,7 @@ class CogGraph:
                 logger.info(f"[子系统生成] 新子系统 {subsystem_id}，包含 {len(cluster)} 个单元")
                 visited.update(u.id for u in cluster)
 
-    def _dfs_collect_cluster(self, start_unit, max_depth=2):
+    def _dfs_collect_cluster(self, start_unit, max_depth=4):
         """
         辅助：深度优先搜索，找出局部连接的单元群
         """
@@ -966,12 +987,6 @@ class CogGraph:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
-        if self.current_step == 2000:
-            for unit in self.units:
-                unit.dynamic_aging = True
-            logger.info("[进化] 动态寿命机制已激活（Dynamic Aging）")
-
-
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -982,10 +997,11 @@ class CogGraph:
             if total_e > max_e:
                 excess = total_e - max_e
                 tiers = [
-                    (0.00, 0.15, 0.01),  # 超出 0~15% 部分收 1%
-                    (0.15, 0.35, 0.05),  # 超出 15~35% 部分收 5%
-                    (0.35, 0.55, 0.10),  # 超出 35~55% 部分收 10%
-                    (0.50, float("inf"), 0.50)  # 超出 55% 部分收 50%
+                    (0.00, 0.10, 0.05),
+                    (0.10, 0.15, 0.15),  # 超出 10%~15% 部分收 15%
+                    (0.15, 0.35, 0.25),  # 超出 15~35% 部分收 25%
+                    (0.35, 0.55, 0.35),  # 超出 35~55% 部分收 35%
+                    (0.50, float("inf"), 0.5)  # 超出 55% 部分收 50%
                 ]
 
                 tax = 0.0
@@ -1036,12 +1052,26 @@ class CogGraph:
                     unit.energy += 0.05
                     logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
 
-        if self.current_step > 0 and self.current_step % 500 == 0:
+        # 每次循环时，根据当前步数决定更新间隔
+        step = self.current_step
+
+        if step < 1000:
+            interval = 1000
+        elif step < 1500:
+            interval = 500
+        elif step < 3000:
+            interval = 250
+        elif step < 5000:
+            interval = 200
+        else:
+            interval = 100
+
+        # 然后用这个 interval 来判断是否需要更新 target_vector
+        if step > 0 and step % interval == 0:
             old_target = self.target_vector.clone()
             self.target_vector = torch.rand_like(self.target_vector)
-
             similarity = torch.cosine_similarity(old_target, self.target_vector, dim=0).item()
-            logger.info(f"[目标变化] 第 {self.current_step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
+            logger.info(f"[目标变化] 第 {step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             self.prune_connections()
@@ -1142,12 +1172,8 @@ class CogGraph:
         # 统计当前 emitter 数量
         emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
 
-        for unit in self.units:
-            unit.global_emitter_count = emitter_count
-
-
         for unit in self.units[:]:
-
+            unit.global_emitter_count = emitter_count
             unit_input = torch.cat([env_state, goal_tensor], dim=1)
 
             # 如果该单元有上游连接（被其他单元指向）
@@ -1267,8 +1293,8 @@ class CogGraph:
             if unit.should_die():
                 logger.debug(f"[死亡] {unit.id} 被移除")
                 self.remove_unit(unit)
-
-
+        if self.current_step > 0 and self.current_step % 50 == 0:
+            self.finalize_deaths()
         self.auto_connect()
         # === 死连接清理 ===
         if self.current_step % 10 == 0:
@@ -1312,41 +1338,36 @@ class CogGraph:
 
                 for unit in self.units:
                     if unit.get_role() == "processor":
-                        unit.energy += 0.04 * dim_scale * reward_score * dilution_factor
+                        unit.energy += 0.01 * dim_scale * reward_score * dilution_factor
                     elif unit.get_role() == "emitter":
-                        unit.energy += 0.04 * dim_scale * reward_score * dilution_factor
+                        unit.energy += 0.01 * dim_scale * reward_score * dilution_factor
+                    # ✅ 增加多样性惩罚（含数量判断）
+                    action_indices = [torch.argmax(out).item() for out in outputs]
+
+                    if len(action_indices) >= 3:  # 至少 3 个 emitter 才有统计意义
+                        common_action = max(set(action_indices), key=action_indices.count)
+                        if action_indices.count(common_action) > len(action_indices) * 0.9:
+                            if unit.get_role() == "emitter":
+                                unit.energy -= 0.05
+                                logger.debug(f"[惩罚] emitter {unit.id} 因输出单一行为被扣能量")
+                        elif len(set(action_indices)) > len(action_indices) * 0.6:
+                            if unit.get_role() == "emitter":
+                                unit.energy += 0.01
+                            logger.debug(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.01 能量")
+                    else:
+                        logger.debug(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
+
+                    if self.task.evaluate(self.env, outputs):
+                        if self.task.evaluate(self.env, outputs):
+                            logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励")
+                            if unit.get_role() == "emitter":
+                                unit.energy += 0.02  # 提高 emitter 奖励
+                            elif unit.get_role() == "processor":
+                                unit.energy += 0.02  # 给 processor 更多能量，鼓励参与
+
 
                 logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
 
-            # ✅ 增加多样性惩罚（含数量判断）
-            action_indices = [torch.argmax(out).item() for out in outputs]
-
-            if len(action_indices) >= 3:  # 至少 3 个 emitter 才有统计意义
-                common_action = max(set(action_indices), key=action_indices.count)
-                if action_indices.count(common_action) > len(action_indices) * 0.9:
-                    for unit in self.units:
-                        if unit.get_role() == "emitter":
-                            unit.energy -= 0.05
-                            logger.debug(f"[惩罚] emitter {unit.id} 因输出单一行为被扣能量")
-                elif len(set(action_indices)) > len(action_indices) * 0.6:
-                    for unit in self.units:
-                        if unit.get_role() == "emitter":
-                            unit.energy += 0.01
-
-                    logger.debug(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.01 能量")
-
-            else:
-                logger.debug(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
-
-            if self.task.evaluate(self.env, outputs):
-                if self.task.evaluate(self.env, outputs):
-                    logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励 +0.1")
-
-                    for unit in self.units:
-                        if unit.get_role() == "emitter":
-                            unit.energy += 0.05  # 提高 emitter 奖励
-                        elif unit.get_role() == "processor":
-                            unit.energy += 0.06  # 给 processor 更多能量，鼓励参与
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
 
@@ -1356,13 +1377,13 @@ class CogGraph:
 
         # —— 统一统计 & 连接打印（仅 debug） ——
         self._log_stats_and_conns()
-
-        self.rebalance_cell_types()
+        if self.debug and self.current_step % 20 == 0:
+            self.rebalance_cell_types()
 
         # === 🔁 分裂 or 储能：强制处理能量超标单元 ===
         while True:
-            over_energy_units = [u for u in self.units if u.energy > 3.0]
-            if not over_energy_units:
+            over_energy_units = [u for u in self.units if u.energy > 3.5]
+            if not over_energy_units or self.current_step % 20 != 0:
                 break
 
             min_counts = self._get_min_target_counts()
@@ -1379,13 +1400,13 @@ class CogGraph:
                     self.add_unit(child)
                     logger.info(f"[强制分裂] {unit.id} ({role}) → 数量不足/系统未满 → 复制")
 
-                else:
-                    # ⚠️ 系统能量过载 & 当前角色数量足够 → 储能
-                    contribution = unit.energy * 0.5
-                    unit.energy *= 0.5
-                    self.energy_pool += contribution
-                    logger.debug(
-                        f"[能量转移] {unit.id} ({role}) 系统过载 → 存入能量池 {contribution:.2f}，保留 {unit.energy:.2f}")
+            else:
+                # ⚠️ 系统能量过载 & 当前角色数量足够 → 储能
+                contribution = unit.energy * 0.5
+                unit.energy *= 0.5
+                self.energy_pool += contribution
+                logger.debug(
+                    f"[能量转移] {unit.id} ({role}) 系统过载 → 存入能量池 {contribution:.2f}，保留 {unit.energy:.2f}")
 
         # === 40 %-限额复制（>15 细胞才触发） ===
         selected_parents = self._select_clone_parents(pending)
@@ -1410,14 +1431,41 @@ class CogGraph:
             self.restructure_common_subgraphs()
 
         # === 🪫 能量池补给机制：支持能量低的细胞 ===
-        if self.energy_pool > 0.0:
-            weak_units = [u for u in self.units if u.energy < 0.8]
-            if weak_units:
-                per_unit = min(0.2, self.energy_pool / len(weak_units))
-                for u in weak_units:
-                    u.energy += per_unit
-                    self.energy_pool -= per_unit
-                logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
+        if self.current_step % 50 == 0:
+            # 给所有 age > 100 的细胞做“环境能量差额”补给
+            # 计算当前所有细胞总能量
+            total_cell_energy = sum(u.energy for u in self.units)
+            # 如果细胞能量不足环境上限，就触发补给
+            if total_cell_energy < self.max_total_energy and self.energy_pool > 0.0:
+                # 环境还差多少能量
+                needed = self.max_total_energy - total_cell_energy
+                # 池中总能量能否完全补足
+                if self.energy_pool <= needed:
+                    to_distribute = self.energy_pool
+                else:
+                    to_distribute = needed
+                # 筛选出 age > 100 的细胞
+                aged_units = [u for u in self.units if getattr(u, "age", 0) > 100]
+                if aged_units and to_distribute > 0:
+                    per_aged = to_distribute / len(aged_units)
+                    for u in aged_units:
+                        u.energy += per_aged
+                    # 从能量池中扣除实际分配量
+                    self.energy_pool -= to_distribute
+                    logger.info(
+                        f"[百岁补给] 对 {len(aged_units)} 个 age>100 细胞，每个补给 {per_aged:.2f}，"
+                        f"已从能量池扣除 {to_distribute:.2f}"
+                    )
+
+            # 给弱细胞补给
+            if self.energy_pool > 1.0:
+                weak_units = [u for u in self.units if u.energy < 0.5]
+                if weak_units:
+                    per_unit = min(0.2, self.energy_pool / len(weak_units))
+                    for u in weak_units:
+                        u.energy += per_unit
+                        self.energy_pool -= per_unit
+                    logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     def upscale_old_units(self, new_input_size):
         """将所有 input_size 小于当前环境预期尺寸的单元升维（只升不降）"""
@@ -1456,11 +1504,12 @@ class CogGraph:
                 unit.input_size = new_input_size
 
     def summary(self):
-        # 打印当前图结构概况
-
-        logger.debug(f"[图结构] 当前单元数: {len(self.units)}")
-        for unit in self.units:
-            logger.debug(f" - {unit} → 连接数: {len(self.connections[unit.id])}")
+        # # 打印当前图结构概况
+        #
+        # logger.debug(f"[图结构] 当前单元数: {len(self.units)}")
+        # for unit in self.units:
+        #     logger.debug(f" - {unit} → 连接数: {len(self.connections[unit.id])}")
+        return
 
     def collect_emitter_outputs(self):
         """收集所有 emitter 输出并自动对齐到目标维度"""
@@ -1481,7 +1530,11 @@ class CogGraph:
 
         if aligned:
             stacked = torch.cat(aligned, dim=0)      # [N, goal_dim]
-            logger.debug("[输出检查] Emitter 对齐后均值(前5) :", stacked.mean(dim=0)[:5])
+            logger.debug(
+                "[输出检查] Emitter 对齐后均值(前5) : %s",
+                stacked.mean(dim=0)[:5]
+            )
+
             return stacked
         else:
             logger.debug("[输出检查] 当前没有活跃的 emitter 单元")

@@ -33,7 +33,7 @@ class RLAgent:
         num_actions: int,
         lr: float = 3e-4,
         gamma: float = 0.99,
-        d_model: int = 64,
+        d_model: int = 128,
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = torch.device(device)
@@ -58,8 +58,8 @@ class RLAgent:
         self.gamma = gamma  # ← 保存折扣因子
 
         # —— 探索 & 正则超参数 ——
-        self.epsilon = 0.1            # ε-greedy 探索率
-        self.entropy_coef = 0.01      # Entropy 正则系数
+        self.epsilon = 0.2            # ε-greedy 探索率
+        self.entropy_coef = 0.025      # Entropy 正则系数
 
         # —— 轨迹缓存 ——
         self.log_probs: List[torch.Tensor] = []

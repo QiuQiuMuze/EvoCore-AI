@@ -25,7 +25,7 @@ class LimitedDebugHandler(logging.Handler):
 
 # === 设置 root logger ===
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
 
 # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
@@ -35,7 +35,7 @@ logger.addHandler(debug_handler)
 
 # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(console_handler)
 
