@@ -246,8 +246,8 @@ class CogUnit:
 
         # === 高频调用奖励机制 ===
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
-        if avg_recent_calls >= 2.0 and self.energy > 0.0:
-            self.energy += 0.01
+        if avg_recent_calls >= 4.0 and self.energy > 0.0:
+            self.energy += 0.02
             logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.01")
 
         # === 输出扰动：模拟早期探索行为（前10步）===
@@ -262,7 +262,7 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.5
+        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.1
         self.energy += self_reward
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
@@ -300,19 +300,19 @@ class CogUnit:
         role = self.get_role()
 
         # ✅ 各类细胞紧急增殖
-        if role == "emitter" and emitter_count <= 1:
+        if role == "emitter" and emitter_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 1  # 💡 补给能量
+            self.energy += 1.0  # 💡 补给能量
             return True
 
-        if role == "processor" and processor_count <= 1:
+        if role == "processor" and processor_count <= 16:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 1
+            self.energy += 1.0
             return True
 
-        if role == "sensor" and sensor_count <= 1:
+        if role == "sensor" and sensor_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 1
+            self.energy += 1.0
             return True
 
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
@@ -366,50 +366,60 @@ class CogUnit:
             return False  # 太年轻的不记
 
         if self.role == "sensor":
-            # 感知单元应关注输入响应频率 & 能量利用效率
+            # 感知单元：至少要有两帧输出才能计算变化
             if len(self.output_history) < 2:
                 return False
 
-            # 3) 计算最近几次感知输出的 L1 变化量
+            # 1) 计算 L1 变化量，先对齐到最小公共长度
             changes = []
-            for i in range(1, len(self.output_history)):
-                prev = self.output_history[i-1]
-                curr = self.output_history[i]
-                changes.append((curr - prev).abs().sum().item())
+            for prev, curr in zip(self.output_history, self.output_history[1:]):
+                p = prev.view(-1)
+                c = curr.view(-1)
+                L = min(p.numel(), c.numel())
+                changes.append((c[:L] - p[:L]).abs().sum().item())
+
+            if not changes:
+                return False
 
             avg_change = sum(changes) / len(changes)
-
-            # 只要平均变化量超过一个阈值，就记这条记忆
-            # —— 这个阈值可以根据 input_size 调整
             SENSOR_CHANGE_THRESHOLD = 5.0
             return avg_change > SENSOR_CHANGE_THRESHOLD
+
 
 
         elif self.role == "processor":
             # 处理单元应关注调用频率 & 输出多样性
             if getattr(self, "avg_recent_calls", 0) < 0.75:
                 return False
-            if len(self.output_history) < 1:
+            if len(self.output_history) < 2:
                 return False
-            # variation = sum(
-            #     torch.norm(self.output_history[i] - self.output_history[i + 1]).item()
-            #     for i in range(len(self.output_history) - 1)
-            # ) / (len(self.output_history) - 1)
-            # return variation > 0.05  # 输出变化足够丰富
-            return True
+            total_diff = 0.0
+            count = 0
+            for prev, curr in zip(self.output_history, self.output_history[1:]):
+                # 只比较 shape 相同的
+                if prev.shape == curr.shape:
+                    total_diff += torch.norm(curr - prev).item()
+                    count += 1
+
+            if count == 0:
+                return False
+
+            variation = total_diff / count
+            return variation > 0.05  # 输出变化足够丰富
+
 
         elif self.role == "emitter":
             # 行为单元应关注任务完成情况和激活频率（活跃但非重复）
-            if self.avg_recent_calls < 1.0:
+            if self.avg_recent_calls < 2.0:
                 return False
             if len(self.output_history) < 2:
                 return False
-            # diff = sum(
-            #     torch.norm(self.output_history[i] - self.output_history[i + 1]).item()
-            #     for i in range(len(self.output_history) - 1)
-            # ) / (len(self.output_history) - 1)
-            # return 0.01 < diff < 0.5  # 太低代表退化，太高可能随机扰动
-            return True
+            diff = sum(
+                torch.norm(self.output_history[i] - self.output_history[i + 1]).item()
+                for i in range(len(self.output_history) - 1)
+            ) / (len(self.output_history) - 1)
+            return 0.01 < diff < 0.5  # 太低代表退化，太高可能随机扰动
+
 
         return False
 
@@ -437,8 +447,12 @@ class CogUnit:
                 # 假设 output_history 至少有 2 帧
                 hist = [t.view(-1) for t in self.output_history]
                 diffs = []
-                for i in range(len(hist) - 1):
-                    diffs.append((hist[i + 1] - hist[i]).norm().item())
+                for prev, curr in zip(self.output_history, self.output_history[1:]):
+                    p = prev.view(-1)
+                    c = curr.view(-1)
+                    L = min(p.numel(), c.numel())
+                    diffs.append((c[:L] - p[:L]).abs().sum().item())
+
                 variation = sum(diffs) / len(diffs)
 
                 score = variation
@@ -546,24 +560,24 @@ class CogUnit:
             return True
 
         # 输出完全重复（仅针对 processor 和 emitter）
-        # if self.role in ["processor", "emitter"] and getattr(self, "current_step", 0) > 600:
-        #     if len(self.output_history) >= 4:
-        #         diffs = []
-        #         for i in range(len(self.output_history) - 1):
-        #             a = self.output_history[i]
-        #             b = self.output_history[i + 1]
-        #             target_dim = max(a.shape[-1], b.shape[-1])
-        #             if a.shape[-1] < target_dim:
-        #                 padding = (0, target_dim - a.shape[-1])
-        #                 a = torch.nn.functional.pad(a, padding, value=0)
-        #             if b.shape[-1] < target_dim:
-        #                 padding = (0, target_dim - b.shape[-1])
-        #                 b = torch.nn.functional.pad(b, padding, value=0)
-        #             diffs.append(torch.norm(a - b).item())
-        #
-        #         if max(diffs) < 0.01:
-        #             logger.info(f"[退化死亡] {self.id} 输出变化极小 → 被淘汰")
-        #             return True
+        if self.role in ["processor", "emitter"] and getattr(self, "current_step", 0) > 600:
+            if len(self.output_history) >= 4:
+                diffs = []
+                for i in range(len(self.output_history) - 1):
+                    a = self.output_history[i]
+                    b = self.output_history[i + 1]
+                    target_dim = max(a.shape[-1], b.shape[-1])
+                    if a.shape[-1] < target_dim:
+                        padding = (0, target_dim - a.shape[-1])
+                        a = torch.nn.functional.pad(a, padding, value=0)
+                    if b.shape[-1] < target_dim:
+                        padding = (0, target_dim - b.shape[-1])
+                        b = torch.nn.functional.pad(b, padding, value=0)
+                    diffs.append(torch.norm(a - b).item())
+
+                if max(diffs) < 0.005:
+                    logger.info(f"[退化死亡] {self.id} 输出变化极小 → 被淘汰")
+                    return True
         return False
 
     def clone(self, role_override=None, new_input_size=None):

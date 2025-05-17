@@ -102,9 +102,9 @@ class CogGraph:
     # -------------------------------------------------------------------
     # 自动生成种子细胞（sensor=1, processor=4, emitter=1，可调）
     def _init_seed_units(self,
-                         n_sensor: int = 2,
-                         n_processor: int = 4,
-                         n_emitter: int = 2,
+                         n_sensor: int = 16,
+                         n_processor: int = 32,
+                         n_emitter: int = 16,
                          device: str = "cpu"):
 
         expected_input = self.env_size * self.env_size * INPUT_CHANNELS
@@ -1012,7 +1012,7 @@ class CogGraph:
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step > 0 and self.current_step % 500 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 20)  # 每次+5，最大到20x20
+            self.env_size = min(self.env_size + 5, 40)  # 每次+5，最大到40x40
             self.env = GridEnvironment(size=self.env_size)  # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -1036,7 +1036,7 @@ class CogGraph:
                     unit.energy += 0.05
                     logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
 
-        if self.current_step > 0 and self.current_step % 100 == 0:
+        if self.current_step > 0 and self.current_step % 500 == 0:
             old_target = self.target_vector.clone()
             self.target_vector = torch.rand_like(self.target_vector)
 
@@ -1088,9 +1088,6 @@ class CogGraph:
                 # 条件2：高分门槛
                 if last_score < score_threshold:
                     continue
-                # 条件3：活跃度
-                if getattr(u, "avg_recent_calls", 0) < 2.0:
-                    continue
 
                 # 条件4：输出质量 role-specific
                 # 先从 local_memory_pool 最近几条里重算 quality
@@ -1100,18 +1097,21 @@ class CogGraph:
                 aligned = [t if t.numel() == max_len else torch.nn.functional.pad(t, (0, max_len - t.numel())) for t in
                            hist]
                 diffs = [(aligned[i] - aligned[i + 1]).norm().item() for i in range(len(aligned) - 1)]
-                if u.role == "processor":
-                    diversity = sum(diffs) / len(diffs)
-                    if diversity < 0.1:
-                        continue
-                elif u.role == "sensor":
+                if u.role == "sensor":
                     variation = torch.var(torch.stack(aligned), dim=0).mean().item()
                     if variation < 0.05:
                         continue
+
+                elif u.role == "processor":
+                    diversity = sum(diffs) / len(diffs)
+                    if diversity < 0.1 and getattr(u, "avg_recent_calls", 0) < 2.0:
+                        continue
+
+
                 elif u.role == "emitter":
                     avg_diff = sum(diffs) / len(diffs)
                     stability = 1.0 if 0.01 < avg_diff < 0.5 else 0.0
-                    if stability < 1.0:
+                    if stability < 1.0 and getattr(u, "avg_recent_calls", 0) < 2.0:
                         continue
 
                 # 全部通过，加入候选
@@ -1302,7 +1302,7 @@ class CogGraph:
             distance = torch.norm(avg_output - target_vector)
 
             # 线性衰减式奖励分数（距离 0→奖励满分1，距离3→奖励为0）
-            reward_score = max(0.0, 1.0 - distance / 5.0)
+            reward_score = max(0.0, 1.0 - distance / 3.0)
 
             if reward_score > 0.0:
                 dim_scale = self.target_vector.size(0) / 50  # 50 → 原始基准
