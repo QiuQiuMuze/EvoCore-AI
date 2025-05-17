@@ -52,8 +52,14 @@ class TransformerPolicyNetwork(nn.Module):
         # 4) 输出头
         self.fc_out = nn.Linear(d_model, num_actions)
 
+        # —— 新增动作噪声参数 ——
+        # 在训练时，logits 上加高斯噪声；eval 模式下保持确定性
+        self.noise_std = 0.2
+        self.use_action_noise = True
+
         # 初始化（官方推荐方式）
         self._reset_parameters()
+
 
     # -------------------------------------------------------------
 
@@ -88,6 +94,12 @@ class TransformerPolicyNetwork(nn.Module):
 
         # step-5 分类头
         logits = self.fc_out(h)  # (B, num_actions)
+        # —— 训练时加入高斯噪声 ——
+        if self.training and self.use_action_noise:
+            # 生成和 logits 同 shape 的 Gaussian 噪声
+            noise = torch.randn_like(logits) * self.noise_std
+            logits = logits + noise
+
         return logits
 
 

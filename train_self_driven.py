@@ -27,6 +27,7 @@ import torch
 from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
+from utils import IntrinsicCuriosityModule
 
 import torch.nn as nn
 
@@ -113,7 +114,15 @@ def main(cfg):
         d_model=64,
         device=device)
 
-    # 在创建 agent 之后
+    # 在创建 agent 之后 —— 初始化 Intrinsic Curiosity Module
+    icm = IntrinsicCuriosityModule(
+        state_dim=input_dim,
+        action_dim=agent.policy_net.fc_out.out_features,
+        hidden_dim=64,    # 隐藏层大小，你可以改成 d_model 或者 128
+        lr=1e-4           # ICM 学习率
+    ).to(device)
+    curiosity_beta = 0.05  # 内在奖励权重
+
     last_dim = graph.processor_hidden_size  # 初始 D_old
 
     print(f"[Init] transformer input_dim = {input_dim}, device = {device}")
@@ -156,6 +165,7 @@ def main(cfg):
             if new_dim != last_dim:
                 print(f"[Resize] input_proj: {last_dim} → {new_dim}")
                 resize_input_proj(agent, new_dim, device)
+                icm.expand_state_dim(new_dim)
                 last_dim = new_dim
 
             # ——— 拿出前向输出，构造 transformer 输入序列 ———
@@ -189,20 +199,48 @@ def main(cfg):
                 danger_shaping = 0.0
             # --------------------------------------
 
-            # 奖励：环境内部字段决定
-            reward = (getattr(env, "agent_energy_gain", 0.0)
-                      - getattr(env, "agent_energy_penalty", 0.0)
-                      + proximity_bonus + danger_shaping)
+            # # 奖励：环境内部字段决定
+            # reward = (getattr(env, "agent_energy_gain", 0.0)
+            #           - getattr(env, "agent_energy_penalty", 0.0)
+            #           + proximity_bonus + danger_shaping)
+            #
+            # agent.store_reward(reward)
+            # ep_reward += reward
+            #
+            # # 更新下一状态
+            # state = torch.from_numpy(env.get_state()).float().to(cfg.device)
+            # —— 1) 计算外在奖励 ——
+            ext_reward = (
+                    getattr(env, "agent_energy_gain", 0.0)
+                    - getattr(env, "agent_energy_penalty", 0.0)
+                    + proximity_bonus + danger_shaping
+            )
+            # —— 2) 拿到 raw 下一状态 & 对应的 sensor 特征 ——
+            next_raw = torch.from_numpy(env.get_state()).float().to(device)
+            next_sensor = graph.sensor_forward(next_raw)  # shape = (1, state_dim)
+            # —— 3) 计算内在奖励 ——
+            #    用当前 step 的 sensor_out (shape=(1,state_dim)) 而非 raw state
+            ic_reward = icm.compute_intrinsic_reward(
+                sensor_out.squeeze(0),  # (state_dim,)
+                next_sensor.squeeze(0),  # (state_dim,)
+                torch.tensor([action],
+                             dtype=torch.long,
+                             device=device)
+            )
+            # —— 4) 合并奖励并存储 ——
+            total_reward = ext_reward + curiosity_beta * ic_reward
+            agent.store_reward(total_reward)
+            ep_reward += total_reward
 
-            agent.store_reward(reward)
-            ep_reward += reward
-
-            # 更新下一状态
-            state = torch.from_numpy(env.get_state()).float().to(cfg.device)
+            # —— 5) 更新下一步：raw state & (下一步的) sensor_out ——
+            state = next_raw
+            # 下次循环开始会重新计算 sensor_out = graph.sensor_forward(state)
 
         # --- Episode 结束：策略更新 ---
         agent.finish_episode()
         reward_history.append(ep_reward)
+        # —— 每集结束后，优化 ICM 模型 ——
+        icm.update_parameters()
 
         # --- 日志 & Checkpoint ---
         if ep % 100 == 0:

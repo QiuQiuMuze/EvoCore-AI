@@ -14,7 +14,7 @@ RLAgent
 """
 
 from __future__ import annotations
-
+import random
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -57,10 +57,16 @@ class RLAgent:
 
         self.gamma = gamma  # ← 保存折扣因子
 
+        # —— 探索 & 正则超参数 ——
+        self.epsilon = 0.1            # ε-greedy 探索率
+        self.entropy_coef = 0.01      # Entropy 正则系数
+
         # —— 轨迹缓存 ——
         self.log_probs: List[torch.Tensor] = []
         self.rewards:   List[float]       = []
-        self.saved_states = []  # baseline 需要状态输入
+        self.saved_states = []            # baseline 需要状态输入
+        self.saved_logits: List[torch.Tensor] = []  # 用于计算 entropy
+
 
 
     # --------------------------------------------------------------------- #
@@ -96,10 +102,29 @@ class RLAgent:
             int: 动作索引
         """
         state_seq = state_seq.to(self.device)
-        logits = self.policy_net(state_seq)          # (1, num_actions)
-        dist = Categorical(logits=logits)
-        action = dist.sample()                       # Tensor([])
-        self.log_probs.append(dist.log_prob(action)) # 缓存本步 log π(a|s)
+        logits = self.policy_net(state_seq)  # (1, num_actions)
+        # — ε-greedy 行为 —
+        if random.random() < self.epsilon:
+            # 随机动作
+            action = torch.randint(
+                low=0,
+                high=logits.size(-1),
+                size=(1,),
+                device=self.device
+            )
+            # uniform log_prob = log(1/num_actions)
+            log_prob = torch.log(
+                torch.ones_like(action, dtype=torch.float, device=self.device)
+                / logits.size(-1)
+            )
+        else:
+            dist = Categorical(logits=logits)
+            action = dist.sample()                   # Tensor([a])
+            log_prob = dist.log_prob(action)         # 缓存 log π(a|s)
+        self.log_probs.append(log_prob)
+        # 存保存 logits 用于后续 entropy 计算
+        self.saved_logits.append(logits.squeeze(0))  # shape=(num_actions,)
+
         state_feat = state_seq.detach().mean(dim=1)  # (1, input_dim)
         self.saved_states.append(state_feat)  # ← 保存一份状态序列，用于 baseline 值函数
         return action.item()
@@ -149,7 +174,21 @@ class RLAgent:
             policy_loss.append(-log_prob * advantage)
             value_loss.append(torch.nn.functional.mse_loss(value, R))
 
-        loss = torch.stack(policy_loss).sum() + 0.5 * torch.stack(value_loss).sum()
+        # — 计算 Entropy bonus —
+        if self.saved_logits:
+            L = torch.stack(self.saved_logits)  # [T, num_actions]
+            P = torch.softmax(L, dim=-1)
+            entropy = -(P * torch.log(P + 1e-8)).sum(dim=-1).mean()
+        else:
+            torch.tensor(0.0, device=self.device)
+
+        # 总损失 = policy + 0.5 * value - entropy_coef * entropy
+        loss = (
+            torch.stack(policy_loss).sum()
+            + 0.5 * torch.stack(value_loss).sum()
+            - self.entropy_coef * entropy
+        )
+
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -158,6 +197,7 @@ class RLAgent:
         self.log_probs.clear()
         self.rewards.clear()
         self.saved_states.clear()
+        self.saved_logits.clear()  # 清空 entropy 缓存
 
     # --------------------------------------------------------------------- #
     #                          模型持久化                                    #
