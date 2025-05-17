@@ -560,7 +560,7 @@ class CogUnit:
             return True
 
         # 输出完全重复（仅针对 processor 和 emitter）
-        if self.role in ["processor", "emitter"] and getattr(self, "current_step", 0) > 600:
+        if self.role in ["processor", "emitter"] and getattr(self, "current_step", 0) > 600 and self.age > 150:
             if len(self.output_history) >= 4:
                 diffs = []
                 for i in range(len(self.output_history) - 1):
