@@ -10,6 +10,8 @@ import logging
 from collections import deque, Counter
 from env import logger
 from typing import List, Dict
+from agents.rl_agent import RLAgent
+import copy
 
 
 # class LimitedDebugHandler(logging.Handler):
@@ -131,8 +133,10 @@ class CogGraph:
                 self.connect(p, e)
 
     # -------------------------------------------------------------------
-    def __init__(self, device: str = "cpu"):
-        self.device = torch.device(device)
+    def __init__(self, rl_agent: RLAgent, device: str = "cpu"):
+        # 保存传入的 RLAgent 实例
+        self.rl_agent = rl_agent
+        self.device   = torch.device(device)
         # === RL 接口：Processor 输出的统一维度 ===
         self._pending_deaths: List[CogUnit] = []
         self._death_energy_sum: Dict[str, float] = {}  # role -> total energy
@@ -395,11 +399,14 @@ class CogGraph:
         """
         dev = self.device  # ← 统一目标设备
         x = torch.as_tensor(env_state_np, dtype=torch.float32, device=dev).view(-1)
-        if x.numel() < self.processor_hidden_size:
-            pad = (0, self.processor_hidden_size - x.numel())
+        # —— 对齐到 processor_hidden_size ——
+        D = x.numel()
+        if D < self.processor_hidden_size:
+            pad = (0, self.processor_hidden_size - D)
             x = torch.nn.functional.pad(x, pad)
-        else:
+        elif D > self.processor_hidden_size:
             x = x[: self.processor_hidden_size]
+
         sensors = [u for u in self.units if u.get_role() == "sensor"]
         if sensors:
             outs = []
@@ -498,7 +505,20 @@ class CogGraph:
                 # ✅ 满足条件，执行合并
                 logger.info(f"[合并触发] {u1.id} 和 {u2.id} 合并为新单元")
 
-                merged = CogUnit(role=u1.get_role())
+                # —— 1) 先计算当前期望输入维度
+                expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+                # —— 2) 用父体的 hidden_size 保持隐层容量，并继承权重
+                merged = CogUnit(
+                    input_size=expected_input,
+                    hidden_size=u1.hidden_size,
+                    role=u1.get_role(),
+                    env_size=self.env_size
+                )
+                # 深拷贝 u1 的 network 权重到 merged
+                import copy
+                merged.function = copy.deepcopy(u1.function)
+
+                # —— 3) 下面所有融合逻辑都作用在这个 merged 上
                 merged.position = (
                     (u1.get_position()[0] + u2.get_position()[0]) // 2,
                     (u1.get_position()[1] + u2.get_position()[1]) // 2
@@ -619,8 +639,24 @@ class CogGraph:
                     logger.info(f"[重构触发] 子图 ({p1.id}→{e1.id}) 与 ({p2.id}→{e2.id}) 相似，开始重构")
 
                     # 创建新单元
-                    new_p = CogUnit(role="processor")
-                    new_e = CogUnit(role="emitter")
+                    # 创建新单元（带上正确维度）
+                    expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+                    new_p = CogUnit(
+                        input_size=expected_input,
+                        hidden_size=p1.hidden_size,  # 或融合 p1,p2 的 hidden_size
+                        role="processor",
+                        env_size=self.env_size
+                    )
+                    new_e = CogUnit(
+                        input_size=expected_input,
+                        hidden_size=e1.hidden_size,  # 或融合 e1,e2 的 hidden_size
+                        role="emitter",
+                        env_size=self.env_size
+                    )
+                    # 如果要继承父权重：
+                    new_p.function = copy.deepcopy(p1.function)
+                    new_e.function = copy.deepcopy(e1.function)
+
                     new_p.state = (p1.state + p2.state) / 2
                     new_p.last_output = (p1.last_output + p2.last_output) / 2
                     new_e.state = (e1.state + e2.state) / 2
@@ -980,19 +1016,23 @@ class CogGraph:
     def step(self, input_tensor: torch.Tensor):
         self._update_global_counts()
         self.current_step += 1
-        env_state = torch.from_numpy(self.env.get_state()).float().to(self.device).unsqueeze(0)
-        goal_tensor = self.task.encode_goal(self.env_size).unsqueeze(0).to(self.device)
+        # —— 改为拆分外部传入的 input_tensor ——
+        # 假设调用方已经做了 torch.cat([env_state, goal_vec], dim=1)
+        batch = input_tensor.to(self.device)               # (1, env_dim+goal_dim)
+        env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
+        env_state = batch[:, :env_dim]                    # (1, env_dim)
+        goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
+
 
         if self.current_step == 10000:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
         # 若当前步数非常早期，给予基础能量补偿
-        if self.current_step < 10:
+        if self.current_step < 1000:
             for unit in self.units:
-                if unit.get_role() != "sensor":
-                    unit.energy += 0.05
-                    logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
+                unit.energy += 0.08
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -1035,9 +1075,10 @@ class CogGraph:
         if self.current_step > 0 and self.current_step % 500 == 0:
             old_size = self.env_size
             self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
-            self.env = GridEnvironment(size=self.env_size)  # 重新生成环境
+            self.env.resize(self.env_size) # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
+            self.rl_agent.resize_state_dim(self.processor_hidden_size)
 
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
@@ -1246,7 +1287,7 @@ class CogGraph:
             unit.current_step = self.current_step
             # === 统一动态能量消耗 ===
             var = torch.var(unit_input).item()
-            freq = unit.recent_calls
+            freq = unit.avg_recent_calls
             conn = unit.connection_count
             call_density = freq / (conn + 1)
             conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
@@ -1272,7 +1313,8 @@ class CogGraph:
 
             logger.debug(
                 f"[代谢] {unit.id} var={var:.3f}, freq={freq}, conn={conn}, strength_sum={conn_strength_sum:.2f} → -{decay:.3f} 能量")
-
+            unit.current_step = self.current_step
+            unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
             unit.update(unit_input)
 
 
@@ -1363,13 +1405,11 @@ class CogGraph:
                         logger.debug(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
 
                     if self.task.evaluate(self.env, outputs):
-                        if self.task.evaluate(self.env, outputs):
-                            logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励")
-                            if unit.get_role() == "emitter":
-                                unit.energy += 0.02  # 提高 emitter 奖励
-                            elif unit.get_role() == "processor":
-                                unit.energy += 0.02  # 给 processor 更多能量，鼓励参与
-
+                        logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励")
+                        if unit.get_role() == "emitter":
+                            unit.energy += 0.02
+                        elif unit.get_role() == "processor":
+                            unit.energy += 0.02
 
                 logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
 
@@ -1382,13 +1422,13 @@ class CogGraph:
 
         # —— 统一统计 & 连接打印（仅 debug） ——
         self._log_stats_and_conns()
-        if self.debug and self.current_step % 20 == 0:
+        if self.debug and self.current_step % 30 == 0:
             self.rebalance_cell_types()
 
         # === 🔁 分裂 or 储能：强制处理能量超标单元 ===
         while True:
             over_energy_units = [u for u in self.units if u.energy > 3.5]
-            if not over_energy_units or self.current_step % 20 != 0:
+            if not over_energy_units or self.current_step % 30 != 0:
                 break
 
             min_counts = self._get_min_target_counts()
@@ -1472,41 +1512,73 @@ class CogGraph:
                         self.energy_pool -= per_unit
                     logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
+    # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
+
     def upscale_old_units(self, new_input_size):
-        """将所有 input_size 小于当前环境预期尺寸的单元升维（只升不降）"""
+        """将所有 input_size < new_input_size 的单元升维（只升不降）。"""
+        import torch
+
         for unit in self.units:
-            if unit.input_size < new_input_size:
-                logger.info(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
+            if unit.input_size >= new_input_size:
+                continue
 
-                # 1. 升维 last_output
-                old_output = unit.last_output
-                if old_output.dim() == 2 and old_output.shape[0] == 1:
-                    old_output = old_output.squeeze(0)
-                padded_output = torch.zeros(new_input_size, device=old_output.device)
-                padded_output[:old_output.shape[0]] = old_output
-                unit.last_output = padded_output
+            logger.info(f"[升维] {unit.id} input_size {unit.input_size} → {new_input_size}")
 
-                # 2. 检查 hidden_size 是否也要升高（只升不降）
-                if unit.state.shape[0] > unit.hidden_size:
-                    unit.hidden_size = unit.state.shape[0]
-                    logger.info(f"[升维] {unit.id} hidden_size 升至 {unit.hidden_size}")
+            # —— 1. 升维 last_output ——
+            old_out = unit.last_output
+            if old_out.dim() == 2 and old_out.shape[0] == 1:
+                old_out = old_out.squeeze(0)
+            new_out = torch.zeros(new_input_size, device=old_out.device)
+            new_out[: old_out.shape[0]] = old_out
+            unit.last_output = new_out
 
-                # 3. 升维 state
-                old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
-                padded_state = torch.zeros(unit.hidden_size, device=old_state.device)
-                length = min(padded_state.shape[0], old_state.shape[0])
-                padded_state[:length] = old_state[:length]
-                unit.state = padded_state
+            # —— 2. 升维 output_history ——
+            new_history = []
+            for out in unit.output_history:
+                v = out.squeeze(0) if out.dim() == 2 else out
+                p = torch.zeros(new_input_size, device=v.device)
+                p[: v.shape[0]] = v
+                new_history.append(p.unsqueeze(0))
+            unit.output_history = new_history
 
-                # 4. 重建网络结构
-                unit.function = torch.nn.Sequential(
-                    torch.nn.Linear(new_input_size, unit.hidden_size),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(unit.hidden_size, new_input_size)
-                )
+            # —— 3. 升维 state ——
+            # 注意：这里 state 的维度一直等同于 input_size，所以用 new_input_size
+            old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
+            new_state = torch.zeros(new_input_size, device=old_state.device)
+            new_state[: old_state.shape[0]] = old_state
+            unit.state = new_state
 
-                # 5. 更新 input_size
-                unit.input_size = new_input_size
+            # —— 4. 升维 state_memory ——
+            new_mem = []
+            for mem in unit.state_memory:
+                p = torch.zeros(new_input_size, device=mem.device)
+                p[: mem.shape[-1]] = mem
+                new_mem.append(p)
+            unit.state_memory = new_mem
+
+            # —— 5. 重建 function（只升不降）并拷贝旧权重 ——
+            # 保存旧权重
+            old_l1, old_l2 = unit.function[0], unit.function[2]
+            w1, b1 = old_l1.weight.data.clone(), old_l1.bias.data.clone()
+            w2, b2 = old_l2.weight.data.clone(), old_l2.bias.data.clone()
+
+            # 新网络：输入 new_input_size，隐藏层保持原 hidden_size
+            h = unit.hidden_size
+            new_l1 = torch.nn.Linear(new_input_size, h, device=w1.device)
+            new_l2 = torch.nn.Linear(h, new_input_size, device=w1.device)
+            new_func = torch.nn.Sequential(new_l1, torch.nn.ReLU(), new_l2)
+
+            # 无梯度拷贝旧参数
+            with torch.no_grad():
+                new_l1.weight[:, : w1.shape[1]].copy_(w1)
+                new_l1.bias.copy_(b1)
+                new_l2.weight[: w2.shape[0], : w2.shape[1]].copy_(w2)
+                new_l2.bias[: b2.shape[0]].copy_(b2)
+
+            unit.function = new_func
+
+            # —— 6. 更新 input_size ——
+            unit.input_size = new_input_size
 
     def summary(self):
         # # 打印当前图结构概况

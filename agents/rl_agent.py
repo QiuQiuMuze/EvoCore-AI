@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 from typing import List
-
+from env import logger
 from models.transformer_policy import TransformerPolicyNetwork
 
 
@@ -39,6 +39,8 @@ class RLAgent:
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = torch.device(device)
+        self.state_dim = input_dim
+        self.num_actions = num_actions
         # 1) 先构造策略网
         self.policy_net = TransformerPolicyNetwork(
             input_dim=input_dim,
@@ -95,6 +97,41 @@ class RLAgent:
         self.value_head = torch.nn.Sequential(new_layer)
         print(f"[🔁 升维] value_head 输入维度 {old_input_dim} → {new_input_dim}")
 
+    def resize_state_dim(self, new_input_dim: int):
+        """
+        环境扩张后调用，重建 policy_net 并拷贝 input_proj 的重叠部分权重，
+        再扩展 value_head。
+        """
+        old_policy = self.policy_net
+        old_dim = self.state_dim
+        # 1) 构建新网络
+        self.policy_net = TransformerPolicyNetwork(
+            input_dim=new_input_dim,
+            num_actions=self.num_actions,
+            d_model=old_policy.transformer_encoder.layers[0].self_attn.embed_dim,
+            nhead=old_policy.transformer_encoder.layers[0].self_attn.num_heads,
+            num_layers=len(old_policy.transformer_encoder.layers),
+            dim_feedforward=old_policy.transformer_encoder.layers[0].linear1.out_features,
+            max_seq_len=old_policy.pos_emb.shape[0],
+            use_action_noise=old_policy.use_action_noise
+        ).to(self.device)
+
+        # 2) 拷贝重叠的 input_proj 权重和 bias
+        with torch.no_grad():
+            old_proj = old_policy.input_proj    # Linear(old_dim → d_model)
+            new_proj = self.policy_net.input_proj
+            shared = min(old_dim, new_input_dim)
+            # weight shape = [d_model, input_dim]
+            new_proj.weight[:, :shared].copy_(old_proj.weight[:, :shared])
+            new_proj.bias.copy_(old_proj.bias)
+
+        logger.info(f"[RLAgent] policy_net input_dim {old_dim}→{new_input_dim}, 权重已拷贝")
+
+        # 3) 扩展 value_head
+        self.expand_value_head(new_input_dim)
+
+        # 4) 更新内部记录
+        self.state_dim = new_input_dim
     def select_action(self, state_seq: torch.Tensor) -> int:
         """
         给定状态序列，采样一个动作。
@@ -171,9 +208,28 @@ class RLAgent:
         policy_loss = []
         value_loss = []
 
+        import torch.nn.functional as F
         for log_prob, state_feat, R in zip(self.log_probs, self.saved_states, returns):
-            self.expand_value_head(state_feat.shape[-1])  # 确保 value_head 支持当前输入维度
+            # 1) 拿到当前 value_head 的输入维度
+            linear = self.value_head[0]  # Sequential 中的 Linear 层
+            in_dim = linear.in_features
+
+            # 2) 如果 state_feat 比网络输入大，先扩维网络（只升不缩）
+            if state_feat.shape[-1] > in_dim:
+                self.expand_value_head(state_feat.shape[-1])
+                linear = self.value_head[0]
+                in_dim = linear.in_features
+
+            # 3) 如果 state_feat 比网络输入小，pad 零补齐
+            cur_dim = state_feat.shape[-1]
+            if cur_dim < in_dim:
+                pad_size = in_dim - cur_dim
+                # pad 格式 (left, right)，这里只有最后一维右侧补 pad_size
+                state_feat = F.pad(state_feat, (0, pad_size), value=0.0)
+
+            # 4) 现在 state_feat.shape[-1] == in_dim，安全调用
             value = self.value_head(state_feat).squeeze()
+
             advantage = R - value.detach()
             policy_loss.append(-log_prob * advantage)
             value_loss.append(torch.nn.functional.mse_loss(value, R))

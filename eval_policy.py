@@ -19,7 +19,18 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
         f"Cannot infer env_size from input_dim={saved_input_dim}"
     )
     env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
-    graph = CogGraph(device=device)
+    # 1️⃣ 先创建并加载 Agent
+    agent = RLAgent(
+        input_dim=saved_input_dim,
+        num_actions=env.action_space_n,
+        d_model=saved_d_model,
+        device=device
+    )
+    agent.load(ckpt_path, map_location=device)
+
+    # 2️⃣ 把 Agent 传给 CogGraph
+    graph = CogGraph(agent, device=device)
+
     graph.env_size = saved_env_size
     graph.env = env
     graph.processor_hidden_size = saved_input_dim
@@ -111,7 +122,7 @@ if __name__ == "__main__":
 """
 python eval_policy.py \
   --ckpt checkpoints/agent_final.pth \
-  --episodes 3\
-  --max-steps 500\
+  --episodes 5\
+  --max-steps 1000\
   --device cpu
 """

@@ -56,10 +56,21 @@ class GridEnvironment:
         """刷新资源与危险格子的位置（每隔一段时间）"""
         self.resources.clear()
         self.hazards.clear()
-        for _ in range((self.size+max((self.step_count // 250)-1500, 0))*2):  # 生成资源
-            self.resources.add((random.randint(0, self.size - 1), random.randint(0, self.size - 1)))
-        for _ in range(self.size++max((self.step_count // 250)-1500, 0)):  # 生成危险区域
-            self.hazards.add((random.randint(0, self.size - 1), random.randint(0, self.size - 1)))
+        # 修正语法：先计算增量
+        extra = max(((self.step_count - 1500) // 250), 0)
+        # 生成资源：size + extra 数量，每次随机位置
+        for _ in range((self.size + extra) * 2):
+            self.resources.add((
+                random.randint(0, self.size - 1),
+                random.randint(0, self.size - 1)
+            ))
+        # 生成危险区域：size + extra 数量
+        for _ in range(self.size + extra):
+            self.hazards.add((
+                random.randint(0, self.size - 1),
+                random.randint(0, self.size - 1)
+            ))
+
 
     def reset(self):
         # agent 初始化在随机位置
@@ -95,12 +106,12 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = 0.4 - max((self.step_count // 1000) * 0.02, 0)  # 单步奖励
+            self.agent_energy_gain = 0.6 - max(((self.step_count - 5000) // 1000) * 0.02, 0)  # 单步奖励
         else:
             self.agent_energy_gain = 0
 
         if pos in self.hazards:
-            self.agent_energy_penalty = 0.3 + max((self.step_count // 1000) * 0.02, 0)
+            self.agent_energy_penalty = 0.2 + max(((self.step_count - 5000) // 1000) * 0.02, 0)
         else:
             self.agent_energy_penalty = 0.0
 
@@ -194,6 +205,25 @@ class GridEnvironment:
         return min(abs(pos[0] - rx) + abs(pos[1] - ry)
                    for rx, ry in self.resources)
 
+    def resize(self, new_size: int):
+        """
+        平滑扩张环境到 new_size×new_size：
+        - 保留 agent_pos, step_count, prev_dist_… 等状态
+        - 更新 size，然后增量 flush 资源 & 危险
+        """
+        # 1) 更新 size
+        old_size = self.size
+        self.size = new_size
+
+        # 2) 保留当前位置：如果超出边界，裁剪到合法范围
+        x, y = self.agent_pos
+        x = min(x, new_size - 1)
+        y = min(y, new_size - 1)
+        self.agent_pos = [x, y]
+
+        # 3) 重新生成资源/危险，但不重置 step_count 等
+        #    这里直接调用 refresh_environment，让它基于当前 step_count 重绘
+        self.refresh_environment(step=self.step_count, explored_cells_count=self.explored_cells_count)
 
 if __name__ == "__main__":
     env = GridEnvironment(size=10)

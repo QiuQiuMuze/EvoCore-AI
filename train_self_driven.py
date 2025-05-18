@@ -98,9 +98,25 @@ def main(cfg):
     device = torch.device(cfg.device)
 
     # 1) 初始化 CogGraph 内部环境 & 图
-    graph = CogGraph(device=cfg.device)  # 内部已包含 env = GridEnvironment(size=5)
+    # 先用一个临时 env 推断初始输入维度（Graph 还没挂 agent，所以不用它）
+    from env import GridEnvironment
+    temp_env = GridEnvironment(size=5)
+    init_state = torch.from_numpy(temp_env.get_state()).float()
+    init_dim = _infer_input_dim(None, init_state)  # None 会让 _infer_input_dim 返回 env.size
+
+    # 2) 根据推断维度创建 RLAgent
+    agent = RLAgent(
+        input_dim=init_dim,
+        num_actions=temp_env.action_space_n,
+        lr=cfg.lr,
+        gamma=cfg.gamma,
+        d_model=64,
+        device=device
+    )
+
+    # 3) 现在把 agent 注入 CogGraph，再取它的 env
+    graph = CogGraph(agent, device=cfg.device)
     graph.debug = True
-    # —— 让 train 循环也用同一个 env 实例 ——
     env = graph.env
 
     # ---- 新增 ----
@@ -118,6 +134,8 @@ def main(cfg):
         gamma=cfg.gamma,
         d_model=64,
         device=device)
+
+    graph.rl_agent = agent
 
     # 在创建 agent 之后 —— 初始化 Intrinsic Curiosity Module
     icm = IntrinsicCuriosityModule(
@@ -157,11 +175,11 @@ def main(cfg):
         inp = torch.cat([flat_state, goal_vec], dim=0).unsqueeze(0)      # (1, D)
         graph.step(inp)
 
-        # —— ③ 如果隐藏维度变了，升维 policy 和 ICM ——
+        # —— ③ 如果隐藏维度变了，一次性调整 policy_net 和 value_head ——
         new_dim = graph.processor_hidden_size
         if new_dim != last_dim:
-            print(f"[Resize] input_proj: {last_dim} → {new_dim}")
-            resize_input_proj(agent, new_dim, device)
+            print(f"[Resize] dim: {last_dim} → {new_dim}")
+            agent.resize_state_dim(new_dim)  # ← 这里自动重建并拷贝策略网络＋价值网络
             icm.expand_state_dim(new_dim)
             last_dim = new_dim
 

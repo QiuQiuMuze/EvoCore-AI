@@ -4,9 +4,10 @@ import uuid
 import random
 from env import logger
 from collections import deque
+import torch.nn as nn
 
 # ======== CogUnit 全局功能开关 ========
-ENABLE_MINI_LEARN = False   # ← 关闭自编码训练
+ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
 FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
 # 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
 MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
@@ -119,7 +120,8 @@ class CogUnit:
         self.age = 0                    # 生存步数
         self.input_size = input_size
         self.hidden_size = hidden_size
-
+        self.call_history = []
+        self.avg_recent_calls = 0.0
         # 认知状态向量
         self.state = torch.zeros(hidden_size)
 
@@ -190,6 +192,33 @@ class CogUnit:
 
 
     def update(self, input_tensor: torch.Tensor):
+        # 刚更新完一次，就把过去 call_history 滑窗算一下均值
+        if self.call_history:
+            self.avg_recent_calls = sum(self.call_history) / len(self.call_history)
+
+        # —— 保证 input_tensor 是形状 (1, D) ——
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)
+
+        # —— 拼接目标向量 ——
+        if hasattr(self, "goal_vec"):
+            # self.goal_vec: (goal_dim,)
+            gv = self.goal_vec.view(1, -1)  # → (1, goal_dim)
+            input_tensor = torch.cat([input_tensor, gv], dim=-1)
+        # —— 对齐到 current network 的 input_size ——
+        D = input_tensor.shape[-1]
+        if D < self.input_size:
+            pad = (0, self.input_size - D)
+            input_tensor = torch.nn.functional.pad(input_tensor, pad)
+        elif D > self.input_size:
+            input_tensor = input_tensor[..., : self.input_size]
+
+        # —— concat 完毕 ——
+
+        # 动态扩展记忆窗口：每 500 步多存 5 帧
+        step = getattr(self, "current_step", 0)
+        self.memory_limit = 5 + (step // 500) * 5
+
         global_step = getattr(self, "current_step", 0)
         self.memory_pool_limit = 50 + (global_step // 500) * 20  # 每 500 步 +20
 
@@ -201,18 +230,54 @@ class CogUnit:
         """更新 CogUnit 状态"""
         if input_tensor.dim() == 1:
             input_tensor = input_tensor.unsqueeze(0)
+            if hasattr(self, "goal_vec"):
+                gv = self.goal_vec.unsqueeze(0)  # → (1, goal_dim)
+                input_tensor = torch.cat([input_tensor, gv], dim=-1)
 
         # 🚨 先检查 input_size 是否需要扩展（动态适配环境变化）
         current_input_size = input_tensor.shape[-1]
         if current_input_size > self.input_size:
-            logger.info(f"[动态扩展] {self.id} 输入尺寸增加 {self.input_size} → {current_input_size}")
+            old_l1, old_l2 = self.function[0], self.function[2]
+            # 克隆一下旧权重
+            w1, b1 = old_l1.weight.data.clone(), old_l1.bias.data.clone()
+            w2, b2 = old_l2.weight.data.clone(), old_l2.bias.data.clone()
+
+            h = self.hidden_size
+            # 新网络：输入维度 current_input_size → hidden → current_input_size
+            new_l1 = nn.Linear(current_input_size, h, device=old_l1.weight.device)
+            new_l2 = nn.Linear(h, current_input_size, device=old_l2.weight.device)
+
+            # 用 no_grad 把旧参数拷到新网络
+            with torch.no_grad():
+                # 第一层：保留旧的列
+                new_l1.weight[:, :w1.shape[1]].copy_(w1)
+                new_l1.bias.copy_(b1)
+                # 第二层：保留旧的行和列
+                new_l2.weight[:w2.shape[0], :w2.shape[1]].copy_(w2)
+                new_l2.bias[:b2.shape[0]].copy_(b2)
+
+            # 重新组装 function，更新 input_size
+            self.function = nn.Sequential(new_l1, nn.ReLU(), new_l2)
             self.input_size = current_input_size
-            self.function = torch.nn.Sequential(
-                torch.nn.Linear(self.input_size, self.hidden_size),
-                torch.nn.ReLU(),
-                torch.nn.Linear(self.hidden_size, self.input_size)
-            )
+
+            new_hist = []
+            for out in self.output_history:
+                v = out.view(-1)
+                pad = (0, current_input_size - v.shape[0])
+                v2 = torch.nn.functional.pad(v, pad)
+                new_hist.append(v2.unsqueeze(0))
+            self.output_history = new_hist
+
+            new_mem = []
+            for mem in self.state_memory:
+                pad = (0, current_input_size - mem.numel())
+                new_mem.append(torch.nn.functional.pad(mem, pad))
+            self.state_memory = new_mem
+
+            # 同步 pad last_output 和 state（确保后面输出历史也对齐）
             self.last_output = torch.zeros(self.input_size, device=input_tensor.device)
+            self.state = torch.zeros(self.input_size, device=input_tensor.device)
+
         elif current_input_size < self.input_size:
             # 小于当前 input_size：补零 → 保持原有维度
             pad = (0, self.input_size - current_input_size)
@@ -253,7 +318,7 @@ class CogUnit:
         # === 高频调用奖励机制 ===
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
         if avg_recent_calls >= 4.0 and self.energy > 0.0:
-            self.energy += 0.02
+            self.energy += 0.04
             logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.01")
 
         # === 输出扰动：模拟早期探索行为（前10步）===
@@ -268,7 +333,7 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.03
+        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.05
         self.energy += self_reward
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
@@ -308,17 +373,17 @@ class CogUnit:
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 0.1  # 💡 补给能量
+            self.energy += 0.4  # 💡 补给能量
             return True
 
         if role == "processor" and processor_count <= 16:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 0.1
+            self.energy += 0.4
             return True
 
         if role == "sensor" and sensor_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 0.1
+            self.energy += 0.4
             return True
 
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
@@ -596,6 +661,35 @@ class CogUnit:
             role=role,
             env_size=self.env_size
         )
+
+        # 2) 继承父体的 network 权重
+        import copy, torch.nn as nn
+        if input_size == self.input_size:
+            # 输入维度不变，直接 deepcopy 整个 Sequential
+            clone_unit.function = copy.deepcopy(self.function)
+        else:
+            # 输入维度变大，要做「只升不降」的权重拷贝
+            old_l1, old_relu, old_l2 = self.function
+            w1, b1 = old_l1.weight.data.clone(), old_l1.bias.data.clone()
+            w2, b2 = old_l2.weight.data.clone(), old_l2.bias.data.clone()
+            h = self.hidden_size
+
+            # 新建对应层
+            new_l1 = nn.Linear(input_size, h, device=w1.device)
+            new_l2 = nn.Linear(h, input_size, device=w2.device)
+
+            # 把旧权重拷到新层的左上角
+            with torch.no_grad():
+                new_l1.weight[:, :w1.shape[1]].copy_(w1)
+                new_l1.bias.copy_(b1)
+                new_l2.weight[:w2.shape[0], :w2.shape[1]].copy_(w2)
+                new_l2.bias[:b2.shape[0]].copy_(b2)
+
+            clone_unit.function = nn.Sequential(
+                new_l1,
+                nn.ReLU(),  # 不要直接拿 old_relu
+                new_l2
+            )
 
         # 🔬 基因复制（深拷贝）
         clone_unit.gene = {k: v for k, v in self.gene.items()}
