@@ -1214,6 +1214,8 @@ class CogGraph:
         allow_clone = self.total_energy() < self.max_total_energy
 
         # === 第一阶段：单元更新处理 ===
+        unit_list_snapshot = list(self.units)
+        unit_inputs: List[torch.Tensor] = []
         # 统计当前 emitter 数量
         emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
 
@@ -1315,7 +1317,7 @@ class CogGraph:
                 f"[代谢] {unit.id} var={var:.3f}, freq={freq}, conn={conn}, strength_sum={conn_strength_sum:.2f} → -{decay:.3f} 能量")
             unit.current_step = self.current_step
             unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
-            unit.update(unit_input)
+            unit_inputs.append(unit_input)
 
 
             # ✅ 加强连接权重（使用次数越多越强）
@@ -1341,6 +1343,12 @@ class CogGraph:
                 self.remove_unit(unit)
         if self.current_step > 0 and self.current_step % 50 == 0:
             self.finalize_deaths()
+        # === 第二阶段：统一调用 update ===
+        # 注意：使用和“第一阶段”相同的单元顺序
+        for idx, unit in enumerate(unit_list_snapshot):
+            # unit_inputs 长度 = 快照长度，用同样的 idx 安全取
+            unit.update(unit_inputs[idx])
+
         self.auto_connect()
         # === 死连接清理 ===
         if self.current_step % 50 == 0:
