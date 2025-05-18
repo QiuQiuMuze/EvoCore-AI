@@ -27,7 +27,8 @@ class TransformerPolicyNetwork(nn.Module):
         nhead: int = 4,            # 多头注意力头数
         num_layers: int = 3,       # Encoder 层数
         dim_feedforward: int = 512,
-        max_seq_len: int = 16      # 允许的最大序列长度（默认足够你当前 2-token 输入）
+        max_seq_len: int = 16,      # 允许的最大序列长度（默认足够你当前 2-token 输入）
+        use_action_noise: bool = True
     ) -> None:
         super().__init__()
 
@@ -55,7 +56,7 @@ class TransformerPolicyNetwork(nn.Module):
         # —— 新增动作噪声参数 ——
         # 在训练时，logits 上加高斯噪声；eval 模式下保持确定性
         self.noise_std = 0.2
-        self.use_action_noise = True
+        self.use_action_noise = use_action_noise
 
         # 初始化（官方推荐方式）
         self._reset_parameters()

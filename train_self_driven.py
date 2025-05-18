@@ -18,7 +18,7 @@ train_self_driven.py
 $ python train_self_driven.py --episodes 5000 --max-steps 256
 """
 from __future__ import annotations
-
+from env import logger
 import argparse
 import os
 import time
@@ -51,6 +51,11 @@ def resize_input_proj(net: nn.Module, new_dim: int, device):
 # -------------------------------------------------------------------------- #
 def get_cfg():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--use-curiosity", action="store_true",
+                        help="enable intrinsic curiosity reward")
+    parser.add_argument("--no-curiosity", action="store_false", dest="use_curiosity")
+    parser.set_defaults(use_curiosity=True)
+
     parser.add_argument("--episodes", type=int, default=10_000,
                         help="total training episodes")
     parser.add_argument("--max-steps", type=int, default=1000,
@@ -121,149 +126,127 @@ def main(cfg):
         hidden_dim= 128,    # 隐藏层大小，你可以改成 d_model 或者 128
         lr=1e-4           # ICM 学习率
     ).to(device)
-    curiosity_beta = 0.1  # 内在奖励权重
+    curiosity_beta = 0.3 if cfg.use_curiosity else 0.0  # 内在奖励权重
 
     last_dim = graph.processor_hidden_size  # 初始 D_old
 
     print(f"[Init] transformer input_dim = {input_dim}, device = {device}")
 
-    # 3) 训练循环
+    # 3) 训练循环 —— 伪 Episode 截断（环境只 reset 一次，每隔 max_steps 步做一次更新）
     reward_history = []
-    global_step = 0  # ← 新增：系统累计总步数
-    for ep in range(1, cfg.episodes + 1):
+    # 只做一次环境初始化
+    if hasattr(graph, "reset_state"):
+        graph.reset_state()
+    env.reset()
+    state = torch.from_numpy(env.get_state()).float().to(device)
+    ep_reward = 0.0
+    step_in_horizon = 0
 
+    # 总步数 = episodes * max_steps
+    TOTAL_STEPS = cfg.episodes * cfg.max_steps
+    horizon_id = 0
+    for global_step in range(1, TOTAL_STEPS + 1):
+        step_in_horizon += 1
 
-        # 如 graph 有 reset_state() 请调用；否则新建实例或跳过
-        if hasattr(graph, "reset_state"):
-            graph.reset_state()
-        env.reset()
+        # —— ① 打印信息 ——
+        logger.warning(f"\n==== Step {global_step} (within horizon step {step_in_horizon}) ====")
 
-        state = torch.from_numpy(env.get_state()).float().to(cfg.device)
-        ep_reward = 0.0
+        # —— ② 构造 CogGraph.step() 的输入 ——
+        goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
+        flat_state = state.view(-1)                                       # (env_size*env_size*C,)
+        inp = torch.cat([flat_state, goal_vec], dim=0).unsqueeze(0)      # (1, D)
+        graph.step(inp)
 
-        from env import logger
-        for t in range(cfg.max_steps):
-            # ——— 打印当前 Episode/Step 信息 ———
-            logger.warning(f"\n==== Episode {ep}  Step {t+1} ====")
+        # —— ③ 如果隐藏维度变了，升维 policy 和 ICM ——
+        new_dim = graph.processor_hidden_size
+        if new_dim != last_dim:
+            print(f"[Resize] input_proj: {last_dim} → {new_dim}")
+            resize_input_proj(agent, new_dim, device)
+            icm.expand_state_dim(new_dim)
+            last_dim = new_dim
 
-            # ——— 构造 CogGraph.step() 的输入（含目标向量） ———
-          # 这里我们复用 graph.task.encode_goal，
-            # 生成 (env_size*env_size*INPUT_CHANNELS,) 的 one-hot goal
-            goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
+        # —— ④ 拿 Transformer 输入 ——
+        sensor_out    = graph.sensor_forward(state)      # (1, state_dim)
+        processor_out = graph.processor_forward(sensor_out)
+        env.render()
+        state_seq = torch.stack([sensor_out, processor_out], dim=0).unsqueeze(0).to(device)  # (1,2,dim)
 
-            # 把环境状态展平，再拼上目标向量
-            flat_state = state.view(-1)  # (env_size*env_size*INPUT_CHANNELS,)
-            inp = torch.cat([flat_state, goal_vec], dim=0).unsqueeze(0)  # (1, D)
+        # —— ⑤ 选动作 & 执行环境步 ——
+        action = agent.select_action(state_seq)
+        env.step(action, cog_step=graph.current_step)
 
-           # ——— 真正调用 step() ———
-            # 这一步会：
-            #   1) 按序 sensor→processor→emitter
-            #   2) 更新 self.current_step
-            #   3) 触发所有 logger.info/debug
-            graph.step(inp)
-            # ——— 检测隐藏维度变化 & 重置 input_proj ———
-            new_dim = graph.processor_hidden_size
-            if new_dim != last_dim:
-                print(f"[Resize] input_proj: {last_dim} → {new_dim}")
-                resize_input_proj(agent, new_dim, device)
-                icm.expand_state_dim(new_dim)
-                last_dim = new_dim
+        # —— ⑥ Reward shaping ——
+        agent_pos   = tuple(env.agent_pos)
+        goal_pos    = graph.task.target_position
+        dist_res    = abs(agent_pos[0]-goal_pos[0]) + abs(agent_pos[1]-goal_pos[1])
+        proximity_bonus = 0.01 if dist_res <= 2 else 0.0
+        danger_dist = env.distance_to_nearest_danger(agent_pos)
+        if danger_dist <= 2:
+            danger_shaping = -0.05
+        elif danger_dist >= 3:
+            danger_shaping = 0.0
 
-            # ——— 拿出前向输出，构造 transformer 输入序列 ———
-            sensor_out    = graph.sensor_forward(state)
-            processor_out = graph.processor_forward(sensor_out)
+        # —— ⑦ 计算外在奖励 & 内在奖励 ——
+        ext_reward = (
+            getattr(env, "agent_energy_gain", 0.0)
+          - getattr(env, "agent_energy_penalty", 0.0)
+          + proximity_bonus + danger_shaping
+        )
+        next_raw    = torch.from_numpy(env.get_state()).float().to(device)
+        next_sensor = graph.sensor_forward(next_raw)   # (1, state_dim)
+        ic_reward = (
+            icm.compute_intrinsic_reward(
+                sensor_out.squeeze(0),
+                next_sensor.squeeze(0),
+                torch.tensor([action], device=device)
+            ) if cfg.use_curiosity else 0.0
+        )
 
-            # ——— 可视化环境 ——（可选，和你最初版本对齐）———
-            env.render()
+        # —— ⑧ 计算衰减因子 & 合并奖励 ——
+        progress = min(global_step, 2500) / 2500
+        decay    = 1.0 - 0.7 * progress
+        total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
 
+        agent.store_reward(total_reward)
+        ep_reward += total_reward
 
-            # --- 构造 transformer 输入 ---
-            state_seq = torch.stack([sensor_out, processor_out], dim=0)  # (seq_len=2, dim)
-            state_seq = state_seq.unsqueeze(0).to(device)                # (1, 2, dim)
+        # —— ⑨ 更新 state ——
+        state = next_raw
 
-            # --- 选动作 & 环境交互 ---
-            action = agent.select_action(state_seq)
-            env.step(action, cog_step=graph.current_step)
-
-            # ---------- reward shaping ----------
-            agent_pos = tuple(env.agent_pos)                    # (x, y)
-            goal_pos  = graph.task.target_position              # 资源目标
-            dist_res  = abs(agent_pos[0] - goal_pos[0]) + abs(agent_pos[1] - goal_pos[1])
-            proximity_bonus = 0.01 if dist_res <= 2 else 0.0     # 靠近资源
-
-            danger_dist = env.distance_to_nearest_danger(agent_pos)
-            if danger_dist <= 2:
-                danger_shaping = -0.05                        # 靠近危险
-            elif danger_dist >= 3:
-                danger_shaping = 0                            # 远离危险
-
-            # --------------------------------------
-
-            # # 奖励：环境内部字段决定
-            # reward = (getattr(env, "agent_energy_gain", 0.0)
-            #           - getattr(env, "agent_energy_penalty", 0.0)
-            #           + proximity_bonus + danger_shaping)
-            #
-            # agent.store_reward(reward)
-            # ep_reward += reward
-            #
-            # # 更新下一状态
-            # state = torch.from_numpy(env.get_state()).float().to(cfg.device)
-            # —— 1) 计算外在奖励 ——
-            ext_reward = (
-                    getattr(env, "agent_energy_gain", 0.0)
-                    - getattr(env, "agent_energy_penalty", 0.0)
-                    + proximity_bonus + danger_shaping
-            )
-            # —— 2) 拿到 raw 下一状态 & 对应的 sensor 特征 ——
-            next_raw = torch.from_numpy(env.get_state()).float().to(device)
-            next_sensor = graph.sensor_forward(next_raw)  # shape = (1, state_dim)
-            # —— 3) 计算内在奖励 ——
-            #    用当前 step 的 sensor_out (shape=(1,state_dim)) 而非 raw state
-            ic_reward = icm.compute_intrinsic_reward(
-                sensor_out.squeeze(0),  # (state_dim,)
-                next_sensor.squeeze(0),  # (state_dim,)
-                torch.tensor([action],
-                             dtype=torch.long,
-                             device=device)
-            )
-            # —— 4) 合并奖励并存储 ——
-
-            # —— 增加全局步数 & 计算衰减因子 ——
-            global_step += 1
-            progress = min(global_step, 2500) / 2500
-            decay = 1.0 - 0.7 * progress
-
-            # —— 4) 合并奖励并存储 ——
-            total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
-            agent.store_reward(total_reward)
-            ep_reward += total_reward
-
-            # —— 5) 更新下一步：raw state & (下一步的) sensor_out ——
-            state = next_raw
-            # 下次循环开始会重新计算 sensor_out = graph.sensor_forward(state)
-
-        # --- Episode 结束：策略更新 ---
-        agent.finish_episode()
-        reward_history.append(ep_reward)
-        # —— 每集结束后，优化 ICM 模型 ——
-        icm.update_parameters()
-
-        # --- 日志 & Checkpoint ---
-        if ep % 100 == 0:
-            avg_r = sum(reward_history[-100:]) / 100
-            print(f"[Ep {ep:>5}]  avg_reward(100) = {avg_r:.4f}")
-
-        if cfg.save_every and ep % cfg.save_every == 0:
+        # —— ⑩ 达到截断长度，做一次“Episode”更新 ——
+        if step_in_horizon >= cfg.max_steps:
+            horizon_id += 1
+            agent.finish_episode()
+            if cfg.use_curiosity:
+                icm.update_parameters()
+            reward_history.append(ep_reward)
+            step_in_horizon = 0
+            ep_reward = 0.0
+            # 注意：不调用 env.reset()
+        if cfg.save_every and horizon_id % cfg.save_every == 0:
             os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = f"checkpoints/agent_ep{ep}.pth"
-            agent.save(ckpt_path)
-            print(f"[Save] {ckpt_path} saved")
+            ckpt = f"checkpoints/agent_h{horizon_id}.pth"
+            agent.save(ckpt)
+            print(f"[Save] saved {ckpt}")
 
-    # 全程训练完成后再存一份最终模型
+        # —— （可选）每隔 10 个 horizon 打印一次平均奖励 ——
+        if global_step % (cfg.max_steps * 10) == 0 and reward_history:
+            last10 = reward_history[-10:]
+            print(f"[Step {global_step}] avg_reward(last10 horizons) = {sum(last10)/len(last10):.4f}")
+
+    # 收尾：如果最后一段未满 max_steps，也要做一次更新
+    if step_in_horizon > 0:
+        horizon_id += 1
+        agent.finish_episode()
+        if cfg.use_curiosity:
+            icm.update_parameters()
+        reward_history.append(ep_reward)
+
+    # —— 训练总结 & 最终保存 ——
+    print(f"Training finished ✓  total horizons = {horizon_id}")
     os.makedirs("checkpoints", exist_ok=True)
     agent.save("checkpoints/agent_final.pth")
-    print("Training finished ✓")
+    print("Saved final model to checkpoints/agent_final.pth")
 
 
 # -------------------------------------------------------------------------- #
@@ -289,5 +272,5 @@ Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEP
 """
 
 """
-python train_self_driven.py --episodes 20 --max-steps 1000 --save-every 5 --device cpu
+python train_self_driven.py --episodes 6 --max-steps 500 --save-every 6 --device cpu
 """

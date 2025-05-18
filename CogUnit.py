@@ -85,16 +85,16 @@ class CogUnit:
     - 可克隆生成新单元（clone）
     """
 
-    def __init__(self, input_size=50, hidden_size=16, role="processor"):
+    def __init__(self, input_size=50, hidden_size=16, role="processor",env_size=5):
         self.is_elite = False
         self.local_memory_pool = []  # 每个单元的私有记忆池
 
         # 基因表达，表示对不同功能的偏好
         self.gene = {
-            "sensor_bias": random.uniform(0.8, 1.2),
-            "processor_bias": random.uniform(0.8, 1.2),
-            "emitter_bias": random.uniform(0.8, 1.2),
-            "mutation_rate": 0.001  # 每次复制有0.1%概率突变
+            "sensor_bias": random.uniform(0.5, 1.5),
+            "processor_bias": random.uniform(0.5, 1.5),
+            "emitter_bias": random.uniform(0.5, 1.5),
+            "mutation_rate": 0.01 # 每次复制有1%概率突变
         }
 
         self.death_by_aging = False
@@ -103,7 +103,13 @@ class CogUnit:
         self.call_history = []  # 记录最近几步的调用次数
         self.call_window = 5  # 窗口长度，过去 5 步
         self.inactive_steps = 0
-        self.position = (random.randint(0, 10), random.randint(0, 10))  # 可调范围
+        # 位置总在 [0, env_size) 范围内随机
+        self.env_size = env_size
+        self.position = (
+            random.randint(0, env_size - 1),
+            random.randint(0, env_size - 1),
+        )
+
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
         self.memory_pool_limit = 50
@@ -587,7 +593,8 @@ class CogUnit:
         clone_unit = CogUnit(
             input_size=input_size,
             hidden_size=self.hidden_size,
-            role=role
+            role=role,
+            env_size=self.env_size
         )
 
         # 🔬 基因复制（深拷贝）
@@ -615,6 +622,11 @@ class CogUnit:
                 mutation = random.uniform(-0.1, 0.1)
                 clone_unit.gene[key] = max(0.5, min(2.0, clone_unit.gene[key] + mutation))
             logger.info(f"[突变] gene 突变为 {clone_unit.gene}")
+
+        clone_unit.position = (
+            random.randint(0, self.env_size - 1),
+            random.randint(0, self.env_size - 1),
+        )
 
         clone_unit.energy = self.energy * 0.6
         clone_unit.age = 0

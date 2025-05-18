@@ -32,8 +32,10 @@ class RLAgent:
         input_dim: int,
         num_actions: int,
         lr: float = 3e-4,
+        use_epsilon: bool = True,
         gamma: float = 0.99,
         d_model: int = 128,
+        use_entropy: bool = True,
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = torch.device(device)
@@ -58,8 +60,10 @@ class RLAgent:
         self.gamma = gamma  # ← 保存折扣因子
 
         # —— 探索 & 正则超参数 ——
-        self.epsilon = 0.2            # ε-greedy 探索率
+        self.use_epsilon = use_epsilon
+        self.epsilon = 0.2 if use_epsilon else 0.0            # ε-greedy 探索率
         self.entropy_coef = 0.025      # Entropy 正则系数
+        self.use_entropy = use_entropy
 
         # —— 轨迹缓存 ——
         self.log_probs: List[torch.Tensor] = []
@@ -104,7 +108,7 @@ class RLAgent:
         state_seq = state_seq.to(self.device)
         logits = self.policy_net(state_seq)  # (1, num_actions)
         # — ε-greedy 行为 —
-        if random.random() < self.epsilon:
+        if self.use_epsilon and random.random() < self.epsilon:
             # 随机动作
             action = torch.randint(
                 low=0,
@@ -176,19 +180,24 @@ class RLAgent:
 
         # — 计算 Entropy bonus —
         if self.saved_logits:
-            L = torch.stack(self.saved_logits)  # [T, num_actions]
+            L = torch.stack(self.saved_logits)
             P = torch.softmax(L, dim=-1)
             entropy = -(P * torch.log(P + 1e-8)).sum(dim=-1).mean()
         else:
-            torch.tensor(0.0, device=self.device)
+            entropy = torch.tensor(0.0, device=self.device)
 
         # 总损失 = policy + 0.5 * value - entropy_coef * entropy
-        loss = (
-            torch.stack(policy_loss).sum()
-            + 0.5 * torch.stack(value_loss).sum()
-            - self.entropy_coef * entropy
-        )
-
+        if self.use_entropy:
+            loss = (
+                    torch.stack(policy_loss).sum()
+                    + 0.5 * torch.stack(value_loss).sum()
+                    - self.entropy_coef * entropy
+            )
+        else:
+            loss = (
+                    torch.stack(policy_loss).sum()
+                    + 0.5 * torch.stack(value_loss).sum()
+            )
 
         self.optimizer.zero_grad()
         loss.backward()

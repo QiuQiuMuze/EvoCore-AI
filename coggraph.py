@@ -110,9 +110,9 @@ class CogGraph:
         expected_input = self.env_size * self.env_size * INPUT_CHANNELS
 
         # 1) 创建
-        sensors = [CogUnit(input_size=expected_input, role="sensor") for _ in range(n_sensor)]
-        processors = [CogUnit(input_size=expected_input, role="processor") for _ in range(n_processor)]
-        emitters = [CogUnit(input_size=expected_input, role="emitter") for _ in range(n_emitter)]
+        sensors = [CogUnit(input_size=expected_input, role="sensor", env_size=self.env_size) for _ in range(n_sensor)]
+        processors = [CogUnit(input_size=expected_input, role="processor", env_size=self.env_size) for _ in range(n_processor)]
+        emitters = [CogUnit(input_size=expected_input, role="emitter", env_size=self.env_size) for _ in range(n_emitter)]
 
         # 2) 迁移到目标 device
         for u in sensors + processors + emitters:
@@ -987,6 +987,12 @@ class CogGraph:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
+        # 若当前步数非常早期，给予基础能量补偿
+        if self.current_step < 10:
+            for unit in self.units:
+                if unit.get_role() != "sensor":
+                    unit.energy += 0.05
+                    logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -1028,7 +1034,7 @@ class CogGraph:
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step > 0 and self.current_step % 500 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 40)  # 每次+5，最大到40x40
+            self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
             self.env = GridEnvironment(size=self.env_size)  # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -1038,6 +1044,9 @@ class CogGraph:
             self.target_vector = self.task.encode_goal(self.env_size)
             logger.info(
                 f"[Curriculum升级] 第 {self.current_step} 步：环境大小 {old_size}x{old_size} → {self.env_size}x{self.env_size}，新目标 {new_target}")
+        # —— 同步告知现存所有单元新的 env_size，但不改它们的 position
+            for u in self.units:
+                u.env_size = self.env_size
 
         if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
             old_max = self.max_total_energy
@@ -1045,12 +1054,7 @@ class CogGraph:
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
 
 
-        # 若当前步数非常早期，给予基础能量补偿
-        if self.current_step < 10:
-            for unit in self.units:
-                if unit.get_role() != "sensor":
-                    unit.energy += 0.05
-                    logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.1")
+
 
         # 每次循环时，根据当前步数决定更新间隔
         step = self.current_step
@@ -1097,7 +1101,7 @@ class CogGraph:
                     self.connections = {u.id: {} for u in self.units}
 
 
-        if self.current_step > 2000 and self.current_step % 40 == 0:
+        if self.current_step > 2000 and self.current_step % 80 == 0:
             total = len(self.units)
             max_elites = max(1, int(total * 0.08))  # 最多8%
 
@@ -1297,7 +1301,7 @@ class CogGraph:
             self.finalize_deaths()
         self.auto_connect()
         # === 死连接清理 ===
-        if self.current_step % 10 == 0:
+        if self.current_step % 50 == 0:
             threshold = 50
             for from_id in list(self.connections.keys()):
                 for to_id in list(self.connections[from_id].keys()):
@@ -1337,6 +1341,7 @@ class CogGraph:
                     dilution_factor = max(0.5, 1.0 - 0.00005 * (self.current_step - 5000))
 
                 for unit in self.units:
+
                     if unit.get_role() == "processor":
                         unit.energy += 0.01 * dim_scale * reward_score * dilution_factor
                     elif unit.get_role() == "emitter":

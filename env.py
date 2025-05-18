@@ -25,7 +25,7 @@ class LimitedDebugHandler(logging.Handler):
 
 # === 设置 root logger ===
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)
 logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
 
 # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
