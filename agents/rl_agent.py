@@ -32,7 +32,7 @@ class RLAgent:
         input_dim: int,
         num_actions: int,
         lr: float = 3e-4,
-        use_epsilon: bool = True,
+        use_epsilon: bool = False,
         gamma: float = 0.99,
         d_model: int = 128,
         use_entropy: bool = True,
@@ -144,8 +144,12 @@ class RLAgent:
         """
         state_seq = state_seq.to(self.device)
         logits = self.policy_net(state_seq)  # (1, num_actions)
+        # —— 如果是 eval 模式，直接贪心取 max ——
+        if not self.policy_net.training:
+            return int(torch.argmax(logits, dim=-1).item())
+
         # — ε-greedy 行为 —
-        if self.use_epsilon and random.random() < self.epsilon:
+        if self.policy_net.training and self.use_epsilon and random.random() < self.epsilon:
             # 随机动作
             action = torch.randint(
                 low=0,
@@ -162,13 +166,14 @@ class RLAgent:
             dist = Categorical(logits=logits)
             action = dist.sample()                   # Tensor([a])
             log_prob = dist.log_prob(action)         # 缓存 log π(a|s)
-        self.log_probs.append(log_prob)
-        # 存保存 logits 用于后续 entropy 计算
-        self.saved_logits.append(logits.squeeze(0))  # shape=(num_actions,)
-
-        state_feat = state_seq.detach().mean(dim=1)  # (1, input_dim)
-        self.saved_states.append(state_feat)  # ← 保存一份状态序列，用于 baseline 值函数
+        # —— 只有在训练模式下，才把 log_prob、state、logits 存入缓存 ——
+        if self.policy_net.training:
+            self.log_probs.append(log_prob)
+            self.saved_logits.append(logits.squeeze(0))
+            state_feat = state_seq.detach().mean(dim=1)  # (1, dim)
+            self.saved_states.append(state_feat)
         return action.item()
+
 
     def store_reward(self, r: float) -> None:
         """在环境步结束后调用，缓存即时回报。"""
@@ -257,6 +262,10 @@ class RLAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.policy_net.parameters()) + list(self.value_head.parameters()),
+            max_norm=1.0
+        )
         self.optimizer.step()
 
         self.log_probs.clear()
@@ -277,9 +286,18 @@ class RLAgent:
 
     def load(self, path: str, map_location: str | torch.device | None = None) -> None:
         checkpoint = torch.load(path, map_location=map_location or self.device)
-        self.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+        self.policy_net.load_state_dict(
+            checkpoint["policy_state_dict"],
+            strict=False
+        )
+
         self.value_head.load_state_dict(checkpoint["value_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # 评估模式下，optimizer state 可能因参数变动无法完全匹配；捕获错误并跳过
+        try:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError:
+            # 可选：打印一条 warning
+            logger.warning("optimizer state 与当前模型不匹配，已跳过 optimizer 加载")
 
 
 """

@@ -5,8 +5,10 @@ from coggraph import CogGraph
 from agents.rl_agent import RLAgent
 import argparse, statistics, time
 from env import logger
+import random
+import numpy as np
 
-def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: str = "cpu"):
+def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: str = "cpu", seed: int = None):
     # ——— 0) 加载 checkpoint，推断训练时的输入维 (input_dim) 和 Transformer 隐藏维 (d_model) ———
     checkpoint = torch.load(ckpt_path, map_location=device)
     saved_input_dim = checkpoint["policy_state_dict"]["input_proj.weight"].shape[1]
@@ -19,6 +21,9 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
         f"Cannot infer env_size from input_dim={saved_input_dim}"
     )
     env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
+
+    if seed is not None and hasattr(env, "seed"):
+        env.seed(seed)
     # 1️⃣ 先创建并加载 Agent
     agent = RLAgent(
         input_dim=saved_input_dim,
@@ -27,6 +32,13 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
         device=device
     )
     agent.load(ckpt_path, map_location=device)
+    # —— 切到 eval 模式，关闭 ε-greedy ——
+    agent.policy_net.eval()
+    agent.use_epsilon = False
+    # —— 确保缓存一开始为空 ——
+    agent.log_probs.clear()
+    agent.saved_states.clear()
+    agent.saved_logits.clear()
 
     # —— 构造 CogGraph & 挂环境 ——
     graph = CogGraph(agent, device=device)
@@ -62,6 +74,7 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
             raw_seq = torch.stack([s_out, p_out], dim=0)  # (2, input_dim)
             state_seq = raw_seq.unsqueeze(0).to(device)  # (1, 2, input_dim)
 
+
             action = agent.select_action(state_seq)
 
             env.step(action, cog_step=graph.current_step)
@@ -80,6 +93,9 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
         per_step_rewards.append(ep_reward / ep_length)
         coverages.append(len(visited) / (env.size * env.size))
         resources_collected.append(collected)
+        agent.log_probs.clear()
+        agent.saved_states.clear()
+        agent.saved_logits.clear()
 
     mean_r = statistics.mean(rewards)
     std_r = statistics.stdev(rewards) if len(rewards) > 1 else 0.0
@@ -100,6 +116,7 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     print(f"  Avg Ep Length        : {avg_len:.1f} steps")
     print(f"  State Coverage       : {mean_coverage * 100:.1f}%")
     print(f"  Avg Resources Collected: {mean_collected:.1f}")
+    return mean_r
 
 
 if __name__ == "__main__":
@@ -109,12 +126,37 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=4000) # 检测的最长步数
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     args = parser.parse_args()
-    t0 = time.time()
-    evaluate(args.ckpt,
+    import random, numpy as np, torch, statistics, time
+
+    seeds = [100, 200, 300]
+    all_means = []
+    for seed in seeds:
+        # —— 固定这一轮的随机种子 ——
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        # （如果 env 支持 seed()，也要在这里调用一次）
+
+        t0 = time.time()
+        mean_r = evaluate(
+            args.ckpt,
             episodes = args.episodes,
-            max_steps = args.max_steps,  # ← 传递
-            device = args.device)
-    print(f"⏱  finished in {time.time()-t0:.1f}s")
+            max_steps = args.max_steps,
+            device = args.device,
+            seed = seed
+        )
+        elapsed = time.time() - t0
+        print(f"Seed={seed}: Avg Return={mean_r:.4f}, Time={elapsed:.1f}s\n")
+        all_means.append(mean_r)
+
+    # 汇总多 seed 下的表现
+    mean_of_means = statistics.mean(all_means)
+    std_of_means  = statistics.stdev(all_means)
+    print("===== Across seeds =====")
+    print(f"Seeds: {seeds}")
+    print(f"Mean of Avg Returns = {mean_of_means:.4f}")
+    print(f"Std  of Avg Returns = {std_of_means:.4f}")
+
 """
 python eval_policy.py \
   --ckpt checkpoints/agent_h0.pth \

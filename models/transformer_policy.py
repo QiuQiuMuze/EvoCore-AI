@@ -35,8 +35,6 @@ class TransformerPolicyNetwork(nn.Module):
         # 1) 输入映射到 d_model
         self.input_proj = nn.Linear(input_dim, d_model)
 
-        # 2) 可学习的位置编码
-        self.pos_emb = nn.Parameter(torch.randn(max_seq_len, d_model))
 
         # 3) TransformerEncoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -83,9 +81,13 @@ class TransformerPolicyNetwork(nn.Module):
         # step-1 线性投影到 d_model
         h = self.input_proj(x)  # (B, L, d_model)
 
-        # step-2 加上位置编码（只取前 L 个位置）
+        # step-2 加上正余弦位置编码（任意长度都能支持）
         seq_len = h.size(1)
-        h = h + self.pos_emb[:seq_len]
+        # 从 utils.py 里拿正余弦编码
+        from utils import sinusoidal_positional_encoding
+        pos_emb = sinusoidal_positional_encoding(seq_len, h.size(-1), device=h.device)
+        h = h + pos_emb
+
 
         # step-3 TransformerEncoder
         h = self.transformer_encoder(h)  # (B, L, d_model)

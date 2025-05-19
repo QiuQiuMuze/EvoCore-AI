@@ -1089,7 +1089,7 @@ class CogGraph:
             for u in self.units:
                 u.env_size = self.env_size
 
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
@@ -1125,7 +1125,7 @@ class CogGraph:
             self.assign_subsystems()
 
         if hasattr(self, "subsystem_competition") and self.subsystem_competition:
-            if self.current_step % 100 == 0:
+            if self.current_step % 150 == 0:
                 subsystem_energies = {}
                 for unit in self.units:
                     if unit.subsystem_id:
@@ -1343,7 +1343,7 @@ class CogGraph:
             self.finalize_deaths()
         self.auto_connect()
         # === 死连接清理 ===
-        if self.current_step % 50 == 0:
+        if self.current_step % 80 == 0:
             threshold = 50
             for from_id in list(self.connections.keys()):
                 for to_id in list(self.connections[from_id].keys()):
@@ -1417,18 +1417,18 @@ class CogGraph:
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
 
         # —— 可选路径追踪（纯调试，不影响状态） ——
-        if self.debug and self.current_step % 50 == 0:
+        if self.debug and self.current_step % 100 == 0:
             self.trace_info_paths()
 
         # —— 统一统计 & 连接打印（仅 debug） ——
         self._log_stats_and_conns()
-        if self.debug and self.current_step % 30 == 0:
+        if self.debug and self.current_step % 60 == 0:
             self.rebalance_cell_types()
 
         # === 🔁 分裂 or 储能：强制处理能量超标单元 ===
         while True:
             over_energy_units = [u for u in self.units if u.energy > 3.5]
-            if not over_energy_units or self.current_step % 30 != 0:
+            if not over_energy_units or self.current_step % 40 != 0:
                 break
 
             min_counts = self._get_min_target_counts()
@@ -1471,12 +1471,12 @@ class CogGraph:
             self.add_unit(unit)
 
         # —— 定期合并 & 重构（核心算法，必须保留） ——
-        if self.current_step % 100 == 0:
+        if self.current_step % 120 == 0:
             self.merge_redundant_units()
             self.restructure_common_subgraphs()
 
         # === 🪫 能量池补给机制：支持能量低的细胞 ===
-        if self.current_step % 50 == 0:
+        if self.current_step % 60 == 0:
             # 给所有 age > 100 的细胞做“环境能量差额”补给
             # 计算当前所有细胞总能量
             total_cell_energy = sum(u.energy for u in self.units)
