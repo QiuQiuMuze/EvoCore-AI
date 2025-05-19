@@ -112,7 +112,7 @@ class RLAgent:
             nhead=old_policy.transformer_encoder.layers[0].self_attn.num_heads,
             num_layers=len(old_policy.transformer_encoder.layers),
             dim_feedforward=old_policy.transformer_encoder.layers[0].linear1.out_features,
-            max_seq_len=old_policy.pos_emb.shape[0],
+            max_seq_len=old_policy.max_seq_len,
             use_action_noise=old_policy.use_action_noise
         ).to(self.device)
 

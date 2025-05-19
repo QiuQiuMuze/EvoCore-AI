@@ -31,6 +31,7 @@ class TransformerPolicyNetwork(nn.Module):
         use_action_noise: bool = True
     ) -> None:
         super().__init__()
+        self.max_seq_len = max_seq_len
 
         # 1) 输入映射到 d_model
         self.input_proj = nn.Linear(input_dim, d_model)
