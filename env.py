@@ -35,7 +35,7 @@ logger.addHandler(debug_handler)
 
 # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(console_handler)
 

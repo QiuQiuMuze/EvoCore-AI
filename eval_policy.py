@@ -28,25 +28,18 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     )
     agent.load(ckpt_path, map_location=device)
 
-    # 2️⃣ 把 Agent 传给 CogGraph
+    # —— 构造 CogGraph & 挂环境 ——
     graph = CogGraph(agent, device=device)
 
+    # 强制还原训练时的输入维度
     graph.env_size = saved_env_size
-    graph.env = env
     graph.processor_hidden_size = saved_input_dim
-    # 如果后续逻辑需要 goal 向量，也可以同步重置：
+    graph.env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
     graph.task = TaskInjector(target_position=(saved_env_size - 1, saved_env_size - 1))
     graph.target_vector = graph.task.encode_goal(saved_env_size)
-    graph.debug = True
+    graph.upscale_old_units(saved_input_dim)
 
-    # ——— 2) 直接用 checkpoint 上的 input_dim & d_model 构造 Agent，并加载权重 ———
-    agent = RLAgent(
-        input_dim=saved_input_dim,
-        num_actions=env.action_space_n,
-        d_model=saved_d_model,
-        device=device
-    )
-    agent.load(ckpt_path, map_location=device)
+    graph.debug = True
 
     rewards, lengths = [], []
     per_step_rewards = []  # 每步回报列表
@@ -62,12 +55,15 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
         collected = 0
         visited = set()
         for _ in range(max_steps):
-            s_out = graph.sensor_forward(state)
-            p_out = graph.processor_forward(s_out)
+            s_out = graph.sensor_forward(state)  # (input_dim,)
+            p_out = graph.processor_forward(s_out)  # (input_dim,)
             graph.emitter_forward(p_out)
-            state_seq = torch.stack([s_out, p_out], dim=0).unsqueeze(0).to(device)
 
-            action = agent.select_action(state_seq)  # no grad needed, but keep default
+            raw_seq = torch.stack([s_out, p_out], dim=0)  # (2, input_dim)
+            state_seq = raw_seq.unsqueeze(0).to(device)  # (1, 2, input_dim)
+
+            action = agent.select_action(state_seq)
+
             env.step(action, cog_step=graph.current_step)
 
             r = env.agent_energy_gain - env.agent_energy_penalty
@@ -121,7 +117,7 @@ if __name__ == "__main__":
     print(f"⏱  finished in {time.time()-t0:.1f}s")
 """
 python eval_policy.py \
-  --ckpt checkpoints/agent_final.pth \
+  --ckpt checkpoints/agent_h0.pth \
   --episodes 5\
   --max-steps 1000\
   --device cpu

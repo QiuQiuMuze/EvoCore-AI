@@ -120,7 +120,6 @@ class CogUnit:
         self.age = 0                    # 生存步数
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.call_history = []
         self.avg_recent_calls = 0.0
         # 认知状态向量
         self.state = torch.zeros(hidden_size)
@@ -284,7 +283,15 @@ class CogUnit:
             input_tensor = torch.nn.functional.pad(input_tensor, pad)
 
         # === Forward: 内部处理 ===
-        raw_output = self.function(input_tensor)  # 正常forward
+        use_grad = ENABLE_MINI_LEARN
+        # —— 前向只用于推理时关闭 Autograd ——
+        if not use_grad:
+            # inference_mode 更快且更彻底
+            with torch.inference_mode():
+                raw_output = self.function(input_tensor)
+        else:
+            raw_output = self.function(input_tensor)
+
         self.last_output = raw_output.detach().clone()  # ⚡ 关键：detach掉，避免污染计算图
         self.state = self.last_output.clone()
 
@@ -590,7 +597,7 @@ class CogUnit:
                 return False
 
 
-        elif self.role == "sensor" and getattr(self, "global_processor_count", 1) <= 2:
+        elif self.role == "sensor" and getattr(self, "global_sensor_count", 1) <= 2:
             if self.age < 600:
                 return False
 
