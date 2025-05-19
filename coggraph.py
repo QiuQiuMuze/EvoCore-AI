@@ -52,7 +52,7 @@ import copy
 
 
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
-N_STATE_CHANNELS = 3
+N_STATE_CHANNELS = 4
 N_GOAL_CHANNELS = 1
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
@@ -149,10 +149,11 @@ class CogGraph:
         # self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
         self.env_size = 5  # 初始环境 5x5
         self.env = GridEnvironment(size=self.env_size)  # 创建环境
-        self.task = TaskInjector(target_position=(self.env_size - 1, self.env_size - 1))  # 初始目标点
-        self.target_vector = self.task.encode_goal(self.env_size)  # 初始目标向量
+        initial_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
+        self.task = TaskInjector(target_position=initial_target)
+        self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
+        self.target_vector = torch.zeros(self.env_size * self.env_size)  # 初始化为空目标
         self.max_total_energy = 250  # 初始最大总能量
-        self.target_vector = self.task.encode_goal(self.env_size)
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
@@ -525,7 +526,7 @@ class CogGraph:
                 )
                 merged.state = (u1.state + u2.state) / 2
                 merged.age = int((u1.age + u2.age) / 2)
-                merged.energy = u1.energy + u2.energy + 0.01  # 奖励合并能量
+                merged.energy = u1.energy + u2.energy + 0.02  # 奖励合并能量
                 merged.last_output = (u1.last_output + u2.last_output) / 2
 
                 # 加入新单元
@@ -1013,6 +1014,12 @@ class CogGraph:
                 half = len(pool) // 2
                 del pool[:half]
 
+    def is_current_target_hazard(self):
+        """判断当前 target_vector 是否指向危险点"""
+        index = torch.argmax(self.target_vector).item()
+        x, y = index % self.env_size, index // self.env_size
+        return (x, y) in self.env.hazards
+
     def step(self, input_tensor: torch.Tensor):
         self._update_global_counts()
         self.current_step += 1
@@ -1023,6 +1030,26 @@ class CogGraph:
         env_state = batch[:, :env_dim]                    # (1, env_dim)
         goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
 
+        # === 动态目标向量 ===
+        # 找到 agent 当前最近的资源点或陷阱点
+        agent_pos = tuple(self.env.agent_pos)
+
+        nearest_res = self.env.get_nearest_resource_to(agent_pos)
+        nearest_hzd = self.env.get_nearest_danger_to(agent_pos)  # 你需要添加这个函数
+
+        # 距离判定（谁更近）
+        d1 = self.env.distance_to_nearest_resource(agent_pos)
+        d2 = self.env.distance_to_nearest_danger(agent_pos)
+
+        # 选择更近的目标点作为 current_target
+        target_xy = nearest_res if d1 <= d2 else nearest_hzd
+
+        # 转为 one-hot 向量
+        if target_xy is not None:
+            index = target_xy[1] * self.env_size + target_xy[0]
+            vec = torch.zeros(self.env_size * self.env_size, device=self.device)
+            vec[index] = 1.0
+            self.target_vector = vec
 
         if self.current_step == 10000:
             self.subsystem_competition = True
@@ -1031,8 +1058,8 @@ class CogGraph:
         # 若当前步数非常早期，给予基础能量补偿
         if self.current_step < 1000:
             for unit in self.units:
-                unit.energy += 0.08
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
+                unit.energy += 0.01
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.01")
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -1074,7 +1101,7 @@ class CogGraph:
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step > 0 and self.current_step % 500 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
+            self.env_size = min(self.env_size + 5, 35)  # 每次+5，最大到35x35
             self.env.resize(self.env_size) # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -1111,12 +1138,12 @@ class CogGraph:
         else:
             interval = 100
 
-        # 然后用这个 interval 来判断是否需要更新 target_vector
-        if step > 0 and step % interval == 0:
-            old_target = self.target_vector.clone()
-            self.target_vector = torch.rand_like(self.target_vector)
-            similarity = torch.cosine_similarity(old_target, self.target_vector, dim=0).item()
-            logger.info(f"[目标变化] 第 {step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
+        # # 然后用这个 interval 来判断是否需要更新 target_vector
+        # if step > 0 and step % interval == 0:
+        #     old_target = self.target_vector.clone()
+        #     self.target_vector = torch.rand_like(self.target_vector)
+        #     similarity = torch.cosine_similarity(old_target, self.target_vector, dim=0).item()
+        #     logger.info(f"[目标变化] 第 {step} 步，target_vector 更新！（相似度 {similarity:.3f}）")
 
         if self.current_step > 0 and self.current_step % 100 == 0:
             self.prune_connections()
@@ -1293,7 +1320,16 @@ class CogGraph:
             conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
 
             # 统一代谢模型（可调权重）
-            dim_scale = 50.0 / unit.input_size  # ← 50 是最初环境(5×5×2)的基准
+            # 初始为 1.0，3000步后线性上升，最多到 1.5（从3000到6000之间变化）
+            if self.current_step < 3000:
+                dim_scale = 1.0
+            elif self.current_step >= 6000:
+                dim_scale = 1.5
+            else:
+                # 在 3000~6000 之间，线性插值
+                progress = (self.current_step - 3000) / 3000
+                dim_scale = 1.0 + 0.5 * progress
+
             bias_factor = 1.0
             if unit.role == "sensor":
                 bias_factor = unit.gene.get("sensor_bias", 1.0)
@@ -1308,7 +1344,7 @@ class CogGraph:
             # 代谢公式加入动态因子
             decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) * dim_scale * bias_factor * step_factor * unit_factor
 
-            unit.energy -= decay
+            unit.energy -= decay * 0.02
             unit.energy = max(unit.energy, 0.0)
 
             logger.debug(
@@ -1317,6 +1353,12 @@ class CogGraph:
             unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
             unit.update(unit_input)
 
+            if unit.get_role() == "emitter":
+                out = unit.get_output().squeeze(0) if unit.get_output().dim() == 2 else unit.get_output()
+                vec = self._align_to_goal_dim(out)
+                idx = torch.argmax(vec).item()
+                x, y = idx % self.env_size, idx // self.env_size
+                unit.output_positions.append((x, y))
 
             # ✅ 加强连接权重（使用次数越多越强）
             for uid in incoming:
@@ -1366,6 +1408,9 @@ class CogGraph:
                             self.reverse_connections.get(to_id, set()).discard(from_id)
                             logger.debug(f"[连接衰减清除] {from_id} → {to_id}")
 
+        decay_threshold = 40  # 超过 30 步未奖励就开始衰减
+        decay_amount = 0.04  # 每步扣能量
+
         # 简易任务奖励：如果 emitter 输出靠近某个目标向量，则发放奖励
         target_vector = self.target_vector
         outputs = self.collect_emitter_outputs()
@@ -1374,44 +1419,99 @@ class CogGraph:
             distance = torch.norm(avg_output - target_vector)
 
             # 线性衰减式奖励分数（距离 0→奖励满分1，距离3→奖励为0）
-            reward_score = max(0.0, 1.0 - distance / 3.0)
+            action_indices = [torch.argmax(out).item() for out in outputs]
 
-            if reward_score > 0.0:
-                dim_scale = self.target_vector.size(0) / 50  # 50 → 原始基准
-                dilution_factor = 1.0
-                if self.current_step >= 5000:  # 5000步后开始奖励稀释
-                    dilution_factor = max(0.5, 1.0 - 0.00005 * (self.current_step - 5000))
+            emitters = [u for u in self.units if u.get_role() == "emitter"]
 
-                for unit in self.units:
+            action_indices = [torch.argmax(out).item() for out in outputs]
 
-                    if unit.get_role() == "processor":
-                        unit.energy += 0.01 * dim_scale * reward_score * dilution_factor
-                    elif unit.get_role() == "emitter":
-                        unit.energy += 0.01 * dim_scale * reward_score * dilution_factor
-                    # ✅ 增加多样性惩罚（含数量判断）
-                    action_indices = [torch.argmax(out).item() for out in outputs]
+            for i, unit in enumerate(emitters):
+                out = outputs[i]
+                vec = self._align_to_goal_dim(out)
+                dist = torch.norm(vec - self.target_vector)
+                reward_score = max(0.0, 1.0 - dist / 2)
 
-                    if len(action_indices) >= 3:  # 至少 3 个 emitter 才有统计意义
-                        common_action = max(set(action_indices), key=action_indices.count)
-                        if action_indices.count(common_action) > len(action_indices) * 0.9:
-                            if unit.get_role() == "emitter":
-                                unit.energy -= 0.05
-                                logger.debug(f"[惩罚] emitter {unit.id} 因输出单一行为被扣能量")
-                        elif len(set(action_indices)) > len(action_indices) * 0.6:
-                            if unit.get_role() == "emitter":
-                                unit.energy += 0.01
-                            logger.debug(f"[奖励] emitter 输出多样性高 → 所有 emitter +0.01 能量")
-                    else:
-                        logger.debug(f"[跳过多样性惩罚] emitter 数量不足，仅 {len(action_indices)} 个")
+                if reward_score <= 0.0:
+                    unit.last_action_rewarded = False
+                    continue
+
+                is_hazard = self.is_current_target_hazard()
+
+                # 获取其所有上游 processor
+                emitter_id = unit.id
+                upstream_processors = [
+                    self.unit_map[pid]
+                    for pid in self.reverse_connections.get(emitter_id, set())
+                    if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
+                ]
+
+                if is_hazard:
+                    # 🔴 惩罚 emitter + 上游 processor
+                    unit.energy -= 0.02
+                    logger.debug(f"[惩罚] {unit.id} 目标是陷阱 → 扣能量 -0.02")
+                    for p in upstream_processors:
+                        p.energy -= 0.02
+                        logger.debug(f"[惩罚] 上游 {p.id} → emitter {unit.id} 输出靠近陷阱 → 扣能量 -0.02")
+                    unit.last_action_rewarded = False
+
+                else:
+                    # 🟢 正常奖励 emitter + 上游 processor
+                    dim_scale = min(self.target_vector.size(0) / 50, 2.0)
+                    dilution_factor = 1.0
+                    if self.current_step >= 5000:
+                        dilution_factor = max(0.5, 1.0 - 0.00005 * (self.current_step - 5000))
+                    base_reward = 0.02 * dim_scale * reward_score * dilution_factor
+
+                    unit.energy += base_reward
+                    logger.debug(f"[奖励] {unit.id} 输出靠近目标 → +{base_reward:.3f}")
+
+                    for p in upstream_processors:
+                        p.energy += base_reward
+                        logger.debug(f"[奖励] 上游 {p.id} → emitter {unit.id} 共同完成任务 → +{base_reward:.3f}")
 
                     if self.task.evaluate(self.env, outputs):
-                        logger.debug(f"[任务完成] 达成目标位置 {self.task.target_position}，奖励")
-                        if unit.get_role() == "emitter":
-                            unit.energy += 0.02
-                        elif unit.get_role() == "processor":
-                            unit.energy += 0.02
+                        unit.energy += 0.4
+                        for p in upstream_processors:
+                            p.energy += 0.4
+                        logger.debug(f"[任务完成] emitter {unit.id} 达成目标 → emitter+processor +0.4 能量")
+                        unit.last_reward_step = self.current_step
+                        unit.last_action_rewarded = True
+                    else:
+                        unit.last_action_rewarded = False
 
-                logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
+                    # ✅ 多样性奖励 / 惩罚（仍在非 hazard 分支中）
+                    if len(action_indices) >= 3:
+                        common_action = max(set(action_indices), key=action_indices.count)
+                        if action_indices.count(common_action) > len(action_indices) * 0.9:
+                            unit.energy -= 0.05
+                            logger.debug(f"[惩罚] emitter {unit.id} 输出过于一致 → -0.05")
+                        elif len(set(action_indices)) > len(action_indices) * 0.6:
+                            unit.energy += 0.05
+                            logger.debug(f"[奖励] emitter {unit.id} 输出多样性高 → +0.05")
+
+                    # ✅ 衰减机制
+                    if self.current_step > 1500:
+                        inactive_steps = self.current_step - unit.last_reward_step
+                        if inactive_steps > decay_threshold:
+                            unit.energy -= decay_amount
+                            logger.debug(f"[衰减] {unit.id} 超过 {decay_threshold} 步未奖励 → -{decay_amount:.3f}")
+
+                    # ✅ 探索性惩罚
+                    if len(unit.output_positions) >= 10 and self.current_step % 10 == 0:
+                        start = unit.output_positions[0]
+                        end = unit.output_positions[-1]
+                        manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
+                        if 3 <= manhattan < 5:
+                            unit.energy -= 0.02
+                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.08")
+                        elif 6 <= manhattan < 8:
+                            unit.energy -= 0.04
+                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.10")
+                        elif 9 <= manhattan <= 10:
+                            unit.energy -= 0.08
+                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.12")
+
+                    logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
 
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===

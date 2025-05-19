@@ -47,8 +47,8 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     graph.env_size = saved_env_size
     graph.processor_hidden_size = saved_input_dim
     graph.env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
-    graph.task = TaskInjector(target_position=(saved_env_size - 1, saved_env_size - 1))
-    graph.target_vector = graph.task.encode_goal(saved_env_size)
+    # graph.task = TaskInjector(target_position=(saved_env_size - 1, saved_env_size - 1))
+    # graph.target_vector = graph.task.encode_goal(saved_env_size)
     graph.upscale_old_units(saved_input_dim)
 
     graph.debug = True
@@ -159,8 +159,8 @@ if __name__ == "__main__":
 
 """
 python eval_policy.py \
-  --ckpt checkpoints/agent_h0.pth \
-  --episodes 5\
-  --max-steps 1000\
+  --ckpt checkpoints/agent_final.pth \
+  --episodes 2\
+  --max-steps 500\
   --device cpu
 """

@@ -64,7 +64,7 @@ class RLAgent:
         # —— 探索 & 正则超参数 ——
         self.use_epsilon = use_epsilon
         self.epsilon = 0.2 if use_epsilon else 0.0            # ε-greedy 探索率
-        self.entropy_coef = 0.025      # Entropy 正则系数
+        self.entropy_coef = 0.1   # Entropy 正则系数
         self.use_entropy = use_entropy
 
         # —— 轨迹缓存 ——

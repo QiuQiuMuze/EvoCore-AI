@@ -70,8 +70,8 @@ def _get_hi(table, total):
 # ── 角色分裂最低能量阈值 以及 最低调用频率 ────────────
 ROLE_SPLIT_RULE = {
     "sensor":    {"min_e": 1.2, "min_calls": 0},   # 轻量，几乎不限制调用频率
-    "processor": {"min_e": 1.6, "min_calls": 1},   # 中等
-    "emitter":   {"min_e": 1.2, "min_calls": 2},   # 最重，门槛最高
+    "processor": {"min_e": 1.2, "min_calls": 1},   # 中等
+    "emitter":   {"min_e": 1.2, "min_calls": 1},   # 最重，门槛最高
 }
 # ----------------------------------------------------
 
@@ -123,6 +123,7 @@ class CogUnit:
         self.avg_recent_calls = 0.0
         # 认知状态向量
         self.state = torch.zeros(hidden_size)
+        self.output_positions = deque(maxlen=10)
 
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
         self.function = torch.nn.Sequential(
@@ -136,6 +137,9 @@ class CogUnit:
         if "mutation_rate" not in self.gene:
             self.gene["mutation_rate"] = 0.05
         self.device = torch.device("cpu")  # 默认跟随 CPU
+        self.last_action_rewarded = False
+        self.last_reward_step = 0  # 记录上次获得 env 奖励的 step
+
 
     # ---------------- 新增 ----------------
     def to(self, device):
@@ -219,7 +223,7 @@ class CogUnit:
         self.memory_limit = 5 + (step // 500) * 5
 
         global_step = getattr(self, "current_step", 0)
-        self.memory_pool_limit = 50 + (global_step // 500) * 20  # 每 500 步 +20
+        self.memory_pool_limit = min(50 + (global_step // 500) * 30, 1000)  # 每 500 步 +30
 
         if FOLLOW_INPUT_DEVICE:
             # 若输入在 GPU，但 self.function 还在 CPU，就迁过去
@@ -326,7 +330,7 @@ class CogUnit:
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
         if avg_recent_calls >= 4.0 and self.energy > 0.0:
             self.energy += 0.04
-            logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.01")
+            logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.04")
 
         # === 输出扰动：模拟早期探索行为（前10步）===
         if hasattr(self, "current_step"):
@@ -380,17 +384,17 @@ class CogUnit:
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
-            self.energy += 0.4  # 💡 补给能量
+            self.energy += 1  # 💡 补给能量
             return True
 
         if role == "processor" and processor_count <= 16:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 processor，强制尝试分裂并补给")
-            self.energy += 0.4
+            self.energy += 1
             return True
 
         if role == "sensor" and sensor_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 sensor，强制尝试分裂并补给")
-            self.energy += 0.4
+            self.energy += 1
             return True
 
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
@@ -741,7 +745,21 @@ class CogUnit:
 
         self.energy *= 0.4
         # ✅ 继承局部记忆池（只保留最新的 75 条）
-        clone_unit.local_memory_pool = [m for m in self.local_memory_pool if "score" in m][-75:]
+        # 保留有 score 的记忆
+        scored_memories = [m for m in self.local_memory_pool if "score" in m]
+
+        # 如果为空就跳过，防止报错
+        if scored_memories:
+            # 按 score 从高到低排序
+            scored_memories.sort(key=lambda m: m["score"], reverse=True)
+
+            # 取前一半（向上取整）
+            top_half = scored_memories[: (len(scored_memories) + 1) // 2]
+
+            # 赋值给子单元
+            clone_unit.local_memory_pool = top_half
+        else:
+            clone_unit.local_memory_pool = []
 
         # --------------------
         # ⚡ 将子细胞迁移到与母体相同的 device

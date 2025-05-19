@@ -25,7 +25,7 @@ class LimitedDebugHandler(logging.Handler):
 
 # === 设置 root logger ===
 logger = logging.getLogger()
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
 
 # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
@@ -50,6 +50,7 @@ class GridEnvironment:
         self.step_count = 0
         self.explored_cells_count = 0
         self.refresh_environment(step=0, explored_cells_count=0)
+        self.visited_map = np.zeros((self.size, self.size), dtype=bool)  # ✅ 初始化探索标记
         self.reset()
 
     def refresh_environment(self, step: int, explored_cells_count: int):
@@ -59,18 +60,20 @@ class GridEnvironment:
         # 修正语法：先计算增量
         extra = max(((self.step_count - 1500) // 250), 0)
         # 生成资源：size + extra 数量，每次随机位置
-        for _ in range((self.size + extra) * 2):
+        for _ in range((int((self.size *self.size)/4) + extra)*2):
             self.resources.add((
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
             ))
         # 生成危险区域：size + extra 数量
-        for _ in range(self.size + extra):
+        for _ in range(int((self.size *self.size)/4)+ extra):
             self.hazards.add((
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
             ))
-
+        # ✅ 每次刷新资源/陷阱后，也要刷新探索地图
+        self.visited_map = np.zeros((self.size, self.size), dtype=bool)
+        self.explored_cells_count = 0
 
     def reset(self):
         # agent 初始化在随机位置
@@ -106,12 +109,15 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = 0.6 - max(((self.step_count - 5000) // 1000) * 0.02, 0)  # 单步奖励
+            self.agent_energy_gain = max(1.2 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.6)  # 单步奖励
         else:
             self.agent_energy_gain = 0
 
         if pos in self.hazards:
-            self.agent_energy_penalty = 0.2 + max(((self.step_count - 5000) // 1000) * 0.02, 0)
+            if self.step_count < 2000:
+                self.agent_energy_penalty = 0.01
+            else:
+                self.agent_energy_penalty = min(0.6 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.8)
         else:
             self.agent_energy_penalty = 0.0
 
@@ -130,22 +136,29 @@ class GridEnvironment:
 
         # —— reward shaping ——
         pos = (x, y)
-        # 1) 资源引导：走得更近 +0.1, 走远了 –0.1
+        # 1) 资源引导：走得更近 +0.001, 走远了 –0.001
         dist_res = self.distance_to_nearest_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.1 if delta_res > 0 else (-0.1 if delta_res < 0 else 0.0)
+        resource_shaping = 0.02 if delta_res > 0 else (-0.02 if delta_res < 0 else 0.0)
         self.prev_dist_resource = dist_res
 
         # 2) 危险引导（delta 版本）
         danger_dist = self.distance_to_nearest_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
-        # 如果比上一帧更远则 +0.1，离得更近则 –0.1，否则 0
-        danger_shaping = 0.1 if delta_danger > 0 else (-0.1 if delta_danger < 0 else 0.0)
+        # 如果比上一帧更远则 +0.001，离得更近则 –0.001，否则 0
+        danger_shaping = 0.02 if delta_danger > 0 else (-0.02 if delta_danger < 0 else 0.0)
         # 更新 prev_danger_dist 供下次比较
         self.prev_danger_dist = danger_dist
 
         # 合成最终 reward
-        reward = base + resource_shaping + danger_shaping
+        # ✅ 探索奖励逻辑
+        explore_bonus = 0.0
+        if not self.visited_map[y, x]:
+            self.visited_map[y, x] = True
+            self.explored_cells_count += 1
+            explore_bonus = 0.01  # 或你想给的探索分数
+
+        reward = base + resource_shaping + danger_shaping + explore_bonus
 
         next_state = self.get_state()
         # --- 终止条件 (done) ---
@@ -159,17 +172,25 @@ class GridEnvironment:
 
         return next_state, reward, done, {}
 
+    def get_nearest_resource_to(self, pos):
+        """返回 pos 最近的资源位置"""
+        if not self.resources:
+            return None
+        return min(self.resources, key=lambda r: abs(r[0] - pos[0]) + abs(r[1] - pos[1]))
+
     def get_state(self):
         """
         返回包含 3 层信息的感知向量：
         - agent 位置（one-hot）
         - 资源分布（1 表示有资源）
         - 危险分布（1 表示有危险）
+        - 是否访问过（1 表示已访问）
         最终返回 size * size * 3 的 1D 向量
         """
         agent_layer = np.zeros((self.size, self.size), dtype=np.float32)
         resource_layer = np.zeros((self.size, self.size), dtype=np.float32)
         hazard_layer = np.zeros((self.size, self.size), dtype=np.float32)
+        visited_layer = self.visited_map.astype(np.float32)  # ✅ 新增
 
         x, y = self.agent_pos
         agent_layer[y, x] = 1.0
@@ -179,8 +200,8 @@ class GridEnvironment:
         for hx, hy in self.hazards:
             hazard_layer[hy, hx] = 1.0
 
-        # 堆叠三层，并展开为 1D 向量
-        stacked = np.stack([agent_layer, resource_layer, hazard_layer], axis=0)
+        # ✅ 现在堆叠四层
+        stacked = np.stack([agent_layer, resource_layer, hazard_layer, visited_layer], axis=0)
         return stacked.flatten().astype(np.float32)
 
     def render(self):
@@ -204,6 +225,12 @@ class GridEnvironment:
             return float("inf")
         return min(abs(pos[0] - rx) + abs(pos[1] - ry)
                    for rx, ry in self.resources)
+
+    def get_nearest_danger_to(self, pos):
+        """返回 pos 最近的危险位置"""
+        if not self.hazards:
+            return None
+        return min(self.hazards, key=lambda r: abs(r[0] - pos[0]) + abs(r[1] - pos[1]))
 
     def resize(self, new_size: int):
         """
