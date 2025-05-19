@@ -25,7 +25,7 @@ class LimitedDebugHandler(logging.Handler):
 
 # === 设置 root logger ===
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)
 logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
 
 # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
@@ -109,15 +109,15 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = max(1.2 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.6)  # 单步奖励
+            self.agent_energy_gain = max(1.4 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 1.0)  # 单步奖励
         else:
             self.agent_energy_gain = 0
 
         if pos in self.hazards:
             if self.step_count < 2000:
-                self.agent_energy_penalty = 0.01
+                self.agent_energy_penalty = 0.05
             else:
-                self.agent_energy_penalty = min(0.6 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.8)
+                self.agent_energy_penalty = min(0.8 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 1.2)
         else:
             self.agent_energy_penalty = 0.0
 
@@ -139,14 +139,14 @@ class GridEnvironment:
         # 1) 资源引导：走得更近 +0.001, 走远了 –0.001
         dist_res = self.distance_to_nearest_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.02 if delta_res > 0 else (-0.02 if delta_res < 0 else 0.0)
+        resource_shaping = 0.01 if delta_res > 0 else (-0.01 if delta_res < 0 else 0.0)
         self.prev_dist_resource = dist_res
 
         # 2) 危险引导（delta 版本）
         danger_dist = self.distance_to_nearest_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
         # 如果比上一帧更远则 +0.001，离得更近则 –0.001，否则 0
-        danger_shaping = 0.02 if delta_danger > 0 else (-0.02 if delta_danger < 0 else 0.0)
+        danger_shaping = 0.01 if delta_danger > 0 else (-0.01 if delta_danger < 0 else 0.0)
         # 更新 prev_danger_dist 供下次比较
         self.prev_danger_dist = danger_dist
 
@@ -156,7 +156,7 @@ class GridEnvironment:
         if not self.visited_map[y, x]:
             self.visited_map[y, x] = True
             self.explored_cells_count += 1
-            explore_bonus = 0.01  # 或你想给的探索分数
+            explore_bonus = 0.005  # 或你想给的探索分数
 
         reward = base + resource_shaping + danger_shaping + explore_bonus
 

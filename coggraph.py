@@ -1014,8 +1014,8 @@ class CogGraph:
                 half = len(pool) // 2
                 del pool[:half]
 
-    def is_current_target_hazard(self):
-        """判断当前 target_vector 是否指向危险点"""
+    def is_current_target_hazard(self) -> bool:
+        """判断当前 target_vector 是否指向危险点（不考虑 emitter 是否命中）"""
         index = torch.argmax(self.target_vector).item()
         x, y = index % self.env_size, index // self.env_size
         return (x, y) in self.env.hazards
@@ -1344,7 +1344,7 @@ class CogGraph:
             # 代谢公式加入动态因子
             decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) * dim_scale * bias_factor * step_factor * unit_factor
 
-            unit.energy -= decay * 0.02
+            unit.energy -= decay * 0.05
             unit.energy = max(unit.energy, 0.0)
 
             logger.debug(
@@ -1416,9 +1416,7 @@ class CogGraph:
         outputs = self.collect_emitter_outputs()
         if outputs is not None:
             avg_output = outputs.mean(dim=0)
-            distance = torch.norm(avg_output - target_vector)
 
-            # 线性衰减式奖励分数（距离 0→奖励满分1，距离3→奖励为0）
             action_indices = [torch.argmax(out).item() for out in outputs]
 
             emitters = [u for u in self.units if u.get_role() == "emitter"]
@@ -1429,11 +1427,12 @@ class CogGraph:
                 out = outputs[i]
                 vec = self._align_to_goal_dim(out)
                 dist = torch.norm(vec - self.target_vector)
-                reward_score = max(0.0, 1.0 - dist / 2)
+                reward_score = max(0.0, 1.0 - dist / 2)  # ≤ 1 距离才有分
+                # 是否正好命中（严格为目标点）
+                is_hit = dist <= 1e-5
 
-                if reward_score <= 0.0:
-                    unit.last_action_rewarded = False
-                    continue
+                # 是否接近但不是目标（在一定距离范围内，但没命中）
+                is_near = 1e-5 < dist <= 2.0
 
                 is_hazard = self.is_current_target_hazard()
 
@@ -1445,16 +1444,18 @@ class CogGraph:
                     if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
                 ]
 
-                if is_hazard:
-                    # 🔴 惩罚 emitter + 上游 processor
-                    unit.energy -= 0.02
-                    logger.debug(f"[惩罚] {unit.id} 目标是陷阱 → 扣能量 -0.02")
+                if is_hazard and is_hit:
+                    # ❌ 直接命中陷阱 → 惩罚
+                    unit.energy -= 0.2
                     for p in upstream_processors:
-                        p.energy -= 0.02
-                        logger.debug(f"[惩罚] 上游 {p.id} → emitter {unit.id} 输出靠近陷阱 → 扣能量 -0.02")
+                        p.energy -= 0.2
+                    logger.debug(f"[惩罚] {unit.id} 输出正中陷阱 → emitter+processor 扣能量")
                     unit.last_action_rewarded = False
 
-                else:
+                elif is_hazard:
+                    continue
+
+                elif is_near or is_hit:
                     # 🟢 正常奖励 emitter + 上游 processor
                     dim_scale = min(self.target_vector.size(0) / 50, 2.0)
                     dilution_factor = 1.0
@@ -1469,7 +1470,7 @@ class CogGraph:
                         p.energy += base_reward
                         logger.debug(f"[奖励] 上游 {p.id} → emitter {unit.id} 共同完成任务 → +{base_reward:.3f}")
 
-                    if self.task.evaluate(self.env, outputs):
+                    if self.task.evaluate(self.env, outputs) and reward_score == 1.0:
                         unit.energy += 0.4
                         for p in upstream_processors:
                             p.energy += 0.4
@@ -1489,30 +1490,30 @@ class CogGraph:
                             unit.energy += 0.05
                             logger.debug(f"[奖励] emitter {unit.id} 输出多样性高 → +0.05")
 
-                    # ✅ 衰减机制
-                    if self.current_step > 1500:
-                        inactive_steps = self.current_step - unit.last_reward_step
-                        if inactive_steps > decay_threshold:
-                            unit.energy -= decay_amount
-                            logger.debug(f"[衰减] {unit.id} 超过 {decay_threshold} 步未奖励 → -{decay_amount:.3f}")
+                # ✅ 衰减机制
+                if self.current_step > 1500:
+                    inactive_steps = self.current_step - unit.last_reward_step
+                    if inactive_steps > decay_threshold:
+                        unit.energy -= decay_amount
+                        logger.debug(f"[衰减] {unit.id} 超过 {decay_threshold} 步未奖励 → -{decay_amount:.3f}")
 
                     # ✅ 探索性惩罚
-                    if len(unit.output_positions) >= 10 and self.current_step % 10 == 0:
+                    if hasattr(unit, "output_positions") and len(
+                            unit.output_positions) >= 10 and self.current_step % 10 == 0:
                         start = unit.output_positions[0]
                         end = unit.output_positions[-1]
                         manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
                         if 3 <= manhattan < 5:
-                            unit.energy -= 0.02
+                            unit.energy -= 0.05
                             logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.08")
                         elif 6 <= manhattan < 8:
-                            unit.energy -= 0.04
+                            unit.energy -= 0.10
                             logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.10")
                         elif 9 <= manhattan <= 10:
-                            unit.energy -= 0.08
+                            unit.energy -= 0.25
                             logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.12")
 
-                    logger.debug(f"[奖励] 输出接近目标，距离 {distance:.2f}，奖励比率 {reward_score:.2f} → 能量分配完毕")
-
+                    logger.debug(f"[奖励] emitter {unit.id} 输出接近目标，距离 {dist:.2f}，奖励比率 {reward_score:.2f}")
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
 
