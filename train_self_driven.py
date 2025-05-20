@@ -28,8 +28,9 @@ from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
 from utils import IntrinsicCuriosityModule
-
+from collections import deque
 import torch.nn as nn
+import torch.nn.functional as F
 
 def resize_input_proj(net: nn.Module, new_dim: int, device):
     """
@@ -68,6 +69,10 @@ def get_cfg():
                         help="save checkpoint every N episodes (0 = never)")
     parser.add_argument("--device", type=str, default="cpu",
                         help="cpu | cuda")
+    parser.add_argument(
+        "--fastflag", action="store_true",
+        help="关闭 torch.compile / amp / CUDA-Graph 等所有加速开关（debug 或 CPU 模式用）"
+    )
     return parser.parse_args()
 
 
@@ -94,12 +99,17 @@ def main(cfg):
     import logging
     logging.debug("✅ Logger 测试 Debug")
     logging.info("✅ Logger 测试 Info")
-
+    # ────────── ① 根据 fastflag 决定是否全关加速 ──────────
+    from config_runtime import RF          # ★ 必须在 disable 前 import
+    if not cfg.fastflag:                   # 没加 --fastflag → 启用全部加速
+        pass                               # 什么都不做，保持 RF 里的默认优化
+    else:                                  # 加了 --fastflag → 彻底关闭
+        RF.disable_all()                   # 包括 compile / amp / cudagraph / batch …
+    # ──────────────────────────────────────────────────────
     device = torch.device(cfg.device)
 
     # 1) 初始化 CogGraph 内部环境 & 图
     # 先用一个临时 env 推断初始输入维度（Graph 还没挂 agent，所以不用它）
-    from env import GridEnvironment
     temp_env = GridEnvironment(size=5)
     init_state = torch.from_numpy(temp_env.get_state()).float()
     init_dim = _infer_input_dim(None, init_state)  # None 会让 _infer_input_dim 返回 env.size
@@ -124,11 +134,13 @@ def main(cfg):
     CogUnit.MAX_OUTPUT_DIM = graph.processor_hidden_size
     # --------------------
 
-    # 2) 动态推断输入维度后再建 Agent
+    # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
     init_state = torch.from_numpy(env.get_state()).float()
-    input_dim = _infer_input_dim(graph, init_state)
+    proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 125
+    goal_dim = env.size * env.size * 2                               # 2 channels × env²
+    full_dim = proc_dim + goal_dim                                   # e.g. 125+50=175
     agent = RLAgent(
-        input_dim=input_dim,
+        input_dim=full_dim,                                          # ← 用 full_dim
         num_actions=4,
         lr=cfg.lr,
         gamma=cfg.gamma,
@@ -139,16 +151,16 @@ def main(cfg):
 
     # 在创建 agent 之后 —— 初始化 Intrinsic Curiosity Module
     icm = IntrinsicCuriosityModule(
-        state_dim=input_dim,
+        state_dim=full_dim,
         action_dim=agent.policy_net.fc_out.out_features,
         hidden_dim= 128,    # 隐藏层大小，你可以改成 d_model 或者 128
         lr=1e-4           # ICM 学习率
     ).to(device)
     curiosity_beta = 0.3 if cfg.use_curiosity else 0.0  # 内在奖励权重
 
-    last_dim = graph.processor_hidden_size  # 初始 D_old
+    last_dim = full_dim
 
-    print(f"[Init] transformer input_dim = {input_dim}, device = {device}")
+    print(f"[Init] transformer input_dim = {full_dim}, device = {device}")
 
     # 3) 训练循环 —— 伪 Episode 截断（环境只 reset 一次，每隔 max_steps 步做一次更新）
     reward_history = []
@@ -157,6 +169,28 @@ def main(cfg):
         graph.reset_state()
     env.reset()
     state = torch.from_numpy(env.get_state()).float().to(device)
+    # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
+    history = deque(maxlen=4)
+    # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
+    init_sensor    = graph.sensor_forward(state)                      # (1, state_dim)
+    init_processor = graph.processor_forward(init_sensor).squeeze(0)  # (proc_dim,)
+    # —— 标准化目标向量到 2×(env²) —— #
+    tv = graph.target_vector.to(device)
+    if tv.dim() == 1:
+        # 单通道→补第二通道全 0
+        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)          # (2, env²)
+    goal_vec = graph.target_vector.to(device).view(-1)  # 正好 2*env²
+    # (2*env²,)
+    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+2*env²,)
+    # --- 保守起见：若将来 proc_dim 变小，也对 init_feat 右补零 ---
+    if init_feat.numel() < last_dim:  # last_dim 之前已经设为 full_dim
+        init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
+    for _ in range(history.maxlen):
+        history.append(init_feat)
+
+
+
+
     ep_reward = 0.0
     step_in_horizon = 0
 
@@ -172,61 +206,140 @@ def main(cfg):
         # —— ② 构造 CogGraph.step() 的输入 ——
         goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
         flat_state = state.view(-1)                                       # (env_size*env_size*C,)
-        inp = torch.cat([flat_state, goal_vec], dim=0).unsqueeze(0)      # (1, D)
+        inp = state.view(1, -1).to(device)     # (1, D)
         graph.step(inp)
 
-        # —— ③ 如果隐藏维度变了，一次性调整 policy_net 和 value_head ——
-        new_dim = graph.processor_hidden_size
-        if new_dim != last_dim:
-            print(f"[Resize] dim: {last_dim} → {new_dim}")
-            agent.resize_state_dim(new_dim)  # ← 这里自动重建并拷贝策略网络＋价值网络
-            icm.expand_state_dim(new_dim)
-            last_dim = new_dim
+        # 如果 processor_hidden_size 变化，则同时更新到 full_dim
+        proc_dim = graph.processor_hidden_size
+        goal_dim = env.size * env.size * 2
+        new_full = proc_dim + goal_dim
+        if new_full != last_dim:
+            print(f"[Resize Input] dim: {last_dim} → {new_full}")
+            agent.resize_state_dim(new_full)
+            icm.expand_state_dim(new_full)
+            last_dim = new_full
+
+
+            # —— 隐藏维度变更时，重置 history —— #
+            history = deque(maxlen=history.maxlen)
+            init_sensor    = graph.sensor_forward(state)
+            init_processor = graph.processor_forward(init_sensor).squeeze(0)
+            # 同样标准化目标向量到 2×(env²)
+            tv = graph.target_vector.to(device)
+            if tv.dim() == 1:
+                tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
+            goal_vec = tv.view(-1)
+            init_feat = torch.cat([init_processor, goal_vec], dim=-1)
+            if init_feat.numel() < last_dim:  # new_full 已经赋给 last_dim
+                init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
+            for _ in range(history.maxlen):
+                history.append(init_feat)
+
+
+
 
         # —— ④ 拿 Transformer 输入 ——
         sensor_out    = graph.sensor_forward(state)      # (1, state_dim)
         processor_out = graph.processor_forward(sensor_out)
         env.render()
-        state_seq = torch.stack([sensor_out, processor_out], dim=0).unsqueeze(0).to(device)  # (1,2,dim)
+
+        # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
+        # flatten 到一维（2*env²） 或者你也可以只取资源通道 goal_vec = graph.target_vector[0]
+        # —— 更新历史 & 构造带目标的特征 —— #
+        tv = graph.target_vector.to(device)
+        if tv.dim() == 1:
+            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
+        goal_vec  = tv.view(-1)
+        step_feat = torch.cat([processor_out.squeeze(0), goal_vec], dim=-1)
+        if step_feat.numel() < last_dim:  # 防止 < last_dim
+            step_feat = F.pad(step_feat, (0, last_dim - step_feat.numel()))
+
+        history.append(step_feat)
+
+        # 用最近 history.maxlen 步的 processor_out 序列作为 Transformer 输入
+
+        # --- 对齐 history 中的张量 ---
+        max_len = max(t.numel() for t in history)  # 找到最长的
+        aligned = []
+        for t in history:
+            if t.numel() < max_len:  # 右侧补零
+                t = F.pad(t, (0, max_len - t.numel()))
+            aligned.append(t)
+
+        seq = torch.stack(aligned, dim=0).unsqueeze(0).to(device)  # (1, L, max_len)
+        state_seq = seq
+
 
         # —— ⑤ 选动作 & 执行环境步 ——
         action = agent.select_action(state_seq)
-        env.step(action, cog_step=graph.current_step)
+        # ——— 使用 capture 形式执行一步环境，获取 raw_reward ———
 
         # —— ⑥ Reward shaping ——
         agent_pos   = tuple(env.agent_pos)
-        goal_pos    = graph.task.target_position
-        dist_res    = abs(agent_pos[0]-goal_pos[0]) + abs(agent_pos[1]-goal_pos[1])
-        proximity_bonus = 0.01 if dist_res <= 2 else 0.0
+        resources = env.resources
+        if resources:
+            # 用与最近资源的距离代替固定目标点
+            dists = [abs(agent_pos[0] - r[0]) + abs(agent_pos[1] - r[1]) for r in resources]
+            min_res_dist = min(dists)
+            proximity_bonus = 0.01 if min_res_dist <= 2 else 0.0
+        else:
+            proximity_bonus = 0.0
+
         danger_dist = env.distance_to_nearest_danger(agent_pos)
         if danger_dist <= 2:
             danger_shaping = -0.05
         elif danger_dist >= 3:
             danger_shaping = 0.0
 
-        # —— ⑦ 计算外在奖励 & 内在奖励 ——
-        ext_reward = (
-            getattr(env, "agent_energy_gain", 0.0)
-          - getattr(env, "agent_energy_penalty", 0.0)
-          + proximity_bonus + danger_shaping
-        )
-        next_raw    = torch.from_numpy(env.get_state()).float().to(device)
-        next_sensor = graph.sensor_forward(next_raw)   # (1, state_dim)
-        ic_reward = (
-            icm.compute_intrinsic_reward(
-                sensor_out.squeeze(0),
-                next_sensor.squeeze(0),
-                torch.tensor([action], device=device)
-            ) if cfg.use_curiosity else 0.0
-        )
+        # —— ⑦ 用 env.step(...) 返回的 reward（含 base、resource_shaping、danger_shaping、explore_bonus）———
+        #    同时拿到下一状态和 done 标志
+        next_state_np, raw_reward, done, _ = env.step(action, cog_step=graph.current_step)
+
+        # —— ⑧ 组合最终外在奖励 —— #
+        # raw_reward 已包含：
+        #   env.agent_energy_gain - env.agent_energy_penalty
+        # + resource_shaping (±0.01)
+        # + danger_shaping   (±0.2)
+        # + explore_bonus    (首次访问格子 +0.005)
+        # 这里再加上你原来的 proximity_bonus
+        ext_reward = raw_reward + proximity_bonus + danger_shaping
+        # —— ⑨ 下一状态转张量 —— #
+        # —— ⑧ 组合最终外在奖励 ——
+        ext_reward = raw_reward + proximity_bonus + danger_shaping
+        # —— ⑨ 下一状态转张量 ——
+        next_raw = torch.from_numpy(next_state_np).float().to(device)
+
+        # —— ⑩ 计算 Intrinsic Curiosity Reward —— #
+        # 1) 下一个 Processor 特征
+        next_sensor = graph.sensor_forward(next_raw)  # (1, proc_dim)
+        next_processor = graph.processor_forward(next_sensor)  # (1, proc_dim)
+        # 2) 下一个 Goal 向量（双通道）
+        tv_next = graph.target_vector.to(device)
+        if tv_next.dim() == 1:
+            tv_next = torch.stack([tv_next, torch.zeros_like(tv_next)], dim=0)
+        goal_vec_next = tv_next.view(-1)  # (2*env²,)
+        # 3) 拼接成 full_dim 特征
+        next_feat = torch.cat([next_processor.squeeze(0), goal_vec_next], dim=-1)
+        if next_feat.numel() < last_dim:
+            next_feat = F.pad(next_feat, (0, last_dim - next_feat.numel()))
+        # 4) 用 step_feat (上面已构造) 和 next_feat 计算 IC 奖励
+        ic_reward = icm.compute_intrinsic_reward(
+            step_feat,
+            next_feat,
+            torch.tensor([action], device=device)
+        ) if cfg.use_curiosity else 0.0
 
         # —— ⑧ 计算衰减因子 & 合并奖励 ——
-        progress = min(global_step, 2500) / 2500
-        decay    = 1.0 - 0.7 * progress
+        progress = min(global_step, 5000) / 5000
+        decay    = 1.0 - 0.35 * progress
         total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
 
         agent.store_reward(total_reward)
         ep_reward += total_reward
+        # —— 新增：每200步也更新 ICM —— #
+        if cfg.use_curiosity and global_step % 200 == 0:
+            icm.update_parameters()
+
 
         # —— ⑨ 更新 state ——
         state = next_raw
@@ -290,5 +403,21 @@ Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEP
 """
 
 """
-python train_self_driven.py --episodes 10 --max-steps 1000 --save-every 2 --device cpu
+python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cpu
 """
+"""
+# 纯 CPU，什么都不用装
+python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cpu  # RF.use_shared_tx=True 也能跑，走官方 nn.Transformer
+
+# GPU + Flash-Attn / TE
+pip install flash-attn --no-build-isolation
+pip install transformer-engine
+python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cuda          # 默认每步跑一次共享 Tx
+# 或每 4 步跑一次，省 Python
+sed -i 's/shared_tx_interval = 1/shared_tx_interval = 4/' config_runtime.py
+python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cuda
+要完全关掉这条加速路径（比如纯 Debug）：
+from config_runtime import RF
+RF.use_shared_tx = False
+"""
+

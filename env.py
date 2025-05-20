@@ -60,13 +60,13 @@ class GridEnvironment:
         # 修正语法：先计算增量
         extra = max(((self.step_count - 1500) // 250), 0)
         # 生成资源：size + extra 数量，每次随机位置
-        for _ in range((int((self.size *self.size)/4) + extra)*2):
+        for _ in range(int((self.size *self.size)/4) + extra):
             self.resources.add((
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
             ))
         # 生成危险区域：size + extra 数量
-        for _ in range(int((self.size *self.size)/4)+ extra):
+        for _ in range(int((self.size *self.size)/8)+ extra):
             self.hazards.add((
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
@@ -109,15 +109,19 @@ class GridEnvironment:
         pos = (x, y)
         if pos in self.resources:
             self.resources.remove(pos)
-            self.agent_energy_gain = max(1.4 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 1.0)  # 单步奖励
+            if self.step_count < 2000:
+                self.agent_energy_gain = 0.8
+            else:
+                self.agent_energy_gain = max(0.4 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.2)  # 单步奖励
+
         else:
             self.agent_energy_gain = 0
 
         if pos in self.hazards:
             if self.step_count < 2000:
-                self.agent_energy_penalty = 0.05
+                self.agent_energy_penalty = 0.08
             else:
-                self.agent_energy_penalty = min(0.8 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 1.2)
+                self.agent_energy_penalty = min(0.2 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.4)
         else:
             self.agent_energy_penalty = 0.0
 
@@ -125,7 +129,7 @@ class GridEnvironment:
         self.step_count += 1
         # 刷新周期基于 CogGraph 的轮数，否则退回用本地 step_count
         step_for_refresh = cog_step if cog_step is not None else self.step_count
-        if step_for_refresh % 1000 == 0:
+        if step_for_refresh % 1000 == 0 and step_for_refresh >= 1000:
             self.refresh_environment(step_for_refresh, self.explored_cells_count)
             self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
             self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
@@ -136,17 +140,17 @@ class GridEnvironment:
 
         # —— reward shaping ——
         pos = (x, y)
-        # 1) 资源引导：走得更近 +0.001, 走远了 –0.001
+        # 1) 资源引导：走得更近 +0.1, 走远了 –0.1
         dist_res = self.distance_to_nearest_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.01 if delta_res > 0 else (-0.01 if delta_res < 0 else 0.0)
+        resource_shaping = 0.1 if delta_res > 0 else (-0.1 if delta_res < 0 else 0.0)
         self.prev_dist_resource = dist_res
 
         # 2) 危险引导（delta 版本）
         danger_dist = self.distance_to_nearest_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
-        # 如果比上一帧更远则 +0.001，离得更近则 –0.001，否则 0
-        danger_shaping = 0.01 if delta_danger > 0 else (-0.01 if delta_danger < 0 else 0.0)
+        # 如果比上一帧更远则 +0.1，离得更近则 –0.1 否则 0
+        danger_shaping = 0.1 if delta_danger > 0 else (-0.1 if delta_danger < 0 else 0.0)
         # 更新 prev_danger_dist 供下次比较
         self.prev_danger_dist = danger_dist
 

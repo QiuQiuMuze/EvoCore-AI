@@ -12,6 +12,16 @@ from env import logger
 from typing import List, Dict
 from agents.rl_agent import RLAgent
 import copy
+# from triton_scatter import scatter_sum
+from config_runtime import RF            # ★ 新增
+from contextlib import nullcontext       # ★ autocast fallback
+try:                                     # Flash-Attn / TE 优先
+    import transformer_engine.pytorch as te
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
+import math
+
 
 
 # class LimitedDebugHandler(logging.Handler):
@@ -72,25 +82,44 @@ class TaskInjector:
         return vec
 
     def evaluate(self, env, emitter_outputs):
-        """评估 emitter 是否“指向”目标位置"""
         if emitter_outputs is None:
             return False
-
         pred_index = torch.argmax(emitter_outputs.mean(dim=0)).item()
         x, y = pred_index % env.size, pred_index // env.size
-        return (x, y) == self.target_position
-
+        return (x, y) in env.resources  # ✅ 只看是否落在资源点上
 
 
 # 理想比例  emitter : processor : sensor = 1 : 2 : 1
 IDEAL_RATIO = {"emitter": 1, "processor": 2, "sensor": 1}
 DENOM = sum(IDEAL_RATIO.values())      # =4
 
-# 每轮允许转换的最高比例（15%）
-MAX_CONV_FRAC = 0.4
+# 每轮允许转换的最高比例（60%）
+MAX_CONV_FRAC = 0.6
 
 # Δ 容差系数：需要至少 diff ≥ ceil(TOL_FRAC*total) 才触发
 TOL_FRAC = 0.05      # 小规模时自动退化成 1
+
+
+# ------------------------------------------------------------
+def _build_transformer_block(D, H, device):
+    """
+    返回一个 *单层* Transformer（优先 TE / Flash-Attn，CPU 退回官方实现）。
+    单独列出来方便 _init_shared_tx() 循环复用。
+    """
+    if HAS_TE and torch.cuda.is_available():
+        import transformer_engine.pytorch as te
+        return te.TransformerLayer(
+                hidden_size=D,
+                num_attention_heads=H,
+                mlp_hidden_size=4*D,
+                dropout=0.0,
+                sequence_parallel=False  # 单卡
+        ).to(device)
+    else:
+        layer = torch.nn.TransformerEncoderLayer(
+                d_model=D, nhead=H, dim_feedforward=4*D,
+                activation="gelu", batch_first=True)
+        return layer.to(device)
 
 
 class CogGraph:
@@ -153,15 +182,98 @@ class CogGraph:
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
         self.target_vector = torch.zeros(self.env_size * self.env_size)  # 初始化为空目标
-        self.max_total_energy = 250  # 初始最大总能量
+        self.max_total_energy = 500  # 初始最大总能量
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
+        # self.id2idx = {}  # 单元 id  → 索引 0..N-1
+        # self.idx2id = []  # 反向（保持 list 方便迭代）
+        # self.edge_dirty = True  # 只要连边变化就置 True
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
+        self._target_buf = torch.zeros((2, self.env_size * self.env_size),
+                                       device=self.device)
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
+
+        # ---------- 🆕 把初始化代码折到一个函数里 ----------
+        if RF.use_shared_tx:
+            self._init_shared_tx()  # 第一次建好共享 Tx
+
+    # ============================================================
+    #                   Shared-Tx 初始化封装
+    # ============================================================
+    def _init_shared_tx(self):
+        """
+        根据 **当前** self.processor_hidden_size 重新创建
+        shared_encoder / role_embed / id_embed。
+        在   1) __init__   2) env 扩容后   调一次即可。
+        """
+        D = self.processor_hidden_size
+        L, H = RF.shared_tx_layers, RF.shared_tx_heads
+
+        blocks = [_build_transformer_block(D, H, self.device) for _ in range(L)]
+        # TE 分支已是单层，官方分支需要包装成 Encoder
+        if isinstance(blocks[0], torch.nn.TransformerEncoderLayer):
+            self.shared_encoder = torch.nn.TransformerEncoder(
+                blocks[0], num_layers=L).to(self.device).eval()
+        else:  # TE
+            self.shared_encoder = torch.nn.Sequential(*blocks).to(self.device).eval()
+
+        # 重新生成 embedding，长度=新 D
+        self.role2id = {"sensor": 0, "processor": 1, "emitter": 2}
+        self.role_embed = torch.nn.Embedding(3, D).to(self.device)
+        self.id_embed = torch.nn.Embedding(1_000_000, D).to(self.device)
+
+        if RF.use_compile and torch.cuda.is_available():
+            # ⚠️ 千万别再写 “import torch._dynamo” —— 那会把 torch 当作局部变量
+            from torch import _dynamo as torch_dynamo      # 只绑定 torch_dynamo，不碰 torch
+            torch_dynamo.config.suppress_errors = True
+
+
+            def _compile(m):
+                if getattr(m, "_compiled", False): return m
+                m._compiled = torch.compile(m, mode=RF.compile_mode, fullgraph=False)
+                return m._compiled
+
+            for u in self.units:
+                u.function = _compile(u.function)
+
+    @torch.no_grad()
+    def _run_shared_transformer(self):
+        """
+        把所有 unit.state → [1,N,D] tokens，
+        role / id 做 embedding，加一次 MHA，
+        再写回各自 unit.state。只做前向，不反传梯度。
+        """
+        if not RF.use_shared_tx or len(self.units) == 0:
+            return
+
+        toks = []
+        for u in self.units:
+            vec = u.state.view(-1)
+
+            # pad / truncate 到当前 D
+            if vec.numel() < self.processor_hidden_size:
+                vec = F.pad(vec, (0, self.processor_hidden_size - vec.numel()))
+            elif vec.numel() > self.processor_hidden_size:
+                vec = vec[: self.processor_hidden_size]
+
+            role_id = self.role2id.get(u.role, 0)
+            tok = vec + self.role_embed.weight[role_id] \
+                      + self.id_embed.weight[u.id % 1_000_000]
+            toks.append(tok)
+
+        tokens = torch.stack(toks, 0).unsqueeze(0).to(self.device)   # [1,N,D]
+
+        ctx = (torch.autocast("cuda", dtype=torch.float16)
+               if (RF.use_fp16 and self.device.type == "cuda") else nullcontext())
+        with ctx:
+            out = self.shared_encoder(tokens)                        # [1,N,D]
+
+        for i, u in enumerate(self.units):
+            u.state = out[0, i].detach()     # 写回
 
 
     def _update_global_counts(self):
@@ -200,22 +312,30 @@ class CogGraph:
 
     def add_unit(self, unit: CogUnit):
         # --- 若图中已有单元，则让新单元跟随它们的 device ---
-        if self.units:
-            target_device = self.units[0].device
-            if unit.device != target_device:
-                unit.to(target_device)
+        # if self.units:
+        #     target_device = self.units[0].device
+        #     if unit.device != target_device:
+        #         unit.to(target_device)
         # -----------------------------------------------
+        # 全局统一：始终迁移到 graph.device（在 __init__ 设定）,启用gpu的时候使用
+        if unit.device != self.device:
+            unit.to(self.device)
         # 将单元加入图结构中
         self.units.append(unit)
         self.unit_map[unit.id] = unit
         self.connections[unit.id] = {}
+        # # --- ❶ 维护 id⇄index ---
+        # self.id2idx[unit.id] = len(self.idx2id)  # 顺序追加
+        # self.idx2id.append(unit.id)
+        # self.edge_dirty = True
+
         self._update_global_counts()
 
     def _get_min_target_counts(self):
         """
         根据当前 max_total_energy 和角色比例，返回每类角色的最小建议数量。
         """
-        total_target = int(self.max_total_energy / 3.0 * 0.7)  # 系统最大细胞数 × 0.9 安全系数
+        total_target = int(self.max_total_energy / 2.5 * 0.8)  # 系统最大细胞数 × 0.9 安全系数
 
         # 理想比例：1(sensor) : 2(processor) : 1(emitter) → 总共 4 份
         IDEAL_RATIO = {"sensor": 1, "processor": 2, "emitter": 1}
@@ -296,6 +416,7 @@ class CogGraph:
                 from_set.discard(unit.id)
         # 然后再把自己那条 key 删掉
         self.reverse_connections.pop(unit.id, None)
+        # self.edge_dirty = True  # ❷ 告诉后面“邻接表需要重建”
 
     def connect(self, from_unit: CogUnit, to_unit: CogUnit):
         # 仅允许合法结构连接
@@ -334,6 +455,7 @@ class CogGraph:
         logger.debug(f"[连接建立] {from_unit.id} → {to_unit.id} (strength={strength:.2f})")
         # 同步维护反向索引
         self.reverse_connections.setdefault(to_unit.id, set()).add(from_unit.id)
+        self.edge_dirty = True
 
     def total_energy(self):
         return sum(unit.energy for unit in self.units if unit.age < 240)
@@ -353,6 +475,8 @@ class CogGraph:
         - 如果更短 → 右侧补零
         """
         goal_dim = self._goal_dim()
+        if tensor.shape[-1] == goal_dim:  # ⚡ 已经是一维 env²，直接返回
+            return tensor
         length = tensor.shape[-1]
 
         if length == goal_dim:
@@ -409,13 +533,25 @@ class CogGraph:
             x = x[: self.processor_hidden_size]
 
         sensors = [u for u in self.units if u.get_role() == "sensor"]
-        if sensors:
-            outs = []
-            for s in sensors:
-                s.update(x.unsqueeze(0))
-                outs.append(s.get_output().view(-1))
-            return torch.stack(outs).mean(dim=0)
-        return x.to(dev)
+        if not sensors:
+            return x            # 无 sensor 时直接返回
+
+        # ---- ⚡ 批量前向，仅做前向推理 ----
+        # ① 把 N 份输入堆在一起
+        batch_in = x.unsqueeze(0).repeat(len(sensors), 1)        # [N, D]
+
+        # ② 用 **首个 sensor 的网络结构** 复制一个临时 net
+        #    假设所有 sensor 都是相同的  Linear → ReLU → Linear
+        net = sensors[0].function
+        batch_out = net(batch_in)                                # [N, D]
+
+        # ③ 分别写回每个 sensor 的 last_output（不调用 update()，
+        #    省掉 split/代谢等逻辑；这些逻辑你已经在 Graph.step() 外部显式调用）
+        for s, o in zip(sensors, batch_out):
+            s.last_output = o.detach()
+
+        return batch_out.mean(dim=0)       # 仍返回合并输出
+
 
     def processor_forward(self, sensor_out):
         """
@@ -424,39 +560,100 @@ class CogGraph:
         Returns:
             torch.Tensor (size = self.processor_hidden_size)
         """
-        dev = self.device  # ← 统一目标设备
-        sensor_out = sensor_out.to(dev)
-        processors = [u for u in self.units if u.get_role() == "processor"]
-        if processors:
-            inp = sensor_out.unsqueeze(0)  # (1,D)
+        # dev = self.device  # ← 统一目标设备
+        # sensor_out = sensor_out.to(dev)
+        # processors = [u for u in self.units if u.get_role() == "processor"]
+        # if processors:
+        #     inp = sensor_out.unsqueeze(0)  # (1,D)
+        #     outs = []
+        #     for p in processors:
+        #         p.update(inp)
+        #         outs.append(p.get_output().view(-1))
+        #     merged = torch.stack(outs).mean(dim=0)
+        # else:
+        #     merged = sensor_out
+        #
+        # # —— 统一到 processor_hidden_size ——
+        # if merged.numel() < self.processor_hidden_size:
+        #     pad = (0, self.processor_hidden_size - merged.numel())
+        #     merged = torch.nn.functional.pad(merged, pad)
+        # else:
+        #     merged = merged[: self.processor_hidden_size]
+        # return merged.to(dev)
+        """批量或逐个执行 processor.update()."""
+        dev = self.device
+        sensor_out = sensor_out.to(dev)                   # (1,D)
+
+        procs = [u for u in self.units if u.role == "processor"]
+        if not procs:
+            return sensor_out
+
+        D = sensor_out.size(-1)
+        if RF.batch_processor:
+            # -------- 构造批输入 --------
+            batch_in = sensor_out.expand(len(procs), -1)  # [N,D]
+
+            # -------- 共享一张网络 --------
+            net = procs[0].function
+
+            ctx = (torch.autocast("cuda", dtype=torch.float16)
+                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
+            with ctx, torch.inference_mode():
+                batch_out = net(batch_in)                 # [N,D]
+
+            # -------- 回写 last_output --------
+            for u, o in zip(procs, batch_out):
+                u.last_output = o.detach()
+            merged = batch_out.mean(dim=0)
+        else:
+            # 回退：逐个 update
             outs = []
-            for p in processors:
-                p.update(inp)
+            for p in procs:
+                p.update(sensor_out)
                 outs.append(p.get_output().view(-1))
             merged = torch.stack(outs).mean(dim=0)
-        else:
-            merged = sensor_out
 
-        # —— 统一到 processor_hidden_size ——
+        # —— 与旧实现相同的 pad / truncate —— #
         if merged.numel() < self.processor_hidden_size:
-            pad = (0, self.processor_hidden_size - merged.numel())
-            merged = torch.nn.functional.pad(merged, pad)
+            merged = torch.nn.functional.pad(
+                merged, (0, self.processor_hidden_size - merged.numel()))
         else:
             merged = merged[: self.processor_hidden_size]
         return merged.to(dev)
+
 
     def emitter_forward(self, processor_out):
         """
         把 processor_out 递给所有 emitter 做一次更新；
         不要求返回值（若你想调试，可 return 平均输出）。
         """
-        dev = self.device  # ← 统一目标设备
-        processor_out = processor_out.to(dev)
-        emitters = [u for u in self.units if u.get_role() == "emitter"]
-        if emitters:
-            inp = processor_out.unsqueeze(0)  # (1,D)
+        # dev = self.device  # ← 统一目标设备
+        # processor_out = processor_out.to(dev)
+        # emitters = [u for u in self.units if u.get_role() == "emitter"]
+        # if emitters:
+        #     inp = processor_out.unsqueeze(0)  # (1,D)
+        #     for e in emitters:
+        #         e.update(inp)
+        dev = self.device
+        emitters = [u for u in self.units if u.role == "emitter"]
+        if not emitters:
+            return
+
+        D = processor_out.size(-1)
+        if RF.batch_emitter:
+            batch_in = processor_out.to(dev).expand(len(emitters), -1)  # [N,D]
+            net = emitters[0].function
+            ctx = (torch.autocast("cuda", dtype=torch.float16)
+                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
+            with ctx, torch.inference_mode():
+                batch_out = net(batch_in)
+            for u, o in zip(emitters, batch_out):
+                u.last_output = o.detach()
+        else:
+            inp = processor_out.to(dev).unsqueeze(0)
             for e in emitters:
                 e.update(inp)
+
 
     def merge_redundant_units(self):
         merged_pairs = set()
@@ -733,6 +930,13 @@ class CogGraph:
         :param prune_ratio: 小于全局平均调用频率 * prune_ratio 的连接会被剪掉
         :param strengthen_ratio: 大于全局平均调用频率 * strengthen_ratio 的连接会被强化
         """
+        # --- 清理失效反向索引（O(total_edges)) ---
+        for to_id, from_set in list(self.reverse_connections.items()):
+            for frm in list(from_set):
+                if frm not in self.unit_map or \
+                        to_id not in self.connections.get(frm, {}):
+                    from_set.discard(frm)
+
         if not self.connection_usage:
             return
 
@@ -768,6 +972,10 @@ class CogGraph:
         logger.info(f"[剪枝] 剪掉 {len(to_prune)} 条弱连接，强化 {len(to_strengthen)} 条强连接")
 
     def auto_connect(self):
+        # 退火：单元越多，触发间隔越长，避免 O(N²) 每步扫描
+        if self.current_step % max(40, len(self.units)//100) != 0:
+            return
+
         def euclidean(p1, p2):
             return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
@@ -1015,17 +1223,21 @@ class CogGraph:
                 del pool[:half]
 
     def is_current_target_hazard(self) -> bool:
-        """判断当前 target_vector 是否指向危险点（不考虑 emitter 是否命中）"""
-        index = torch.argmax(self.target_vector).item()
+        """判断当前目标是否是陷阱（指向陷阱的 one-hot）"""
+        index = torch.argmax(self.target_vector[1]).item()
         x, y = index % self.env_size, index // self.env_size
         return (x, y) in self.env.hazards
 
     def step(self, input_tensor: torch.Tensor):
         self._update_global_counts()
+        # === Transformer 一网打尽 ===
+        if RF.use_shared_tx and (self.current_step % RF.shared_tx_interval == 0):
+            self._run_shared_transformer()
+
         self.current_step += 1
         # —— 改为拆分外部传入的 input_tensor ——
         # 假设调用方已经做了 torch.cat([env_state, goal_vec], dim=1)
-        batch = input_tensor.to(self.device)               # (1, env_dim+goal_dim)
+        batch = input_tensor             # (1, env_dim+goal_dim)
         env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]                    # (1, env_dim)
         goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
@@ -1034,32 +1246,40 @@ class CogGraph:
         # 找到 agent 当前最近的资源点或陷阱点
         agent_pos = tuple(self.env.agent_pos)
 
+        # ① 仅追踪最近资源；同时单独记录最近陷阱
         nearest_res = self.env.get_nearest_resource_to(agent_pos)
-        nearest_hzd = self.env.get_nearest_danger_to(agent_pos)  # 你需要添加这个函数
+        nearest_hzd = self.env.get_nearest_danger_to(agent_pos)
 
-        # 距离判定（谁更近）
-        d1 = self.env.distance_to_nearest_resource(agent_pos)
-        d2 = self.env.distance_to_nearest_danger(agent_pos)
+        target_xy = nearest_res  # 只把资源当目标
+        self.current_hazard_xy = nearest_hzd  # ← 保存给 emitter 判断
 
-        # 选择更近的目标点作为 current_target
-        target_xy = nearest_res if d1 <= d2 else nearest_hzd
+        # ② 两通道 one-hot (C=2，0=资源，1=陷阱)
+        # --- 复用缓冲区，避免每步 malloc ---
+        target_vec = self._target_buf
+        target_vec.zero_()         # 原位清零
 
-        # 转为 one-hot 向量
+
+        # 资源通道
         if target_xy is not None:
-            index = target_xy[1] * self.env_size + target_xy[0]
-            vec = torch.zeros(self.env_size * self.env_size, device=self.device)
-            vec[index] = 1.0
-            self.target_vector = vec
+            idx = target_xy[1] * self.env_size + target_xy[0]
+            target_vec[0, idx] = 1.0
+
+        # 陷阱通道（nearest_hzd 可能为 None）
+        if nearest_hzd is not None:
+            hidx = nearest_hzd[1] * self.env_size + nearest_hzd[0]
+            target_vec[1, hidx] = 1.0
+
+        self.target_vector = target_vec  # ← 现在始终 (2, env²)
 
         if self.current_step == 10000:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
         # 若当前步数非常早期，给予基础能量补偿
-        if self.current_step < 1000:
+        if self.current_step < 500:
             for unit in self.units:
-                unit.energy += 0.01
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.01")
+                unit.energy += 0.5
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.07")
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -1099,13 +1319,16 @@ class CogGraph:
                         f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
-        if self.current_step > 0 and self.current_step % 500 == 0:
+        if self.current_step >= 1000 and self.current_step % 1000 == 0:
             old_size = self.env_size
             self.env_size = min(self.env_size + 5, 35)  # 每次+5，最大到35x35
             self.env.resize(self.env_size) # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
             self.rl_agent.resize_state_dim(self.processor_hidden_size)
+            # —— processor_hidden_size 变了，若用共享 Tx 就重建 —— #
+            if RF.use_shared_tx:
+                self._init_shared_tx()
 
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
@@ -1115,6 +1338,13 @@ class CogGraph:
         # —— 同步告知现存所有单元新的 env_size，但不改它们的 position
             for u in self.units:
                 u.env_size = self.env_size
+            # --- 🔄 重新分配目标向量缓冲区，匹配新的 env_size ---
+            #     形状 = 2 通道 × (env_size²) ，dtype/device 与旧缓冲区保持一致
+            self._target_buf = self._target_buf.new_zeros(
+                (2, self.env_size * self.env_size)
+            )
+
+
 
         if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
             old_max = self.max_total_energy
@@ -1245,35 +1475,48 @@ class CogGraph:
         emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
 
         for unit in self.units[:]:
+            # ---------- 新增【私有目标拷贝】----------
+            if unit.get_role() == "emitter":
+                # ① 给每个 emitter 一份**可写**的 goal_vec
+                unit.goal_vec = self.target_vector.clone()
+                # ② 把最近陷阱坐标也交给它
+                unit.current_hazard_xy = getattr(self, "current_hazard_xy", None)
+            # ---------- 新增结束 ----------------------
+
             unit.global_emitter_count = emitter_count
-            unit_input = torch.cat([env_state, goal_tensor], dim=1)
 
             # 如果该单元有上游连接（被其他单元指向）
             # O(1) 反向查找所有调用过我的
             # 1. 把 reverse_connections 里 stale 的 uid 丢掉，剩下才是真正有效的 incoming
-            raw = list(self.reverse_connections.get(unit.id, set()))
-            incoming = []
-            for uid in raw:
-                # 先检查：uid 还在 unit_map 里？uid→unit.id 这条连边还真在 connections 里？
-                if uid in self.unit_map and unit.id in self.connections.get(uid, {}):
-                    incoming.append(uid)
-                    # 更新 usage & strength
-                    self.connection_usage[(uid, unit.id)] = self.current_step
-                    self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
-                else:
-                    # 要么单元被删了，要么连边被剪了 —— 顺便清理反向索引
-                    self.reverse_connections[unit.id].discard(uid)
+            # raw = list(self.reverse_connections.get(unit.id, set()))
+            # incoming = []
+            # for uid in raw:
+            #     # 先检查：uid 还在 unit_map 里？uid→unit.id 这条连边还真在 connections 里？
+            #     if uid in self.unit_map and unit.id in self.connections.get(uid, {}):
+            #         incoming.append(uid)
+            #         # 更新 usage & strength
+            #         self.connection_usage[(uid, unit.id)] = self.current_step
+            #         self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
+            #     else:
+            #         # 要么单元被删了，要么连边被剪了 —— 顺便清理反向索引
+            #         self.reverse_connections[unit.id].discard(uid)
+            incoming = self.reverse_connections.get(unit.id, ())
+            unit.recent_calls = len(incoming)
 
             if unit.get_role() == "sensor":
                 # 同样使用 dim=1 拼接，再加一个 batch 维度
-                unit_input = torch.cat([env_state, goal_tensor], dim=1)
+                unit_input = env_state
 
             elif incoming:
                 weighted_outputs = []
                 total_weight = 0.0
                 for uid in incoming:
+                    # 反向索引有可能已过期，先判存在
+                    if unit.id not in self.connections.get(uid, {}):
+                        continue
                     strength = self.connections[uid][unit.id]
-                    output = self.unit_map[uid].get_output().squeeze(0)  # 统一为 [8]
+                    output   = self.unit_map[uid].get_output().squeeze(0)
+
                     target_len = self.processor_hidden_size
                     if output.shape[0] != target_len:
                         padding = (0, target_len - output.shape[0])
@@ -1284,9 +1527,13 @@ class CogGraph:
                     total_weight += strength
 
                 if total_weight > 0:
-                    unit_input = torch.stack(weighted_outputs).sum(dim=0, keepdim=True) / total_weight
+                    # ① 挤掉多余维度
+                    merged = torch.stack(weighted_outputs).sum(dim=0) / total_weight   # (D,)
+                    # ② 再加回 batch 维
+                    unit_input = merged.unsqueeze(0)                                   # (1, D)
                 else:
-                    unit_input = torch.zeros_like(input_tensor).unsqueeze(0)
+                    unit_input = torch.zeros(unit.input_size, device=self.device).unsqueeze(0)
+
             else:
             # 强制使用零输入触发更新，避免因无输入永远不更新
                 unit_input = torch.zeros(unit.input_size).unsqueeze(0)
@@ -1313,7 +1560,7 @@ class CogGraph:
 
             unit.current_step = self.current_step
             # === 统一动态能量消耗 ===
-            var = torch.var(unit_input).item()
+            var = float(unit_input.var(unbiased=False))
             freq = unit.avg_recent_calls
             conn = unit.connection_count
             call_density = freq / (conn + 1)
@@ -1343,12 +1590,14 @@ class CogGraph:
 
             # 代谢公式加入动态因子
             decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) * dim_scale * bias_factor * step_factor * unit_factor
+            if self.current_step < 1000:
+                unit.energy -= decay * 0.015
+                unit.energy = max(unit.energy, 0.0)
+            else:
+                unit.energy -= decay * 0.030
+                unit.energy = max(unit.energy, 0.0)
 
-            unit.energy -= decay * 0.05
-            unit.energy = max(unit.energy, 0.0)
-
-            logger.debug(
-                f"[代谢] {unit.id} var={var:.3f}, freq={freq}, conn={conn}, strength_sum={conn_strength_sum:.2f} → -{decay:.3f} 能量")
+            logger.debug("[代谢] %s var=%.3f conn_sum=%.2f",unit.id, var, conn_strength_sum)
             unit.current_step = self.current_step
             unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
             unit.update(unit_input)
@@ -1362,9 +1611,12 @@ class CogGraph:
 
             # ✅ 加强连接权重（使用次数越多越强）
             for uid in incoming:
-                if unit.id in self.connections.get(uid, {}):
-                    self.connections[uid][unit.id] *= 1.05  # 增强
-                    self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
+                if unit.id not in self.connections.get(uid, {}):
+                    continue          # 反向索引过期，跳过
+                self.connections[uid][unit.id] *= 1.05
+                self.connections[uid][unit.id] = \
+                    min(self.connections[uid][unit.id], 5.0)
+
             output_buffer[unit.id] = unit.get_output()
             logger.debug(str(unit))
 
@@ -1385,7 +1637,7 @@ class CogGraph:
             self.finalize_deaths()
         self.auto_connect()
         # === 死连接清理 ===
-        if self.current_step % 80 == 0:
+        if self.current_step % 60 == 0:
             threshold = 50
             for from_id in list(self.connections.keys()):
                 for to_id in list(self.connections[from_id].keys()):
@@ -1411,109 +1663,143 @@ class CogGraph:
         decay_threshold = 40  # 超过 30 步未奖励就开始衰减
         decay_amount = 0.04  # 每步扣能量
 
-        # 简易任务奖励：如果 emitter 输出靠近某个目标向量，则发放奖励
-        target_vector = self.target_vector
+        # ---------- 新版资源 / 陷阱 奖励逻辑 ----------
         outputs = self.collect_emitter_outputs()
         if outputs is not None:
-            avg_output = outputs.mean(dim=0)
-
             action_indices = [torch.argmax(out).item() for out in outputs]
-
             emitters = [u for u in self.units if u.get_role() == "emitter"]
 
-            action_indices = [torch.argmax(out).item() for out in outputs]
-
             for i, unit in enumerate(emitters):
-                out = outputs[i]
-                vec = self._align_to_goal_dim(out)
-                dist = torch.norm(vec - self.target_vector)
-                reward_score = max(0.0, 1.0 - dist / 2)  # ≤ 1 距离才有分
-                # 是否正好命中（严格为目标点）
-                is_hit = dist <= 1e-5
+                out_vec = outputs[i]
+                pred    = self._align_to_goal_dim(out_vec)          # (env²,)
 
-                # 是否接近但不是目标（在一定距离范围内，但没命中）
-                is_near = 1e-5 < dist <= 2.0
+                # ─── 资源距离判断 ───────────────────────────
+                goal_vec = unit.goal_vec.squeeze(0) if unit.goal_vec.dim() == 2 else unit.goal_vec
+                res_dist = float((pred - goal_vec).pow(2).mean().sqrt())  # GPU 上完成
+                is_res_hit  = res_dist < 1e-5          # 精准命中
+                is_res_near = 1e-5 < res_dist <= 2.0   # 近邻（≤2 格）
 
-                is_hazard = self.is_current_target_hazard()
+                # 资源索引（0~env²-1）；若 goal_vec 全 0，返回 0 也无影响
+                cur_idx = torch.argmax(goal_vec).item()
 
-                # 获取其所有上游 processor
-                emitter_id = unit.id
+                # ─── 陷阱距离判断 ───────────────────────────
+                hx, hy = getattr(unit, "current_hazard_xy", (None, None))
+                if hx is not None:
+                    idx = hy * self.env_size + hx  # 平面索引
+
+                    if goal_vec.dim() == 2:
+                        # 目标是 (2, env²)：第 0 通道资源，第 1 通道陷阱
+                        hazard_vec = torch.zeros_like(goal_vec)  # (2, env²)
+                        hazard_vec[1, idx] = 1  # 写进陷阱通道
+                        hazard_flat = hazard_vec[1]  # 取一维来比
+                    else:
+                        # 目标是一维 (env²,)
+                        hazard_vec = torch.zeros_like(goal_vec)  # (env²,)
+                        hazard_vec[idx] = 1
+                        hazard_flat = hazard_vec  # 直接用
+
+                    hz_dist = float((pred - hazard_flat).pow(2).mean().sqrt())
+                    is_hz_hit = hz_dist < 1e-5
+                else:
+                    hz_dist = float("inf")
+                    is_hz_hit = False
+
+                # ─── 上游 processor 列表 ───────────────────
                 upstream_processors = [
                     self.unit_map[pid]
-                    for pid in self.reverse_connections.get(emitter_id, set())
+                    for pid in self.reverse_connections.get(unit.id, set())
                     if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
                 ]
 
-                if is_hazard and is_hit:
-                    # ❌ 直接命中陷阱 → 惩罚
-                    unit.energy -= 0.2
+                # ========== 陷阱命中：重罚 ==========
+                if is_hz_hit:
+                    unit.energy -= 0.20
                     for p in upstream_processors:
-                        p.energy -= 0.2
-                    logger.debug(f"[惩罚] {unit.id} 输出正中陷阱 → emitter+processor 扣能量")
+                        p.energy -= 0.20
                     unit.last_action_rewarded = False
+                    continue     # 本帧结束
 
-                elif is_hazard:
+                # ========== 已确认陷阱且远离 ≥3 格：小奖 ==========
+                if unit.is_hazard_confirmed and hz_dist > 3.0:
+                    unit.energy += 0.04
+                    unit.is_hazard_confirmed = False
+                    unit.last_reward_step = self.current_step
+                    unit.last_action_rewarded = True
+                    # 不 return，让它还可以拿资源奖
+                # --------------------------------------------
+
+                # ------------- 资源奖励/逗留控制 -------------
+                # 变量说明：
+                #   last_rewarded_target_idx  - 上次奖励的资源索引
+                #   linger_steps              - 在同一资源 ≤2 格内逗留计数
+                #   last_reward_amount        - 上次 base 奖励(不含+0.8命中奖)
+                #
+
+                # ➤ 情况 1：首次进入资源范围，尚未领奖
+                if (unit.last_rewarded_target_idx != cur_idx) and (is_res_hit or is_res_near):
+                    base_r = 0.02 * (1.0 - res_dist)        # 距离越近奖励越大
+                    base_r = max(base_r, 0.0)
+                    unit.energy += base_r
+                    for p in upstream_processors:
+                        p.energy += base_r * 0.25
+                    # 精准命中再加 0.8
+                    if is_res_hit:
+                        unit.energy += 0.6
+                        for p in upstream_processors:
+                            p.energy += 0.15
+
+                    # 记录领奖状态
+                    unit.last_rewarded_target_idx = cur_idx
+                    unit.last_reward_amount       = base_r
+                    unit.linger_steps             = 0
+                    unit.last_reward_step         = self.current_step
+                    unit.last_action_rewarded     = True
+                    continue      # 本帧奖励处理完毕
+
+                # ➤ 情况 2：仍在同一资源 ≤2 格内逗留
+                if (unit.last_rewarded_target_idx == cur_idx) and res_dist <= 2.0:
+                    unit.linger_steps = min(unit.linger_steps + 1, 20)  # ← 在 0~20 之间递增
+                    if unit.linger_steps > 3:               # 逗留阈值
+                        unit.energy -= 0.01                 # 轻微能量衰减，不撤回奖励
+                    # 不再给新奖励
                     continue
 
-                elif is_near or is_hit:
-                    # 🟢 正常奖励 emitter + 上游 processor
-                    dim_scale = min(self.target_vector.size(0) / 50, 2.0)
-                    dilution_factor = 1.0
-                    if self.current_step >= 5000:
-                        dilution_factor = max(0.5, 1.0 - 0.00005 * (self.current_step - 5000))
-                    base_reward = 0.02 * dim_scale * reward_score * dilution_factor
+                # ➤ 情况 3：离开资源 ≥4 格 —— 撤回 base 奖励
+                if (unit.last_rewarded_target_idx == cur_idx) and res_dist > 4.0:
+                    unit.energy -= unit.last_reward_amount
+                    unit.last_rewarded_target_idx = None
+                    unit.linger_steps             = 0
+                    unit.last_reward_amount       = 0.0
+                    # 不额外惩罚，留下撤回即可
 
-                    unit.energy += base_reward
-                    logger.debug(f"[奖励] {unit.id} 输出靠近目标 → +{base_reward:.3f}")
+                # ------------ 多样性奖惩 -------------
+                if len(action_indices) >= 3:
+                    most_common = max(set(action_indices), key=action_indices.count)
+                    if action_indices.count(most_common) > len(action_indices) * 0.9:
+                        unit.energy -= 0.05
+                    elif len(set(action_indices)) > len(action_indices) * 0.6:
+                        unit.energy += 0.05
 
-                    for p in upstream_processors:
-                        p.energy += base_reward
-                        logger.debug(f"[奖励] 上游 {p.id} → emitter {unit.id} 共同完成任务 → +{base_reward:.3f}")
-
-                    if self.task.evaluate(self.env, outputs) and reward_score == 1.0:
-                        unit.energy += 0.4
-                        for p in upstream_processors:
-                            p.energy += 0.4
-                        logger.debug(f"[任务完成] emitter {unit.id} 达成目标 → emitter+processor +0.4 能量")
-                        unit.last_reward_step = self.current_step
-                        unit.last_action_rewarded = True
-                    else:
-                        unit.last_action_rewarded = False
-
-                    # ✅ 多样性奖励 / 惩罚（仍在非 hazard 分支中）
-                    if len(action_indices) >= 3:
-                        common_action = max(set(action_indices), key=action_indices.count)
-                        if action_indices.count(common_action) > len(action_indices) * 0.9:
-                            unit.energy -= 0.05
-                            logger.debug(f"[惩罚] emitter {unit.id} 输出过于一致 → -0.05")
-                        elif len(set(action_indices)) > len(action_indices) * 0.6:
-                            unit.energy += 0.05
-                            logger.debug(f"[奖励] emitter {unit.id} 输出多样性高 → +0.05")
-
-                # ✅ 衰减机制
+                # ------------ 衰减 + 兜圈 ------------
                 if self.current_step > 1500:
                     inactive_steps = self.current_step - unit.last_reward_step
                     if inactive_steps > decay_threshold:
-                        unit.energy -= decay_amount
-                        logger.debug(f"[衰减] {unit.id} 超过 {decay_threshold} 步未奖励 → -{decay_amount:.3f}")
+                        unit.energy -= decay_amount * 0.1
 
-                    # ✅ 探索性惩罚
-                    if hasattr(unit, "output_positions") and len(
-                            unit.output_positions) >= 10 and self.current_step % 10 == 0:
+                    if (hasattr(unit, "output_positions")
+                            and len(unit.output_positions) >= 10
+                            and self.current_step % 10 == 0):
                         start = unit.output_positions[0]
-                        end = unit.output_positions[-1]
+                        end   = unit.output_positions[-1]
                         manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
                         if 3 <= manhattan < 5:
-                            unit.energy -= 0.05
-                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.08")
+                            unit.energy -= 0.08
                         elif 6 <= manhattan < 8:
                             unit.energy -= 0.10
-                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.10")
                         elif 9 <= manhattan <= 10:
-                            unit.energy -= 0.25
-                            logger.debug(f"[探索惩罚] {unit.id} 疑似兜圈 → -0.12")
+                            unit.energy -= 0.12
+        # ---------- 奖励逻辑结束 ----------
 
-                    logger.debug(f"[奖励] emitter {unit.id} 输出接近目标，距离 {dist:.2f}，奖励比率 {reward_score:.2f}")
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
 
@@ -1541,6 +1827,13 @@ class CogGraph:
                     # ✅ 当前角色数量不足 或 系统能量未超载 → 强制分裂
                     expected_input = self.env_size * self.env_size * INPUT_CHANNELS
                     child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None)
+                    # —— 分裂后给父细胞和子细胞各 +0.5 能量 —— #
+                    if self.current_step < 2000:
+                        split_bonus = 0.2
+                    else:
+                        split_bonus = 0
+                    unit.energy += split_bonus
+                    child.energy += split_bonus
                     self.connect(unit, child)
                     self.auto_connect()
                     self.add_unit(child)
@@ -1572,7 +1865,8 @@ class CogGraph:
             self.add_unit(unit)
 
         # —— 定期合并 & 重构（核心算法，必须保留） ——
-        if self.current_step % 120 == 0:
+        interval = max(120, len(self.units) // 50)
+        if self.current_step % interval == 0:
             self.merge_redundant_units()
             self.restructure_common_subgraphs()
 

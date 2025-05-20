@@ -5,10 +5,12 @@ import random
 from env import logger
 from collections import deque
 import torch.nn as nn
+from config_runtime import RF            # ★ 新增
+from contextlib import nullcontext       # ★ autocast fallback
 
 # ======== CogUnit 全局功能开关 ========
 ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
-FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
+FOLLOW_INPUT_DEVICE = False  # ← 自动把内部张量跟随输入 device（GPU/CPU）
 # 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
 MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
 # ====================================
@@ -133,18 +135,30 @@ class CogUnit:
         )
 
         self.last_output = torch.zeros(input_size)
+        # ---------- 加速格式 ---------- #
+        if RF.use_channels_last and torch.cuda.is_available():
+            self.function = self.function.to(memory_format=torch.channels_last)
+        if RF.use_fp16 and torch.cuda.is_available():
+            self.function = self.function.half()   # 权重转 FP16
 
         if "mutation_rate" not in self.gene:
             self.gene["mutation_rate"] = 0.05
         self.device = torch.device("cpu")  # 默认跟随 CPU
         self.last_action_rewarded = False
         self.last_reward_step = 0  # 记录上次获得 env 奖励的 step
+        # ----- 资源点打转管控 -----
+        self.last_rewarded_target_idx = None   # 上一次领奖的资源索引
+        self.linger_steps             = 0      # 在同一目标附近逗留的帧数
+        self.latest_base_reward       = 0.0    # 上一次靠近时发的 base 奖励，用来扣回
+
 
 
     # ---------------- 新增 ----------------
     def to(self, device):
         """把内部权重 & 状态迁移到指定设备（cpu / cuda）"""
         device = torch.device(device)
+        if device == getattr(self, "device", torch.device("cpu")):
+            return self  # 已在目标 device，直接返回
         self.device = device
         self.function.to(device)
         self.state = self.state.to(device)
@@ -195,6 +209,9 @@ class CogUnit:
 
 
     def update(self, input_tensor: torch.Tensor):
+        if input_tensor.dim() == 3 and input_tensor.size(1) == 1:
+            input_tensor = input_tensor.squeeze(1)  # (1, D)
+
         # 刚更新完一次，就把过去 call_history 滑窗算一下均值
         if self.call_history:
             self.avg_recent_calls = sum(self.call_history) / len(self.call_history)
@@ -315,7 +332,7 @@ class CogUnit:
         # ========================
 
         # 1️⃣ 输入复杂度：使用方差作为熵的近似
-        input_var = torch.var(input_tensor).item()
+        input_var = float(input_tensor.var())
 
         # 2️⃣ 调用频率：外部由 Graph 写入 recent_calls 属性
         recent_call_freq = getattr(self, "recent_calls", 1)
@@ -350,6 +367,25 @@ class CogUnit:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
 
         # === ✅ 局部微型学习
+        # ---------- 新增【探测-判定-更新目标】----------
+        if self.role == "emitter" and hasattr(self, "goal_vec"):
+            # ① 找到 emit 最高激活格子的坐标
+            out_vec = self.last_output.view(-1)
+            idx = torch.argmax(out_vec).item()
+            x, y = idx % self.env_size, idx // self.env_size
+
+            # ② 最近陷阱坐标由 graph 事先写入 current_hazard_xy
+            hx, hy = getattr(self, "current_hazard_xy", (None, None))
+
+            if hx is not None and (x, y) == (hx, hy):
+                # ♦ 命中 / 对准陷阱 → 立即标记并清空目标，促使撤退
+                self.is_hazard_confirmed = True
+                self.goal_vec.zero_()          # ← 清空私有目标
+            else:
+                # ♦ 未对准陷阱（资源或其他格） → 取消标记
+                self.is_hazard_confirmed = False
+        # ---------- 新增结束 ---------------------------
+
         if self.get_role() == "emitter":
             bias = self.gene.get("emitter_bias", 1.0)
             lr = 0.001 * (2.0 - min(1.5, bias))

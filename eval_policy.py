@@ -125,6 +125,8 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=4000) # 检测的最长步数
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--fastflag", action="store_true",
+                        help="关闭则禁用所有 RuntimeFlags 加速")
     args = parser.parse_args()
     import random, numpy as np, torch, statistics, time
 
@@ -159,8 +161,8 @@ if __name__ == "__main__":
 
 """
 python eval_policy.py \
-  --ckpt checkpoints/agent_final.pth \
-  --episodes 2\
-  --max-steps 500\
+  --ckpt checkpoints/agent_h4.pth \
+  --episodes 1\
+  --max-steps 1000\
   --device cpu
 """
