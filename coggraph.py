@@ -60,7 +60,7 @@ import math
 
 
 
-
+HIT_THRESH = 0.2          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
 N_GOAL_CHANNELS = 2
@@ -187,6 +187,8 @@ class CogGraph:
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
+        self.removed_resources_count = 0
+        self.removed_hazards_count = 0
         # self.id2idx = {}  # 单元 id  → 索引 0..N-1
         # self.idx2id = []  # 反向（保持 list 方便迭代）
         # self.edge_dirty = True  # 只要连边变化就置 True
@@ -310,7 +312,7 @@ class CogGraph:
         s = sum(1 for u in self.units if u.get_role()=="sensor")
         p = sum(1 for u in self.units if u.get_role()=="processor")
         e = sum(1 for u in self.units if u.get_role()=="emitter")
-        logger.info(f"[统计] step={self.current_step} | sensor:{s}, processor:{p}, emitter:{e}")
+        logger.warning(f"[统计] step={self.current_step} | sensor:{s}, processor:{p}, emitter:{e}")
 
         # 再把所有连接强度 dump 一遍
         logger.debug("[连接强度]")
@@ -342,19 +344,22 @@ class CogGraph:
     def _get_min_target_counts(self):
         """
         根据当前 max_total_energy 和角色比例，返回每类角色的最小建议数量。
+        只有低于各自阈值的角色才会触发强制分裂。
         """
-        total_target = int(self.max_total_energy / 2.5 * 0.8)  # 系统最大细胞数 × 0.9 安全系数
+        # 系统希望的最小总细胞数（原逻辑）
+        total_target = int(self.max_total_energy / 2.5 * 0.8)
 
-        # 理想比例：1(sensor) : 2(processor) : 1(emitter) → 总共 4 份
+        # 理想比例：sensor:processor:emitter = 1:2:1
         IDEAL_RATIO = {"sensor": 1, "processor": 2, "emitter": 1}
         DENOM = sum(IDEAL_RATIO.values())  # = 4
 
-        target_counts = {
-            role: int(total_target * IDEAL_RATIO[role] / DENOM)
-            for role in IDEAL_RATIO
-        }
-        return target_counts
+        target_counts = {}
+        for role, weight in IDEAL_RATIO.items():
+            # 按比例分配，并且至少保留 1 个
+            cnt = math.ceil(total_target * weight / DENOM)
+            target_counts[role] = max(1, cnt)
 
+        return target_counts
     def finalize_deaths(self):
         # 遍历每个 role，分配它们累加的能量
         for role, total_energy in self._death_energy_sum.items():
@@ -1310,8 +1315,8 @@ class CogGraph:
         # 若当前步数非常早期，给予基础能量补偿
         if self.current_step < 500:
             for unit in self.units:
-                unit.energy += 0.5
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.07")
+                unit.energy += 0.02
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.02")
 
         if self.current_step > 200 and self.current_step % 10 == 0:
             total_cell_energy = self.total_energy()
@@ -1339,7 +1344,7 @@ class CogGraph:
 
                 if pool_energy >= tax:
                     self.energy_pool -= tax
-                    logger.info(
+                    logger.warning(
                         f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 累进税 {tax:.2f}（池足够，剩余池能 {self.energy_pool:.2f}）")
                 else:
                     tax_from_cells = tax - self.energy_pool
@@ -1347,7 +1352,7 @@ class CogGraph:
                     loss_per_unit = tax_from_cells / max(len(self.units), 1)
                     for unit in self.units:
                         unit.energy -= loss_per_unit
-                    logger.info(
+                    logger.warning(
                         f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
@@ -1357,7 +1362,9 @@ class CogGraph:
             self.env.resize(self.env_size) # 重新生成环境
             # self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-            self.rl_agent.resize_state_dim(self.processor_hidden_size)
+            # self.rl_agent.resize_state_dim(self.processor_hidden_size)
+            full_dim = self.processor_hidden_size + self.env_size * self.env_size * 2
+            self.rl_agent.resize_state_dim(full_dim)
             # —— processor_hidden_size 变了，若用共享 Tx 就重建 —— #
             if RF.use_shared_tx:
                 self._init_shared_tx()
@@ -1378,7 +1385,7 @@ class CogGraph:
 
 
 
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 1000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
@@ -1630,7 +1637,7 @@ class CogGraph:
                 unit.energy -= decay * 0.015
                 unit.energy = max(unit.energy, 0.0)
             else:
-                unit.energy -= decay * 0.030
+                unit.energy -= decay * 0.035
                 unit.energy = max(unit.energy, 0.0)
 
             logger.debug("[代谢] %s var=%.3f conn_sum=%.2f",unit.id, var, conn_strength_sum)
@@ -1646,7 +1653,7 @@ class CogGraph:
                 # unit.output_positions.append((x, y))
                 # ① 把 emitter 输出对齐到 env² 一维向量
                 out = unit.get_output().squeeze(0) if unit.get_output().dim() == 2 else unit.get_output()
-                pred = self._align_to_goal_dim(out)          # (env²,)
+                pred = torch.softmax(self._align_to_goal_dim(out), dim=0)  # (env²,) 归一化到 [0,1]
 
                 # ② 拆分目标向量：资源通道 / 陷阱通道
                 if unit.goal_vec.dim() == 2:                 # 新版 (2, env²)
@@ -1655,16 +1662,6 @@ class CogGraph:
                 else:                                        # 兼容旧一维
                     res_vec = unit.goal_vec
                     hz_vec  = torch.zeros_like(res_vec)
-
-                # ③ 距离 / whether hit
-                res_dist = float((pred - res_vec).pow(2).mean().sqrt())
-                is_res_hit  = res_dist < 1e-5
-                is_res_near = 1e-5 < res_dist <= 2.0
-
-                hz_dist = float((pred - hz_vec).pow(2).mean().sqrt())
-                is_hz_hit = hz_vec.sum() > 0 and hz_dist < 1e-5
-
-
 
             # ✅ 加强连接权重（使用次数越多越强）
             for uid in incoming:
@@ -1728,7 +1725,8 @@ class CogGraph:
 
             for i, unit in enumerate(emitters):
                 out_vec = outputs[i]
-                pred    = self._align_to_goal_dim(out_vec)          # (env²,)
+                pred = self._align_to_goal_dim(out_vec)          # (env²,)
+                pred = torch.softmax(pred, dim=0)  # ★ NEW ★ 归一化到 [0,1]
 
                 # ─── 资源距离判断 ───────────────────────────
                 # goal_vec = unit.goal_vec.squeeze(0) if unit.goal_vec.dim() == 2 else unit.goal_vec
@@ -1744,34 +1742,21 @@ class CogGraph:
                 goal_vec = res_vec
 
                 # ---------- 资源距离 ----------
-                res_dist   = float((pred - res_vec).pow(2).mean().sqrt())
-                is_res_hit = res_dist < 1e-5
-                is_res_near= 1e-5 < res_dist <= 2.0
-
+                res_dist = float((pred - res_vec).pow(2).mean().sqrt())
+                is_res_hit = res_dist < HIT_THRESH  # ← 用阈值
+                is_res_near = HIT_THRESH <= res_dist <= 1.5  # 近但没命中
 
                 # 资源索引（0~env²-1）；若 goal_vec 全 0，返回 0 也无影响
                 cur_idx = torch.argmax(res_vec).item()
 
-                # ─── 陷阱距离判断 ───────────────────────────
-                hx, hy = getattr(unit, "current_hazard_xy", (None, None))
-                if hx is not None:
-                    idx = hy * self.env_size + hx  # 平面索引
-
-                    if unit.goal_vec.dim() == 2:
-                        # 目标是 (2, env²)：第 0 通道资源，第 1 通道陷阱
-                        hazard_vec = torch.zeros_like(unit.goal_vec)  # (2, env²)
-                        hazard_vec[1, idx] = 1  # 写进陷阱通道
-                        hazard_flat = hazard_vec[1]  # 取一维来比
-                    else:
-                        # 目标是一维 (env²,)
-                        hazard_vec = torch.zeros_like(res_vec)  # (env²,)
-                        hazard_vec[idx] = 1
-                        hazard_flat = hazard_vec  # 直接用
-
-                    hz_dist = float((pred - hazard_flat).pow(2).mean().sqrt())
-                    is_hz_hit = hz_dist < 1e-5
+                # ─── 陷阱命中判定（直接比较 argmax） ───────────────────────────
+                hazard = getattr(unit, "current_hazard_xy", None)
+                if hazard is not None:
+                    hx, hy = hazard
+                    hazard_idx = hy * self.env_size + hx
+                    pred_idx = torch.argmax(pred).item()
+                    is_hz_hit = (pred_idx == hazard_idx)
                 else:
-                    hz_dist = float("inf")
                     is_hz_hit = False
 
                 # ─── 上游 processor 列表 ───────────────────
@@ -1782,12 +1767,32 @@ class CogGraph:
                 ]
 
                 # ========== 陷阱命中：重罚 ==========
-                if is_hz_hit:
-                    unit.energy -= 0.20
+                if is_hz_hit and (hx, hy) in self.env.hazards:
+                    unit.energy -= 0.50
+                    logger.debug("命中陷阱，该罚！")
                     for p in upstream_processors:
-                        p.energy -= 0.20
+                        p.energy -= 0.125
+                    unit.is_hazard_confirmed = True
                     unit.last_action_rewarded = False
+                    # ====== ① 把这个资源从环境里移除 ======
+                    # —— 用真实的陷阱坐标删除陷阱 ——
+                    self.env.hazards.discard((hx, hy))
+                    self.removed_hazards_count += 1
+                    # —— 同步清空 goal_vec ——
+                    hazard_idx = hy * self.env_size + hx
+                    unit.goal_vec[1, hazard_idx] = 0.0
+
                     continue     # 本帧结束
+                # ─── 重新计算 hz_dist，用于小奖判定 ───────────────────
+                # 这里我们用 argmax 得到的预测位置 vs 陷阱位置的欧氏距离
+                hazard = getattr(unit, "current_hazard_xy", None)
+                if hazard is not None:
+                    hx, hy = hazard
+                    pred_idx = torch.argmax(pred).item()
+                    px, py = pred_idx % self.env_size, pred_idx // self.env_size
+                    hz_dist = math.hypot(px - hx, py - hy)
+                else:
+                    hz_dist = float("inf")
 
                 # ========== 已确认陷阱且远离 ≥3 格：小奖 ==========
                 if unit.is_hazard_confirmed and hz_dist > 3.0:
@@ -1795,6 +1800,7 @@ class CogGraph:
                     unit.is_hazard_confirmed = False
                     unit.last_reward_step = self.current_step
                     unit.last_action_rewarded = True
+                    logger.debug("远离危险，小奖！")
                     # 不 return，让它还可以拿资源奖
                 # --------------------------------------------
 
@@ -1806,17 +1812,38 @@ class CogGraph:
                 #
 
                 # ➤ 情况 1：首次进入资源范围，尚未领奖
+                # —— 先确认这个资源格真的还在环境里 ——
+                x_res, y_res = cur_idx % self.env_size, cur_idx // self.env_size
+                if (x_res, y_res) not in self.env.resources:
+                    # 资源已经移除，跳过奖励
+                    continue
+                # ➤ 情况 1：首次进入资源范围，尚未领奖 且 环境里仍有资源
                 if (unit.last_rewarded_target_idx != cur_idx) and (is_res_hit or is_res_near):
+
                     base_r = 0.02 * (1.0 - res_dist)        # 距离越近奖励越大
                     base_r = max(base_r, 0.0)
                     unit.energy += base_r
                     for p in upstream_processors:
-                        p.energy += base_r * 0.25
-                    # 精准命中再加 0.8
+                        p.energy += base_r
+                        logger.debug("进入范围，奖励！")
+                    # 精准命中再加 0.5
                     if is_res_hit:
-                        unit.energy += 0.6
+                        unit.energy += 0.8
+                        # —— ① 从环境里移除资源 ——
+                        self.env.resources.discard((x_res, y_res))
+                        self.removed_resources_count += 1
+                        # —— ② 本帧也同步清空 goal_vec，避免后续误判 ——
+                        unit.goal_vec[0, cur_idx] = 0.0
+
+
+                        # ====== ② 立即重置奖励状态，方便下个资源 ======
+                        unit.last_rewarded_target_idx = None
+                        unit.linger_steps = 0
+                        unit.last_reward_amount = 0.0
+                        logger.debug("达成目标，再奖！")
+                        # （可选）给 processor 分奖励
                         for p in upstream_processors:
-                            p.energy += 0.15
+                            p.energy += 0.2
 
                     # 记录领奖状态
                     unit.last_rewarded_target_idx = cur_idx
@@ -1827,15 +1854,17 @@ class CogGraph:
                     continue      # 本帧奖励处理完毕
 
                 # ➤ 情况 2：仍在同一资源 ≤2 格内逗留
-                if (unit.last_rewarded_target_idx == cur_idx) and res_dist <= 2.0:
+                if (unit.last_rewarded_target_idx == cur_idx) and res_dist <= 2.0 and self.current_step >= 1500:
                     unit.linger_steps = min(unit.linger_steps + 1, 20)  # ← 在 0~20 之间递增
                     if unit.linger_steps > 3:               # 逗留阈值
                         unit.energy -= 0.01                 # 轻微能量衰减，不撤回奖励
+                        logger.info("范围内兜圈子，该罚！")
                     # 不再给新奖励
                     continue
 
                 # ➤ 情况 3：离开资源 ≥4 格 —— 撤回 base 奖励
                 if (unit.last_rewarded_target_idx == cur_idx) and res_dist > 4.0:
+                    logger.warning("跑走了，奖金取消！")
                     unit.energy -= unit.last_reward_amount
                     unit.last_rewarded_target_idx = None
                     unit.linger_steps             = 0
@@ -1879,7 +1908,7 @@ class CogGraph:
 
         # —— 统一统计 & 连接打印（仅 debug） ——
         self._log_stats_and_conns()
-        if self.debug and self.current_step % 60 == 0:
+        if self.debug and self.current_step % 40 == 0:
             self.rebalance_cell_types()
 
         # === 🔁 分裂 or 储能：强制处理能量超标单元 ===
@@ -1896,10 +1925,14 @@ class CogGraph:
                 if role_counts.get(role, 0) < min_counts[role] and self.total_energy() < self.max_total_energy:
                     # ✅ 当前角色数量不足 或 系统能量未超载 → 强制分裂
                     expected_input = self.env_size * self.env_size * INPUT_CHANNELS
-                    child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None)
-                    # —— 分裂后给父细胞和子细胞各 +0.5 能量 —— #
+                    child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None,
+                                       global_resources=self.env.resources,
+                                       global_hazards=self.env.hazards,
+                                       )
+                    # 🔁 注入资源和陷阱信息（避免出生在危险地带）
+                    # —— 分裂后给父细胞和子细胞各 +0.35 能量 —— #
                     if self.current_step < 2000:
-                        split_bonus = 0.2
+                        split_bonus = 0.35
                     else:
                         split_bonus = 0
                     unit.energy += split_bonus
@@ -1923,7 +1956,9 @@ class CogGraph:
             expected_input = self.env_size * self.env_size * INPUT_CHANNELS
 
             child = parent.clone(
-                new_input_size=expected_input if parent.input_size != expected_input else None
+                new_input_size=expected_input if parent.input_size != expected_input else None,
+                global_resources=self.env.resources,
+                global_hazards=self.env.hazards,
             )
             # 父子连接（含继承上下游）
             self.connect(parent, child)
@@ -1976,6 +2011,14 @@ class CogGraph:
                         u.energy += per_unit
                         self.energy_pool -= per_unit
                     logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
+
+        # —— 新增：周期性清理统计 ——
+        if self.current_step % 50 == 0:
+            logger.warning(f"[清理统计] 已清理资源 {self.removed_resources_count} 个，危险 {self.removed_hazards_count} 个")
+        if self.current_step % 1000 == 0:
+            # 重置计数
+            self.removed_resources_count = 0
+            self.removed_hazards_count  = 0
 
     # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
     def expand_unit_dim(self, unit: CogUnit, new_input_size: int):

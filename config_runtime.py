@@ -30,7 +30,7 @@ class _Flags:
     use_channels_last: bool = True  # Linear 网络转 NHWC，访存更顺
     use_fp16: bool = True           # autocast + 权重 half
     # ---------- ⑥ Shared-Transformer ----------
-    use_shared_tx: bool   = True   # 把 N 个 CogUnit 当序列一次性跑
+    use_shared_tx: bool   = False   # 把 N 个 CogUnit 当序列一次性跑
     shared_tx_layers: int = 4      # 堆多少层
     shared_tx_heads: int  = 8      # Multi-Head 个数
     shared_tx_interval: int = 1    # 每隔多少步跑一次（>1 可省 Python）

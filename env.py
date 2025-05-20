@@ -49,28 +49,41 @@ class GridEnvironment:
         self.hazards = set()
         self.step_count = 0
         self.explored_cells_count = 0
-        self.refresh_environment(step=0, explored_cells_count=0)
+        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        exclude = {tuple(self.agent_pos)}
+        self.refresh_environment(step=0, explored_cells_count=0, exclude_positions=exclude)
         self.visited_map = np.zeros((self.size, self.size), dtype=bool)  # ✅ 初始化探索标记
         self.reset()
 
-    def refresh_environment(self, step: int, explored_cells_count: int):
+    def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
+        exclude_positions = exclude_positions or set()
+
         """刷新资源与危险格子的位置（每隔一段时间）"""
         self.resources.clear()
         self.hazards.clear()
         # 修正语法：先计算增量
         extra = max(((self.step_count - 1500) // 250), 0)
-        # 生成资源：size + extra 数量，每次随机位置
-        for _ in range(int((self.size *self.size)/4) + extra):
-            self.resources.add((
+
+        attempts = 0
+        while len(self.resources) < int(self.size * self.size / 6) + extra and attempts < 1000:
+            pos = (
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
-            ))
-        # 生成危险区域：size + extra 数量
-        for _ in range(int((self.size *self.size)/8)+ extra):
-            self.hazards.add((
+            )
+            if pos not in exclude_positions:
+                self.resources.add(pos)
+            attempts += 1
+
+        attempts = 0
+        while len(self.hazards) < int(self.size * self.size / 3) + extra and attempts < 1000:
+            pos = (
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
-            ))
+            )
+            if pos not in exclude_positions:
+                self.hazards.add(pos)
+            attempts += 1
+
         # ✅ 每次刷新资源/陷阱后，也要刷新探索地图
         self.visited_map = np.zeros((self.size, self.size), dtype=bool)
         self.explored_cells_count = 0

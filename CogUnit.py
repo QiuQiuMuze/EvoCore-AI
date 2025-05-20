@@ -376,7 +376,12 @@ class CogUnit:
             x, y = idx % self.env_size, idx // self.env_size
 
             # ② 最近陷阱坐标由 graph 事先写入 current_hazard_xy
-            hx, hy = getattr(self, "current_hazard_xy", (None, None))
+            # 新写法：先取出来，再判断
+            hazard = getattr(self, "current_hazard_xy", None)
+            if hazard is None:
+                hx, hy = None, None
+            else:
+                hx, hy = hazard
 
             if hx is not None and (x, y) == (hx, hy):
                 # ♦ 命中 / 对准陷阱 → 立即标记并清空目标，促使撤退
@@ -699,7 +704,7 @@ class CogUnit:
                     return True
         return False
 
-    def clone(self, role_override=None, new_input_size=None):
+    def clone(self, role_override=None, new_input_size=None,global_resources=None, global_hazards=None):
         role = role_override or self.role
         input_size = new_input_size if new_input_size is not None else self.input_size
 
@@ -765,10 +770,24 @@ class CogUnit:
                 clone_unit.gene[key] = max(0.5, min(2.0, clone_unit.gene[key] + mutation))
             logger.info(f"[突变] gene 突变为 {clone_unit.gene}")
 
-        clone_unit.position = (
-            random.randint(0, self.env_size - 1),
-            random.randint(0, self.env_size - 1),
-        )
+        def find_safe_position(env_size, resources: set, hazards: set, max_attempts=5):
+            for _ in range(max_attempts):
+                pos = (
+                    random.randint(0, env_size - 1),
+                    random.randint(0, env_size - 1)
+                )
+                if pos not in resources and pos not in hazards:
+                    return pos
+            # 🟡 安全位置找不到，就随机一个（哪怕是危险位置）
+            fallback_x = random.randint(0, self.env_size - 1)
+            fallback_y = random.randint(0, self.env_size - 1)
+            logger.warning(f"[出生回退] 未找到安全位置，随机出生在 ({fallback_x}, {fallback_y})")
+            return (fallback_x, fallback_y)
+
+        # ⚠️ 使用提前注入的资源和陷阱信息
+        resources = getattr(self, "global_resources", set())
+        hazards = getattr(self, "global_hazards", set())
+        clone_unit.position = find_safe_position(self.env_size, resources, hazards)
 
         clone_unit.energy = self.energy * 0.6
         clone_unit.age = 0
