@@ -63,7 +63,7 @@ import math
 
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
-N_GOAL_CHANNELS = 1
+N_GOAL_CHANNELS = 2
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
 
@@ -77,8 +77,9 @@ class TaskInjector:
     def encode_goal(self, env_size):
         """将目标位置编码成 one-hot 向量（与输入同维度）"""
         index = self.target_position[1] * env_size + self.target_position[0]
-        vec = torch.zeros(env_size * env_size)
-        vec[index] = 1.0
+        vec = torch.zeros(2, env_size * env_size)  # 2 通道
+        vec[0, index] = 1.0  # 资源层 one-hot
+        # vec[1] 先保持全 0（陷阱层以后再写）
         return vec
 
     def evaluate(self, env, emitter_outputs):
@@ -181,7 +182,7 @@ class CogGraph:
         initial_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
-        self.target_vector = torch.zeros(self.env_size * self.env_size)  # 初始化为空目标
+        self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
         self.max_total_energy = 500  # 初始最大总能量
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
@@ -211,7 +212,11 @@ class CogGraph:
         在   1) __init__   2) env 扩容后   调一次即可。
         """
         D = self.processor_hidden_size
-        L, H = RF.shared_tx_layers, RF.shared_tx_heads
+        H = math.gcd(D, RF.shared_tx_heads) or 1
+        if H != RF.shared_tx_heads:
+            logger.warning(f"[Shared-Tx] embed_dim={D} 不整除 {RF.shared_tx_heads}；自动改为 {H} 头")
+
+        L = RF.shared_tx_layers
 
         blocks = [_build_transformer_block(D, H, self.device) for _ in range(L)]
         # TE 分支已是单层，官方分支需要包装成 Encoder
@@ -261,8 +266,11 @@ class CogGraph:
                 vec = vec[: self.processor_hidden_size]
 
             role_id = self.role2id.get(u.role, 0)
+            # UUID → int → 0‥999 999
+            uid_idx = u.int_id % 1_000_000
             tok = vec + self.role_embed.weight[role_id] \
-                      + self.id_embed.weight[u.id % 1_000_000]
+                      + self.id_embed.weight[uid_idx]
+
             toks.append(tok)
 
         tokens = torch.stack(toks, 0).unsqueeze(0).to(self.device)   # [1,N,D]
@@ -1240,7 +1248,14 @@ class CogGraph:
         batch = input_tensor             # (1, env_dim+goal_dim)
         env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]                    # (1, env_dim)
-        goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
+        # ---------- NEW: 把目标 one-hot 变成 2 个平面 ----------
+        res_map = self.target_vector[0].unsqueeze(0)  # (1, env²)  资源
+        hzd_map = self.target_vector[1].unsqueeze(0)  # (1, env²)  陷阱
+        goal_flat = torch.cat([res_map, hzd_map], dim=1)  # (1, 2·env²)
+
+        # 6 通道打包
+        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
+        # goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
 
         # === 动态目标向量 ===
         # 找到 agent 当前最近的资源点或陷阱点
@@ -1321,7 +1336,7 @@ class CogGraph:
         # === Curriculum Learning: 每500步扩展一次环境大小
         if self.current_step >= 1000 and self.current_step % 1000 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 35)  # 每次+5，最大到35x35
+            self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
             self.env.resize(self.env_size) # 重新生成环境
             self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -1346,7 +1361,7 @@ class CogGraph:
 
 
 
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 1000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
@@ -1505,7 +1520,7 @@ class CogGraph:
 
             if unit.get_role() == "sensor":
                 # 同样使用 dim=1 拼接，再加一个 batch 维度
-                unit_input = env_state
+                unit_input = full_state
 
             elif incoming:
                 weighted_outputs = []
@@ -1603,11 +1618,32 @@ class CogGraph:
             unit.update(unit_input)
 
             if unit.get_role() == "emitter":
+                # out = unit.get_output().squeeze(0) if unit.get_output().dim() == 2 else unit.get_output()
+                # vec = self._align_to_goal_dim(out)
+                # idx = torch.argmax(vec).item()
+                # x, y = idx % self.env_size, idx // self.env_size
+                # unit.output_positions.append((x, y))
+                # ① 把 emitter 输出对齐到 env² 一维向量
                 out = unit.get_output().squeeze(0) if unit.get_output().dim() == 2 else unit.get_output()
-                vec = self._align_to_goal_dim(out)
-                idx = torch.argmax(vec).item()
-                x, y = idx % self.env_size, idx // self.env_size
-                unit.output_positions.append((x, y))
+                pred = self._align_to_goal_dim(out)          # (env²,)
+
+                # ② 拆分目标向量：资源通道 / 陷阱通道
+                if unit.goal_vec.dim() == 2:                 # 新版 (2, env²)
+                    res_vec = unit.goal_vec[0]
+                    hz_vec  = unit.goal_vec[1]
+                else:                                        # 兼容旧一维
+                    res_vec = unit.goal_vec
+                    hz_vec  = torch.zeros_like(res_vec)
+
+                # ③ 距离 / whether hit
+                res_dist = float((pred - res_vec).pow(2).mean().sqrt())
+                is_res_hit  = res_dist < 1e-5
+                is_res_near = 1e-5 < res_dist <= 2.0
+
+                hz_dist = float((pred - hz_vec).pow(2).mean().sqrt())
+                is_hz_hit = hz_vec.sum() > 0 and hz_dist < 1e-5
+
+
 
             # ✅ 加强连接权重（使用次数越多越强）
             for uid in incoming:
@@ -1674,27 +1710,40 @@ class CogGraph:
                 pred    = self._align_to_goal_dim(out_vec)          # (env²,)
 
                 # ─── 资源距离判断 ───────────────────────────
-                goal_vec = unit.goal_vec.squeeze(0) if unit.goal_vec.dim() == 2 else unit.goal_vec
-                res_dist = float((pred - goal_vec).pow(2).mean().sqrt())  # GPU 上完成
-                is_res_hit  = res_dist < 1e-5          # 精准命中
-                is_res_near = 1e-5 < res_dist <= 2.0   # 近邻（≤2 格）
+                # goal_vec = unit.goal_vec.squeeze(0) if unit.goal_vec.dim() == 2 else unit.goal_vec
+                # res_dist = float((pred - goal_vec).pow(2).mean().sqrt())  # GPU 上完成
+                # ---------- 拆通道 ----------
+                if unit.goal_vec.dim() == 2:           # (2, env²)
+                    res_vec, hz_vec = unit.goal_vec
+                else:                                  # 旧一维
+                    res_vec = unit.goal_vec
+                    hz_vec  = torch.zeros_like(res_vec)
+
+                # 给旧变量留别名，后面少动代码
+                goal_vec = res_vec
+
+                # ---------- 资源距离 ----------
+                res_dist   = float((pred - res_vec).pow(2).mean().sqrt())
+                is_res_hit = res_dist < 1e-5
+                is_res_near= 1e-5 < res_dist <= 2.0
+
 
                 # 资源索引（0~env²-1）；若 goal_vec 全 0，返回 0 也无影响
-                cur_idx = torch.argmax(goal_vec).item()
+                cur_idx = torch.argmax(res_vec).item()
 
                 # ─── 陷阱距离判断 ───────────────────────────
                 hx, hy = getattr(unit, "current_hazard_xy", (None, None))
                 if hx is not None:
                     idx = hy * self.env_size + hx  # 平面索引
 
-                    if goal_vec.dim() == 2:
+                    if unit.goal_vec.dim() == 2:
                         # 目标是 (2, env²)：第 0 通道资源，第 1 通道陷阱
-                        hazard_vec = torch.zeros_like(goal_vec)  # (2, env²)
+                        hazard_vec = torch.zeros_like(unit.goal_vec)  # (2, env²)
                         hazard_vec[1, idx] = 1  # 写进陷阱通道
                         hazard_flat = hazard_vec[1]  # 取一维来比
                     else:
                         # 目标是一维 (env²,)
-                        hazard_vec = torch.zeros_like(goal_vec)  # (env²,)
+                        hazard_vec = torch.zeros_like(res_vec)  # (env²,)
                         hazard_vec[idx] = 1
                         hazard_flat = hazard_vec  # 直接用
 
@@ -1974,6 +2023,11 @@ class CogGraph:
 
             # —— 6. 更新 input_size ——
             unit.input_size = new_input_size
+
+            import gc, torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # 立即释放旧显存
 
     def summary(self):
         # # 打印当前图结构概况

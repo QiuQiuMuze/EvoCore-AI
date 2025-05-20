@@ -112,12 +112,13 @@ class CogUnit:
             random.randint(0, env_size - 1),
             random.randint(0, env_size - 1),
         )
-
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
         self.memory_pool_limit = 50
         self.role = role
-        self.id = uuid.uuid4()          # 唯一标识
+        self.uuid = uuid.uuid4()          # 唯一标识
+        self.id = self.uuid
+        self.int_id = self.uuid.int & 0xFFFFFFFF
         self.energy = 1.0               # 初始能量
         self.age = 0                    # 生存步数
         self.input_size = input_size
@@ -126,7 +127,7 @@ class CogUnit:
         # 认知状态向量
         self.state = torch.zeros(hidden_size)
         self.output_positions = deque(maxlen=10)
-
+        self.is_hazard_confirmed = False
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
         self.function = torch.nn.Sequential(
             torch.nn.Linear(input_size, hidden_size),

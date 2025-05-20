@@ -407,7 +407,7 @@ python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --devic
 """
 """
 # 纯 CPU，什么都不用装
-python train_self_driven.py --episodes 3 --max-steps 1000 --save-every 1 --device cpu  # RF.use_shared_tx=True 也能跑，走官方 nn.Transformer
+python train_self_driven.py --episodes 10 --max-steps 500 --save-every 2 --device cpu  # RF.use_shared_tx=True 也能跑，走官方 nn.Transformer
 
 # GPU + Flash-Attn / TE
 pip install flash-attn --no-build-isolation
