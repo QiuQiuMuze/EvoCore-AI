@@ -1,282 +1,248 @@
 **郭宗磊独立制作
 Independently created by Zonglei Guo**
 
-EvoCore 系统结构与模块功能总览
+# EvoCore 系统结构与模块功能总览
 
-项目简介：EvoCore = 可成长的 AI 胚胎体
+---
+
+## 项目简介：EvoCore = 可成长的 AI 胚胎体
 
 EvoCore 并非传统意义的 AI 模型，而是一个具备 **生命周期、结构演化、能量机制、自主学习与死亡重生** 能力的智能体。
 
-> 它像一颗 AI 胚胎，随着环境刺激、能量流动与学习反馈，不断**成长、分化、合并、死亡与重生**，是一种“活”的模型架构。
-
-核心组成如下：
+> 它像一颗 AI 胚胎，随着环境刺激、能量流动与学习反馈，不断 **成长、分化、合并、死亡与重生**，是一种 “活” 的模型架构。
 
 ---
 
-项目结构概览
+## 项目结构概览
 
-* `coggraph.py`：CogGraph 主控模块，负责细胞网络构建、连接、生命周期调度、能量调控、结构维护。
-* `CogUnit.py`：单个细胞 CogUnit 的行为逻辑，包括状态更新、能量代谢、分裂死亡、基因记忆等。
-* `env.py`：环境模块，定义了输入状态与奖励机制。
-* `transformer_policy.py`：轻量 Transformer 策略网络。
-* `rl_agent.py`：策略代理，负责使用 Transformer 进行强化学习。
-* `train_self_driven.py`：主训练入口。
-* `eval_policy.py`：策略评估脚本。
-* `utils.py`：辅助工具函数。
-
----
-
-CogUnit（细胞单元）结构与机制详解 \[`CogUnit.py`]
-
-核心特性
-
-* 拥有独立 `state`, `energy`, `age`, `gene`, `memory_pool`
-* 拥有自己的 `function` 网络：一个浅层 MLP，自主处理输入 → 输出
-* 每个 CogUnit 角色为：`sensor`, `processor`, `emitter`
-
-能量机制
-
-* 每步根据输入复杂度、连接强度、调用频率动态计算能量消耗
-* 若能量高于阈值 → 可分裂
-* 若能量为 0 或老化/退化 → 死亡
-* 能量税机制由 `coggraph.py` 控制（限制系统总能）
-
-分裂机制
-
-* 满足角色门槛（min\_energy + min\_calls）后，可执行 `clone()`
-* clone 时会融合局部记忆、基因变异（突变只允许 hidden\_size 上升）
-
-基因记忆系统
-
-* 每个 CogUnit 维护 local memory pool，记忆高质量输出片段
-* 复制时融合自身与记忆的基因 + 行为偏好（如 sensor\_bias）
-* 记忆可评分并逐步淘汰弱记忆
+| 文件                      | 作用简述                                       |
+| ----------------------- | ------------------------------------------ |
+| `coggraph.py`           | CogGraph 主控模块，管理细胞网络构建、连接、生命周期、能量调控与结构演化   |
+| `CogUnit.py`            | 单细胞 **CogUnit** 行为逻辑：状态更新、能量代谢、分裂/死亡、基因记忆等 |
+| `env.py`                | 环境模块：定义状态输入、资源/陷阱分布与奖励机制                   |
+| `transformer_policy.py` | 轻量级 Transformer 策略网络                       |
+| `rl_agent.py`           | 强化学习代理，调用 Transformer 作决策                  |
+| `train_self_driven.py`  | 主训练入口                                      |
+| `eval_policy.py`        | 策略评估脚本                                     |
+| `utils.py`              | 辅助工具函数                                     |
+| `config_runtime.py`     | 运行期可调参数（如共享 Transformer、FP16、编译模式等）        |
 
 ---
 
-CogGraph（细胞图谱）主控逻辑 \[`coggraph.py`]
+##  新版本重要变更一览
 
-生命周期调度
+1. **目标向量二通道化**
 
-* 每步调用 `step()`，更新所有单元状态，触发生长、连接、剪枝、死亡等
-* 模拟生命周期阶段（从 0 开始，每步推进）
+   * `TaskInjector.encode_goal()` 现返回 **`(2, env²)`** 的 one‑hot：<br>  `vec[0]` = 资源层，`vec[1]` = 陷阱层。
+   * `INPUT_CHANNELS = 4 (state) + 2 (goal) = 6`，全链路已对齐。
+   * `coggraph.step()` 顶部旧的 `goal_tensor = ...` 已删除，避免混淆。
+2. **共享 Transformer 头数自适应**
 
-能量调控
+   * 通过 `math.gcd(embed_dim, RF.shared_tx_heads)` 计算可整除的 **最大公因数** 作为实际多头数。
+   * 若请求的头数无法整除，则自动降到满足整除的最接近值，并给出 warning。
+   * 默认在 6 通道 \* env² 的 embed\_dim 下，往往得到 **2 头** —— 不是硬编码，而是 GCD 恰好为 2。
+3. **环境扩容内存占用说明**
 
-* 系统总能量上限控制（如 250）
-* 超过时触发累进能量税，或转移至 energy\_pool 储存池
-* energy\_pool 可反哺低能细胞（救活机制）
-
-成长机制
-
-* 定期触发 `rebalance_cell_types()`：根据比例 1:2:1 自动调节 sensor/processor/emitter 数量
-* 自动连接 + 随机突变连接 + 死连接剪除
-* 超能细胞强制分裂，新增结构
-
-结构演化
-
-* 相似单元 merge：`merge_redundant_units()`
-* 相似子图重构：`restructure_common_subgraphs()` → processor + emitter 成为复合单元
-* 子系统发现：自动识别高密度子图 → 标记 subsystem\_id
-
-死亡机制
-
-* 低能 / 长寿 / 输出退化 → `should_die()` 被移除
-* 死亡可触发能量分配 + 遗传信息留存
-
-重启机制（文档规划中）
-
-* 若系统陷入崩溃、模块频死、能量失控 → 模拟“死亡 + 重启”阶段
-* 通过保存“摘要记忆”实现重生后的快速恢复
+   * 每 1000 步触发一次 curriculum：`env_size += 5`，同时 **input\_size = env² × 6** 线性暴涨。
+   * 为保持“细胞不降维”，`upscale_old_units()` 会 **复制旧权重并 zero‑pad 新维度**，导致显存/内存瞬时增加。
+   * 可通过调小 `max_total_energy` 或延长扩容间隔来减缓内存高峰。
 
 ---
 
-学习机制：策略学习 & 自我优化
+## CogUnit（细胞单元）结构与机制详解  \[`CogUnit.py`]
 
-`transformer_policy.py`
+### 核心特性
 
-* 使用 TransformerEncoder + 可学习位置编码
-* 输入为多个 CogUnit 的状态序列（如 processor 输出）
-* 输出为 logits（分类动作为上下左右等）
+* 独立持有 `state`, `energy`, `age`, `gene`, `memory_pool`
+* 内置浅层 **MLP** (`Linear → ReLU → Linear`) 处理输入→输出，输入维度随环境自动升维
+* 角色固定三类：`sensor` / `processor` / `emitter`
 
-`rl_agent.py`
+### 能量机制
 
-* 使用 `REINFORCE + baseline` 策略
-* 包含：策略网络 + 值函数（value head）
-* 每步缓存状态、动作 log\_prob、reward → episode 结束后优化策略
+* 动态消耗：输入方差 + 连接强度 + 调用密度 叠加加权
+* 能量 > 阈值 ⇒ 允许 **split()** 复制
+  能量 ≤0 或老化/退化 ⇒ **die()** 移除
+* 系统层面的 **累进能量税** 限制总规模，超额能量转入 `energy_pool`
 
----
+### 分裂 & 基因记忆
 
-训练与评估流程
-
-训练入口 \[`train_self_driven.py`]
-
-* 初始化 `CogGraph`、环境、agent
-* 每步运行：env → graph.step() → agent.select\_action()
-* 每集结束后执行策略梯度更新 `agent.finish_episode()`
-
-评估入口 \[`eval_policy.py`]
-
-* 加载已训练模型 checkpoint
-* 运行指定 episode 数量，评估平均 reward
+* 满足 `min_energy`+`min_calls` 条件方可克隆
+* 克隆时混合 local memory，`hidden_size` 仅允许 **增加**（演化方向单向向上）
+* 记忆池存储高分片段，低分逐渐淘汰；克隆时可注入 `*_bias` 基因
 
 ---
 
-系统核心理念回顾
+## CogGraph（细胞图谱）主控逻辑  \[`coggraph.py`]
 
-EvoCore 架构目标是：
+### 生命周期调度
 
-1. 不再使用“静态网络”，而是从原始细胞自动发育结构
-2. 使用能量系统调控行为活跃性与系统规模
-3. 具备复制、变异、死亡、遗传等“生命式演化机制”
-4. 学习方式可进化（结合强化学习、遗传融合、自我反馈）
-5. 长期目标是形成结构可塑性 + 功能多样性的智能体
+* 每步 `step()`：更新全部单元 → 分裂/死亡/连接/剪枝 等
+* 环境扩容（curriculum）与共享 Transformer 调度均在此统一
 
-最终将朝着：环境驱动、自主成长、结构演化、强化学习融合的“AI 胚胎体方向发展。
+### 能量调控
 
+* `max_total_energy` 设置系统能量天花板
+* 超标 ⇒ 累进税 或 转移至 `energy_pool`，后者可喂养弱细胞
 
+### 成长 & 结构演化
 
+* `rebalance_cell_types()` 保持 **1 : 2 : 1** (sensor\:processor\:emitter)
+* `auto_connect()` + 随机突变 + 死连接剪除 = 连边自组织
+* `merge_redundant_units()` 合并同质单元；`restructure_common_subgraphs()` 重构高相似子图
+* 发现 **子系统**：局部高密度区域自动打上 `subsystem_id`
 
-**Project Introduction: EvoCore = A Growing AI Embryo**
-EvoCore is not a traditional AI model. It is an intelligent agent with life cycle, structural evolution, energy regulation, self-learning, and death-rebirth ability.
+### 死亡 & 遗产
 
-It works like an AI embryo. With environmental inputs, energy flow, and learning feedback, it keeps growing, differentiating, merging, dying, and rebirthing. It is a “living” model architecture.
+* `should_die()` 评估低能 / 老化 / 输出退化
+* “寿终”细胞能量按角色分给年轻同类；优秀输出写入他人记忆池
 
-**Project Structure Overview**
-coggraph.py: Main controller of CogGraph, managing unit network structure, connections, lifecycle scheduling, energy control, and structural evolution.
+---
 
-CogUnit.py: Behavior logic of single cell unit, including state update, energy metabolism, splitting, death, genetic memory, etc.
+## 学习机制：策略学习 & 自我优化
 
-env.py: Environment module, defines state input and reward mechanism.
+### `transformer_policy.py`
 
-transformer_policy.py: Lightweight Transformer-based policy network.
+* **TransformerEncoder + 可学习 PE**
+* 输入：选定若干 CogUnit 的状态序列（默认所有 processor 输出）
+* 输出：动作 logits（上下左右）
 
-rl_agent.py: Reinforcement learning agent that uses Transformer for decision-making.
+### `rl_agent.py`
 
-train_self_driven.py: Main training script.
+* **REINFORCE + baseline**
+* 缓存 (state, log\_prob, reward)，episode 结束后统一更新
 
-eval_policy.py: Evaluation script for policy.
+---
 
-utils.py: Helper functions.
+## 训练与评估
 
-**CogUnit (Cell Unit) Design & Mechanisms** [CogUnit.py]
-Core Features
+### 训练入口  \[`train_self_driven.py`]
 
-Each unit has its own state, energy, age, gene, and memory_pool.
+1. 初始化 `CogGraph` / `GridEnvironment` / `RLAgent`
+2. `env.step()` → `graph.step()` → `agent.select_action()`
+3. Episode 结束 → `agent.finish_episode()` 做策略梯度
 
-Contains its own shallow MLP as function network to process input → output.
+### 评估入口  \[`eval_policy.py`]
 
-Roles: sensor, processor, emitter.
+* 加载 checkpoint，跑若干 episode，输出平均 reward
 
-Energy System
+---
 
-Each step, energy is consumed based on input complexity, connection strength, and call frequency.
+## 系统核心理念回顾
 
-If energy > threshold → can split().
+1. **自生长**：不依赖预定义架构，细胞自组织出拓扑
+2. **能量驱动**：用能量守恒调节活跃度与规模
+3. **生命式演化**：复制 × 变异 × 死亡 × 遗传
+4. **多重学习**：强化学习 + 记忆融合 + 元反馈
+5. **可塑结构**：长期目标是功能多样且可持续重构的智能体
 
-If energy = 0 or aging → die().
+最终愿景：在真实或模拟环境中，EvoCore 将像胚胎一样，
 
-Energy tax is managed by coggraph.py (to control total system energy).
+> **被环境驱动 → 自主成长 → 结构演化 → 不断学习**，
+> 成为真正的 **Self‑Developing AI Embryo**。
 
-Splitting Mechanism
+---
 
-If unit meets energy and usage thresholds → it can clone().
+# EvoCore — System Overview & Module Guide
 
-During cloning, it mixes local memory and mutates its gene (only allows increase in hidden size).
+*(English section keeps the original “lively” tone while mirroring the Chinese content)*
 
-Genetic Memory System
+## What is EvoCore? — A Growing **AI Embryo**
 
-Each unit keeps a local memory pool, saving high-quality output fragments.
+EvoCore is **not** a frozen neural net.
+It is an *organism‑like* agent equipped with **life‑cycle, structural evolution, energy economy, self‑learning and death‑rebirth**.
 
-When cloning, it combines self-gene with memory preference (e.g., sensor_bias).
+> Think of it as an AI embryo: fed by environmental signals and energy flow, it keeps **growing, splitting, merging, dying, reviving**. The architecture lives and breathes.
 
-Low-score memories will be removed gradually.
+---
 
-**CogGraph (Main Graph Logic)** [coggraph.py]
-Lifecycle Scheduling
+## Repo Layout
 
-Each step calls step(), updating all units, triggering growth, connection, pruning, or death.
+| File                    | Brief Description                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `coggraph.py`           | Top‑level **CogGraph** controller: builds the cell graph, manages connections, life‑cycle, energy & evolution |
+| `CogUnit.py`            | Single‑cell logic: state update, metabolism, split/death, genetic memory                                      |
+| `env.py`                | Grid environment with *resources* & *hazards*                                                                 |
+| `transformer_policy.py` | Lightweight Transformer policy network                                                                        |
+| `rl_agent.py`           | RL agent wrapping the Transformer                                                                             |
+| `train_self_driven.py`  | Main training entry                                                                                           |
+| `eval_policy.py`        | Policy evaluation script                                                                                      |
+| `utils.py`              | Helper utilities                                                                                              |
+| `config_runtime.py`     | Runtime switches (shared‑Tx, fp16, compile, etc.)                                                             |
 
-Simulates a living system step by step.
+---
 
-Energy Regulation
+##  What’s New
 
-Total energy of the system has an upper limit (e.g., 250).
+1. **Two‑Channel Goal Map**
 
-If over limit → apply progressive energy tax or move excess to energy_pool.
+   * `TaskInjector.encode_goal()` now returns **`(2, env²)` one‑hot**: channel‑0 resource, channel‑1 hazard.
+   * `INPUT_CHANNELS = 4 (state) + 2 (goal) = 6` everywhere.
+   * Legacy `goal_tensor` var in `coggraph.step()` is gone.
+2. **Head‑count Auto‑Tuning** for shared Transformer
 
-energy_pool can feed low-energy units (like rescue).
+   * We pick the **greatest common divisor** between embed\_dim and the requested `RF.shared_tx_heads`.
+   * If not divisible, we gracefully downgrade (with a warning).
+   * With 6·env² dims the gcd often equals **2**, hence the observed "2 heads" — it is *data‑driven*, not hard‑coded.
+3. **Memory Spikes on Curriculum Expansions**
 
-Growth System
+   * Every 1000 steps the grid grows (+5), thus **input\_size = env² × 6** inflates quadratically.
+   * `upscale_old_units()` keeps all historic params via zero‑padding → sudden RAM/GPU peaks.
+   * Mitigate by lowering `max_total_energy` or stretching the expansion interval.
 
-Runs rebalance_cell_types() regularly to adjust sensor:processor:emitter ratio to 1:2:1.
+---
 
-Auto-connect + random mutate + prune dead connections.
+## CogUnit — Anatomy & Mechanics
 
-Over-energy units must split and add new structure.
+* Private `state`, `energy`, `age`, `gene`, `memory_pool`
+* Personal MLP (*Linear‑ReLU‑Linear*), auto‑resized when env grows
+* Roles: **sensor / processor / emitter**
 
-Structural Evolution
+### Energy
 
-Similar units will be merged by merge_redundant_units().
+* Consumption = f(input variance, connection strength, call density)
+* `energy > thresh` ⇒ **split()**; `energy ≤ 0` or senescence ⇒ **die()**
+* Progressive tax & `energy_pool` governed by CogGraph
 
-Similar subgraphs reconstructed by restructure_common_subgraphs() → processor + emitter become composite units.
+### Split & Genes
 
-High-density subgraph will be marked as subsystem_id.
+* Need both energy & call quotas → `clone()`
+* Clone mixes local memory, mutates gene, allows *only* larger hidden\_size
+* Memory pool keeps high‑score chunks, bad ones decay
 
-Death Mechanism
+---
 
-Low energy / old age / weak output → should_die() → remove the unit.
+## CogGraph — The Big Orchestrator
 
-Death can trigger energy redistribution and genetic memory saving.
+* Central `step()` drives life‑cycle, curriculum, shared‑Tx
+* Energy cap via `max_total_energy` + tax + pool
+* `rebalance_cell_types()` → keeps **1:2:1** ratio
+* Auto‑connect, mutate, prune dead links
+* Merge redundant units; rebuild common sub‑graphs; detect *subsystems*
+* Heritage: dying elders donate energy & memory
 
-Reboot Mechanism (Planned)
+---
 
-If system crashes, frequent deaths, or energy chaos → enter "death + restart" phase.
+## Learning Pipeline
 
-Will save abstract memory for fast recovery after reboot.
+* **TransformerEncoder + learnable PE** (`transformer_policy.py`)
+* RL agent: **REINFORCE w/ baseline** (`rl_agent.py`)
+* Stores (state, log\_prob, reward) per step → updates after each episode
 
-**Learning Mechanism: Strategy Learning & Self-Optimization**
-[transformer_policy.py]
+---
 
-Uses TransformerEncoder with learnable positional encoding.
+## Train & Eval
 
-Input is a sequence of CogUnit states (e.g., processor outputs).
+* **Train**: see `train_self_driven.py` (env → graph → action loop, then optimize)
+* **Eval**: run `eval_policy.py` with saved checkpoints
 
-Output is action logits (e.g., move up/down/left/right).
+---
 
-[rl_agent.py]
+## Core Vision
 
-Uses REINFORCE with baseline method.
+1. From *static* nets to **self‑grown** structures
+2. Energy as the *budget* throttling size & activity
+3. Life‑like evolution: clone × mutate × die × inherit
+4. Fusion of RL, memory, meta‑feedback
+5. Towards structural plasticity & functional diversity
 
-Includes policy network + value function (value head).
-
-Caches state, action log_prob, reward at each step → update policy after each episode.
-
-**Training & Evaluation Flow**
-Training Entry [train_self_driven.py]
-
-Initializes CogGraph, environment, and agent.
-
-Each step: environment → graph.step() → agent.select_action().
-
-After each episode → policy is updated with agent.finish_episode().
-
-**Evaluation Entry** [eval_policy.py]
-
-Loads saved model checkpoint.
-
-Runs specified number of episodes and calculates average reward.
-
-**The goals of EvoCore architecture:**
-
-Replace static networks with self-growing structures from original cells.
-
-Use energy to control activity and system size.
-
-Include life-like mechanisms: clone, mutate, die, inherit.
-
-Support evolutionary learning: reinforcement + memory + feedback.
-
-Long-term goal is to create intelligent agents with structural plasticity and functional diversity.
-
-The final direction is to become a truly self-developing AI embryo — driven by environment, growing its structure, evolving, and learning continuously.
+> The grand goal: an **environment‑driven, self‑developing AI embryo** that never stops evolving.
