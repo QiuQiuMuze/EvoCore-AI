@@ -12,14 +12,28 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     # ——— 0) 加载 checkpoint，推断训练时的输入维 (input_dim) 和 Transformer 隐藏维 (d_model) ———
     checkpoint = torch.load(ckpt_path, map_location=device)
     saved_input_dim = checkpoint["policy_state_dict"]["input_proj.weight"].shape[1]
-    saved_d_model = checkpoint["policy_state_dict"]["input_proj.weight"].shape[0]
+    saved_d_model   = checkpoint["policy_state_dict"]["input_proj.weight"].shape[0]
 
-    # ——— 1) 推断训练时的环境 size（env_size），重建环境 & 重写 graph 的尺寸参数 ———
+    # ——— 1) 兼容旧 ckpt：自动枚举 env_size / channels ———
     from coggraph import INPUT_CHANNELS, TaskInjector
-    saved_env_size = int((saved_input_dim / INPUT_CHANNELS) ** 0.5)
-    assert saved_env_size * saved_env_size * INPUT_CHANNELS == saved_input_dim, (
-        f"Cannot infer env_size from input_dim={saved_input_dim}"
-    )
+
+    def infer_env_size_and_channels(inp_dim: int, max_size: int = 40):
+        """返回 (env_size, channels)；贪心选离 sqrt(inp_dim/6) 最近的合法值"""
+        cands = [(s, inp_dim // (s * s))
+                 for s in range(4, max_size + 1)
+                 if inp_dim % (s * s) == 0]          # env_size² 能整除
+        if not cands:
+            raise ValueError(f"❌ 无法分解 input_dim={inp_dim}")
+        # 选一个最接近理论值的 env_size
+        ideal = (inp_dim / INPUT_CHANNELS) ** 0.5
+        env_size, channels = min(cands, key=lambda p: abs(p[0] - ideal))
+        return env_size, channels
+
+    saved_env_size, ckpt_channels = infer_env_size_and_channels(saved_input_dim)
+    if ckpt_channels != INPUT_CHANNELS:
+        print(f"⚠️  ckpt 使用 {ckpt_channels}-channel 输入，当前代码定义为 {INPUT_CHANNELS}；"
+              f"eval 时将自动在 state 向量尾部 pad 0 以补足/截断。")
+
     env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
 
     if seed is not None and hasattr(env, "seed"):
@@ -49,7 +63,7 @@ def evaluate(ckpt_path: str, episodes: int = 100, max_steps: int = 256, device: 
     graph.env = GridEnvironment(size=saved_env_size, max_steps=max_steps)
     # graph.task = TaskInjector(target_position=(saved_env_size - 1, saved_env_size - 1))
     # graph.target_vector = graph.task.encode_goal(saved_env_size)
-    graph.upscale_old_units(saved_input_dim)
+    # graph.upscale_old_units(saved_input_dim)
 
     graph.debug = True
 

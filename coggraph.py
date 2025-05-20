@@ -532,6 +532,12 @@ class CogGraph:
         """
         dev = self.device  # ← 统一目标设备
         x = torch.as_tensor(env_state_np, dtype=torch.float32, device=dev).view(-1)
+
+        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
+        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "sensor"):
+            for s in (u for u in self.units if u.role == "sensor"):
+                if s.input_size < self.processor_hidden_size:  # 只升不降
+                    self.expand_unit_dim(s, self.processor_hidden_size)
         # —— 对齐到 processor_hidden_size ——
         D = x.numel()
         if D < self.processor_hidden_size:
@@ -592,6 +598,12 @@ class CogGraph:
         dev = self.device
         sensor_out = sensor_out.to(dev)                   # (1,D)
 
+        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
+        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "processor"):
+            for s in (u for u in self.units if u.role == "processor"):
+                if s.input_size < self.processor_hidden_size:  # 只升不降
+                    self.expand_unit_dim(s, self.processor_hidden_size)
+
         procs = [u for u in self.units if u.role == "processor"]
         if not procs:
             return sensor_out
@@ -647,6 +659,11 @@ class CogGraph:
         if not emitters:
             return
 
+        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
+        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "emitter"):
+            for s in (u for u in self.units if u.role == "emitter"):
+                if s.input_size < self.processor_hidden_size:  # 只升不降
+                    self.expand_unit_dim(s, self.processor_hidden_size)
         D = processor_out.size(-1)
         if RF.batch_emitter:
             batch_in = processor_out.to(dev).expand(len(emitters), -1)  # [N,D]
@@ -1338,7 +1355,7 @@ class CogGraph:
             old_size = self.env_size
             self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
             self.env.resize(self.env_size) # 重新生成环境
-            self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
+            # self.upscale_old_units(self.env_size * self.env_size * INPUT_CHANNELS)
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
             self.rl_agent.resize_state_dim(self.processor_hidden_size)
             # —— processor_hidden_size 变了，若用共享 Tx 就重建 —— #
@@ -1488,8 +1505,12 @@ class CogGraph:
         # === 第一阶段：单元更新处理 ===
         # 统计当前 emitter 数量
         emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
-
+        expected_input = self.env_size * self.env_size * INPUT_CHANNELS
         for unit in self.units[:]:
+            # 如果旧单元输入维度不足，本轮先懒升维
+            if unit.input_size < expected_input:
+                self.expand_unit_dim(unit, expected_input)
+
             # ---------- 新增【私有目标拷贝】----------
             if unit.get_role() == "emitter":
                 # ① 给每个 emitter 一份**可写**的 goal_vec
@@ -1957,6 +1978,61 @@ class CogGraph:
                     logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
+    def expand_unit_dim(self, unit: CogUnit, new_input_size: int):
+        """仅将 *一个* unit 升维到 new_input_size（只升不降）"""
+        import torch, gc
+        if unit.input_size >= new_input_size:
+            return  # 安全回退
+
+        logger.info(f"[懒升维] {unit.id}: {unit.input_size} → {new_input_size}")
+
+        # === 以下逻辑直接复制自旧 upscale_old_units，注意把 `unit` 循环去掉 ===
+        old_out = unit.last_output
+        if old_out.dim() == 2 and old_out.shape[0] == 1:
+            old_out = old_out.squeeze(0)
+        new_out = torch.zeros(new_input_size, device=old_out.device)
+        new_out[: old_out.shape[0]] = old_out
+        unit.last_output = new_out
+
+        new_history = []
+        for out in unit.output_history:
+            v = out.squeeze(0) if out.dim() == 2 else out
+            p = torch.zeros(new_input_size, device=v.device)
+            p[: v.shape[0]] = v
+            new_history.append(p.unsqueeze(0))
+        unit.output_history = new_history
+
+        old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
+        new_state = torch.zeros(new_input_size, device=old_state.device)
+        new_state[: old_state.shape[0]] = old_state
+        unit.state = new_state
+
+        new_mem = []
+        for mem in unit.state_memory:
+            p = torch.zeros(new_input_size, device=mem.device)
+            p[: mem.shape[-1]] = mem
+            new_mem.append(p)
+        unit.state_memory = new_mem
+
+        old_l1, old_l2 = unit.function[0], unit.function[2]
+        w1, b1 = old_l1.weight.data.clone(), old_l1.bias.data.clone()
+        w2, b2 = old_l2.weight.data.clone(), old_l2.bias.data.clone()
+
+        h = unit.hidden_size
+        new_l1 = torch.nn.Linear(new_input_size, h, device=w1.device)
+        new_l2 = torch.nn.Linear(h, new_input_size, device=w1.device)
+        new_func = torch.nn.Sequential(new_l1, torch.nn.ReLU(), new_l2)
+        with torch.no_grad():
+            new_l1.weight[:, : w1.shape[1]].copy_(w1)
+            new_l1.bias.copy_(b1)
+            new_l2.weight[: w2.shape[0], : w2.shape[1]].copy_(w2)
+            new_l2.bias[: b2.shape[0]].copy_(b2)
+        unit.function = new_func
+        unit.input_size = new_input_size
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def upscale_old_units(self, new_input_size):
         """将所有 input_size < new_input_size 的单元升维（只升不降）。"""
