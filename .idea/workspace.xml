@@ -11,6 +11,7 @@
       <change beforePath="$PROJECT_DIR$/checkpoints/agent_h0.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h0.pth" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/checkpoints/agent_h2.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h2.pth" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/checkpoints/agent_h4.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h4.pth" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h6.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h6.pth" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -166,7 +167,7 @@
       <workItem from="1747691517740" duration="3365000" />
       <workItem from="1747695955401" duration="19803000" />
       <workItem from="1747716784767" duration="4822000" />
-      <workItem from="1747723806211" duration="23789000" />
+      <workItem from="1747723806211" duration="24095000" />
     </task>
     <servers />
   </component>
