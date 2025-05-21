@@ -8,6 +8,8 @@ import torch.nn as nn
 from config_runtime import RF            # ★ 新增
 from contextlib import nullcontext       # ★ autocast fallback
 from meta_cognition import MetaCognition
+from memory_unit import MemoryBuffer
+
 
 
 # ======== CogUnit 全局功能开关 ========
@@ -162,6 +164,8 @@ class CogUnit:
         self.last_rewarded_target_idx = None   # 上一次领奖的资源索引
         self.linger_steps             = 0      # 在同一目标附近逗留的帧数
         self.latest_base_reward       = 0.0    # 上一次靠近时发的 base 奖励，用来扣回
+
+        self.memory_buffer = MemoryBuffer(maxlen=200)
 
 
 
@@ -900,6 +904,23 @@ class CogUnit:
                         clone_unit.gene["hidden_size_tag"] = new_hidden
                         logger.debug(f"[网络融合] hidden_size 融合为 {new_hidden}")
         return clone_unit
+
+    def record_memory(self, state: torch.Tensor, action, reward: float, outcome: str):
+        """
+        外部在每步做完 reward 计算后调用：
+        state: 当时传入 update() 的输入张量（含 env+goal）
+        action: 本轮 emitter/processor 选的动作标识
+        reward: 本轮环境＋自我评价总 reward
+        outcome: 'success' or 'fail' or 自定义标签
+        """
+        self.memory_buffer.add(state, action, reward, outcome)
+
+    def recall(self, query_state: torch.Tensor, k: int = 5, metric: str = 'cosine'):
+        """
+        查历史经验，返回字典列表：
+        [{'state':…, 'action':…, 'reward':…, 'outcome':…}, …]
+        """
+        return self.memory_buffer.recall(query_state, k, metric)
 
     def get_role(self):
         return self.role

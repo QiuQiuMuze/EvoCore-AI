@@ -64,7 +64,7 @@ from self_model import build_self_model
 
 
 
-HIT_THRESH = 0.2          # 越大越宽松
+HIT_THRESH = 0.15          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
 N_GOAL_CHANNELS = 3
@@ -1315,7 +1315,15 @@ class CogGraph:
 
         # 6 通道打包
         full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
-        # goal_tensor= batch[:, env_dim:]                   # (1, goal_dim)
+        # ─── 新增：长期记忆准备 ───
+        # 1) 把 state snapshot 存下来（去掉 batch 维）
+        state_snapshot = full_state.clone().squeeze(0).detach()
+        # 2) 记录下此刻每个 unit 的能量，用来算 reward
+        prev_energies = {u.id: u.energy for u in self.units}
+
+
+            # —— 否则，下面才是真正的更新逻辑 unit.update(...)
+            # … 你现有的 update 代码 …
 
         # === 动态目标向量 ===
         # 找到 agent 当前最近的资源点或陷阱点
@@ -1420,8 +1428,9 @@ class CogGraph:
             self._target_buf = self._target_buf.new_zeros(
                 (2, self.env_size * self.env_size)
             )
-
-
+            # 扩容逻辑的最后加上：
+            for u in self.units:
+                u.memory_buffer.clear()
 
         if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
             old_max = self.max_total_energy
@@ -1729,6 +1738,23 @@ class CogGraph:
             logger.debug("[代谢] %s var=%.3f conn_sum=%.2f",unit.id, var, conn_strength_sum)
             unit.current_step = self.current_step
             # unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
+                # 先用长期记忆 override
+            try:
+                recs = unit.recall(state_snapshot, k=5, metric='cosine')
+            except RuntimeError:
+                recs = []
+
+            if recs:
+                rewards = [r['reward'] for r in recs]
+                top_reward = rewards[0]
+                avg_reward = sum(rewards) / len(rewards)
+                if top_reward > avg_reward + 1:  # 比平均高一点才算“有价值”
+                    unit.last_output = recs[0]['action'].to(self.device).clone()
+
+                # 替换输入前的初始 guess（可视作 bias 提示）
+                unit.last_output = recs[0]['action'].to(self.device).clone()
+
+            # 总是执行 update，确保状态/能量/奖励/探索仍运行
             unit.update(unit_input)
 
             if unit.get_role() == "emitter":
@@ -1961,7 +1987,7 @@ class CogGraph:
                         # （可选）给 processor 分奖励
                         for p in upstream_processors:
                             p.energy += 0.125
-                            p.meta.record(action="cur_idx", reward=+0.2)
+                            p.meta.record(action="cur_idx", reward=+0.125)
 
                     # 记录领奖状态
                     unit.last_rewarded_target_idx = cur_idx
@@ -2158,6 +2184,18 @@ class CogGraph:
                         target_role=unit.get_role(),
                         reason="low_success_rate"
                     )
+
+        # ─── 新增：统一做一次长期记忆记录 ───
+        if self.current_step % 20 == 0 and self.current_step >= 500:
+            for u in self.units:
+                # 计算 reward = 这一轮能量增减
+                reward = u.energy - prev_energies.get(u.id, 0.0)
+                # 把 last_output 当作“action”存下来
+                action = u.last_output.clone().detach() if hasattr(u, "last_output") else None
+                # 简单按照增减判断 outcome
+                outcome = "success" if reward > 0 else "fail"
+                u.record_memory(state_snapshot, action, reward, outcome)
+
 
 
     # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
