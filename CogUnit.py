@@ -75,7 +75,7 @@ def _get_hi(table, total):
 ROLE_SPLIT_RULE = {
     "sensor":    {"min_e": 1.2, "min_calls": 0},   # 轻量，几乎不限制调用频率
     "processor": {"min_e": 1.2, "min_calls": 1},   # 中等
-    "emitter":   {"min_e": 1.2, "min_calls": 1},   # 最重，门槛最高
+    "emitter":   {"min_e": 1.2, "min_calls": 0},   # 最重，门槛最高
 }
 # ----------------------------------------------------
 
@@ -132,7 +132,14 @@ class CogUnit:
         self.is_hazard_confirmed = False
         # 元认知记录器
         self.meta = MetaCognition(history_len=100)
+        # —— 新增 Intrinsic Goal 支持 ——
+        self.personal_goal = None            # 当前内在目标 (x,y)
+        self.visit_counts = {}               # {(x,y): 次数}
+        self.intrinsic_reward = 0.5         # 达到内在目标奖励能量
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
+        self.intrinsic_cooldown = 200  # 冷却步数
+        self._last_intrinsic_step = -float("inf")
+
         self.function = torch.nn.Sequential(
             torch.nn.Linear(input_size, hidden_size),
             torch.nn.ReLU(),

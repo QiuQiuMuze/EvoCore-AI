@@ -21,6 +21,10 @@ try:                                     # Flash-Attn / TE 优先
 except ImportError:
     HAS_TE = False
 import math
+from goal_generator import sample_unvisited, make_onehot
+from collections import Counter
+
+
 
 
 
@@ -63,7 +67,7 @@ import math
 HIT_THRESH = 0.2          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
-N_GOAL_CHANNELS = 2
+N_GOAL_CHANNELS = 3
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
 
@@ -153,6 +157,23 @@ class CogGraph:
         # 3) 加入图
         for u in sensors + processors + emitters:
             self.add_unit(u)
+
+        # --- 初始化内在目标状态 ---
+        # 保证初始 personal_goal 在不同 emitter 之间不重复
+        taken = set()
+        for e in emitters:
+            e.visit_counts = Counter()
+            # 循环采样，直到拿到一个还没被占用的点
+            while True:
+                cand = sample_unvisited(self.env_size, e.visit_counts)
+                if cand not in taken:
+                    break
+            e.personal_goal = cand
+            e.visit_counts[cand] = 0
+            taken.add(cand)
+
+            e.intrinsic_cooldown = 100  # 冷却 100 步
+            e._last_intrinsic_step = -1e9  # 初始化为极早之前
 
         # 4) 连接：sensor → processor → emitter
         for s in sensors:
@@ -1451,58 +1472,60 @@ class CogGraph:
                 for u in self.units
                 if len(u.local_memory_pool) >= 1
             ]
-            score_threshold = np.percentile(all_scores, 90)
+            # ← 在这里加一个空列表检查
+            if all_scores:
+                score_threshold = np.percentile(all_scores, 90)
 
-            candidates = []
-            for u in self.units:
-                # 条件1：至少5次记忆
-                if len(u.local_memory_pool) < 5:
-                    continue
-                last_score = u.local_memory_pool[-1]["score"]
-                # 条件2：高分门槛
-                if last_score < score_threshold:
-                    continue
-
-                # 条件4：输出质量 role-specific
-                # 先从 local_memory_pool 最近几条里重算 quality
-                hist = [m["output"].view(-1) for m in u.local_memory_pool[-5:]]
-                # 对齐
-                max_len = max(t.numel() for t in hist)
-                aligned = [t if t.numel() == max_len else torch.nn.functional.pad(t, (0, max_len - t.numel())) for t in
-                           hist]
-                diffs = [(aligned[i] - aligned[i + 1]).norm().item() for i in range(len(aligned) - 1)]
-                if u.role == "sensor":
-                    variation = torch.var(torch.stack(aligned), dim=0).mean().item()
-                    if variation < 0.05:
+                candidates = []
+                for u in self.units:
+                    # 条件1：至少5次记忆
+                    if len(u.local_memory_pool) < 5:
+                        continue
+                    last_score = u.local_memory_pool[-1]["score"]
+                    # 条件2：高分门槛
+                    if last_score < score_threshold:
                         continue
 
-                elif u.role == "processor":
-                    diversity = sum(diffs) / len(diffs)
-                    if diversity < 0.1 and getattr(u, "avg_recent_calls", 0) < 2.0:
-                        continue
+                    # 条件4：输出质量 role-specific
+                    # 先从 local_memory_pool 最近几条里重算 quality
+                    hist = [m["output"].view(-1) for m in u.local_memory_pool[-5:]]
+                    # 对齐
+                    max_len = max(t.numel() for t in hist)
+                    aligned = [t if t.numel() == max_len else torch.nn.functional.pad(t, (0, max_len - t.numel())) for t in
+                               hist]
+                    diffs = [(aligned[i] - aligned[i + 1]).norm().item() for i in range(len(aligned) - 1)]
+                    if u.role == "sensor":
+                        variation = torch.var(torch.stack(aligned), dim=0).mean().item()
+                        if variation < 0.05:
+                            continue
+
+                    elif u.role == "processor":
+                        diversity = sum(diffs) / len(diffs)
+                        if diversity < 0.1 and getattr(u, "avg_recent_calls", 0) < 2.0:
+                            continue
 
 
-                elif u.role == "emitter":
-                    avg_diff = sum(diffs) / len(diffs)
-                    stability = 1.0 if 0.01 < avg_diff < 0.5 else 0.0
-                    if stability < 1.0 and getattr(u, "avg_recent_calls", 0) < 2.0:
-                        continue
+                    elif u.role == "emitter":
+                        avg_diff = sum(diffs) / len(diffs)
+                        stability = 1.0 if 0.01 < avg_diff < 0.5 else 0.0
+                        if stability < 1.0 and getattr(u, "avg_recent_calls", 0) < 2.0:
+                            continue
 
-                # 全部通过，加入候选
-                candidates.append((u, last_score))
+                    # 全部通过，加入候选
+                    candidates.append((u, last_score))
 
-            # 按分数降序选 top K
-            elites = [u for u, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:max_elites]]
+                # 按分数降序选 top K
+                elites = [u for u, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:max_elites]]
 
-            # 重置旧标记 & 标新精英
-            for u in self.units:
-                u.is_elite = False
-            # 标记新精英 & 重置年龄
-            for u in elites:
-                u.is_elite = True
-                u.age = 0  # ← 关键：清零年龄，让它从头开始，避免进入老化死亡窗口
+                # 重置旧标记 & 标新精英
+                for u in self.units:
+                    u.is_elite = False
+                # 标记新精英 & 重置年龄
+                for u in elites:
+                    u.is_elite = True
+                    u.age = 0  # ← 关键：清零年龄，让它从头开始，避免进入老化死亡窗口
 
-        # 恢复全局计数更新，避免 should_split 拿到过时值
+            # 恢复全局计数更新，避免 should_split 拿到过时值
 
 
         new_units = []  # 新生成的单元（复制）
@@ -1521,13 +1544,57 @@ class CogGraph:
             if unit.input_size < expected_input:
                 self.expand_unit_dim(unit, expected_input)
 
-            # ---------- 新增【私有目标拷贝】----------
+            # —— Intrinsic 冷却 & 重新采样（排除其它 emitter 的目标） ——
+            # —— Intrinsic 冷却 & 重新采样（排除其它 emitter 的目标 + fallback） ——
             if unit.get_role() == "emitter":
-                # ① 给每个 emitter 一份**可写**的 goal_vec
-                unit.goal_vec = self.target_vector.clone()
-                # ② 把最近陷阱坐标也交给它
+                if unit.personal_goal is None \
+                        and (self.current_step - unit._last_intrinsic_step) >= unit.intrinsic_cooldown:
+
+                    # 1) 收集已被其它 emitter 占用的目标
+                    taken = {
+                        e.personal_goal
+                        for e in self.units
+                        if e is not unit and e.get_role() == "emitter" and e.personal_goal is not None
+                    }
+
+                    # 2) 构造所有格子列表
+                    all_positions = [
+                        (x, y)
+                        for x in range(self.env_size)
+                        for y in range(self.env_size)
+                    ]
+
+                    # 3) 从“没被占用”的位置里选访问次数最少的一批
+                    avail = [p for p in all_positions if p not in taken]
+                    if avail:
+                        # 在 avail 里找最小访问次数
+                        min_count = min(unit.visit_counts.get(p, 0) for p in avail)
+                        candidates = [p for p in avail if unit.visit_counts.get(p, 0) == min_count]
+                        new_goal = random.choice(candidates)
+                    else:
+                        # fallback：所有格子都被占用了，就从全局随机挑一个
+                        new_goal = random.choice(all_positions)
+
+                    unit.personal_goal = new_goal
+                    unit.visit_counts.setdefault(new_goal, 0)
+
+            if unit.get_role() == "emitter":
+                # 1) 外在2通道目标
+                ext_goal = self.target_vector.clone()  # shape (2, env²)
+                # 2) 内在1通道目标：如果从未初始化或冷却中，则采样或用全 0
+                if not hasattr(unit, "personal_goal"):
+                    unit.visit_counts = Counter()
+                    unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts)
+                    unit.visit_counts[unit.personal_goal] = 0
+                if unit.personal_goal is None:
+                    # 冷却期还没到，保持内在通道全 0
+                    int_onehot = torch.zeros(1, self.env_size * self.env_size, device=self.device)
+                else:
+                    int_onehot = make_onehot(self.env_size, unit.personal_goal, device=self.device).unsqueeze(0)
+
+                # 3) 拼接成 (3, env²)
+                unit.goal_vec = torch.cat([ext_goal, int_onehot], dim=0)
                 unit.current_hazard_xy = getattr(self, "current_hazard_xy", None)
-            # ---------- 新增结束 ----------------------
 
             unit.global_emitter_count = emitter_count
 
@@ -1647,7 +1714,7 @@ class CogGraph:
 
             logger.debug("[代谢] %s var=%.3f conn_sum=%.2f",unit.id, var, conn_strength_sum)
             unit.current_step = self.current_step
-            unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
+            # unit.goal_vec = self.target_vector.to(self.device)  # shape (goal_dim,)
             unit.update(unit_input)
 
             if unit.get_role() == "emitter":
@@ -1729,6 +1796,26 @@ class CogGraph:
             action_indices = [torch.argmax(out).item() for out in outputs]
             emitters = [u for u in self.units if u.get_role() == "emitter"]
 
+            for idx, unit in enumerate(emitters):
+                out = outputs[idx]
+                pred = torch.argmax(self._align_to_goal_dim(out)).item()
+                px, py = pred % self.env_size, pred // self.env_size
+                if (px, py) == unit.personal_goal:
+                    # 奖励
+                    unit.energy += unit.intrinsic_reward
+                    unit.meta.record(action="intrinsic", reward=+unit.intrinsic_reward)
+                    logger.info("你达到了你好奇的地方，心中充满了决心")
+                    # 标记访问次数
+                    unit.visit_counts[(px, py)] += 1
+                    # 记录完成步数，清空内在目标，进入冷却
+                    unit._last_intrinsic_step = self.current_step
+                    unit.personal_goal = None
+                    # 只有在 goal_vec 确实有第 3 通道时才清
+                    if getattr(unit, "goal_vec", None) is not None \
+                            and unit.goal_vec.dim() == 2 \
+                            and unit.goal_vec.size(0) >= 3:
+                        unit.goal_vec[2].zero_()
+
             for i, unit in enumerate(emitters):
                 out_vec = outputs[i]
                 pred = self._align_to_goal_dim(out_vec)          # (env²,)
@@ -1736,13 +1823,16 @@ class CogGraph:
 
                 # ─── 资源距离判断 ───────────────────────────
                 # goal_vec = unit.goal_vec.squeeze(0) if unit.goal_vec.dim() == 2 else unit.goal_vec
-                # res_dist = float((pred - goal_vec).pow(2).mean().sqrt())  # GPU 上完成
-                # ---------- 拆通道 ----------
-                if unit.goal_vec.dim() == 2:           # (2, env²)
-                    res_vec, hz_vec = unit.goal_vec
-                else:                                  # 旧一维
-                    res_vec = unit.goal_vec
-                    hz_vec  = torch.zeros_like(res_vec)
+                # res_dist = float((pred - goal_vec).pow(2).mean().sqrt())  # GPU 上完成-
+                # ─── 拆通道 ───────────────────────────
+                if unit.goal_vec.dim() == 2 and unit.goal_vec.size(0) >= 2:
+                    # 只取“外在”资源和陷阱通道（前两通道），忽略第三通道（好奇点）
+                    res_vec = unit.goal_vec[0]
+                    hz_vec = unit.goal_vec[1]
+                else:
+                    # 兼容旧一维或意外情况
+                    res_vec = unit.goal_vec.view(-1) if unit.goal_vec.dim() == 1 else unit.goal_vec[0]
+                    hz_vec = torch.zeros_like(res_vec)
 
                 # 给旧变量留别名，后面少动代码
                 goal_vec = res_vec
@@ -1840,8 +1930,8 @@ class CogGraph:
                         p.energy += base_r * 0.25
                     # 精准命中再加 0.5
                     if is_res_hit:
-                        unit.energy += 0.8
-                        unit.meta.record(action=cur_idx, reward=+0.8)
+                        unit.energy += 0.5
+                        unit.meta.record(action=cur_idx, reward=+0.5)
                         # —— ① 从环境里移除资源 ——
                         self.env.resources.discard((x_res, y_res))
                         self.removed_resources_count += 1
@@ -1856,7 +1946,7 @@ class CogGraph:
                         logger.debug("达成目标，再奖！")
                         # （可选）给 processor 分奖励
                         for p in upstream_processors:
-                            p.energy += 0.2
+                            p.energy += 0.125
                             p.meta.record(action="cur_idx", reward=+0.2)
 
                     # 记录领奖状态
