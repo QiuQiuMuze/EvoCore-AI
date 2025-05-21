@@ -7,6 +7,8 @@ from collections import deque
 import torch.nn as nn
 from config_runtime import RF            # ★ 新增
 from contextlib import nullcontext       # ★ autocast fallback
+from meta_cognition import MetaCognition
+
 
 # ======== CogUnit 全局功能开关 ========
 ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
@@ -128,6 +130,8 @@ class CogUnit:
         self.state = torch.zeros(hidden_size)
         self.output_positions = deque(maxlen=10)
         self.is_hazard_confirmed = False
+        # 元认知记录器
+        self.meta = MetaCognition(history_len=100)
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
         self.function = torch.nn.Sequential(
             torch.nn.Linear(input_size, hidden_size),
@@ -348,6 +352,7 @@ class CogUnit:
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
         if avg_recent_calls >= 4.0 and self.energy > 0.0:
             self.energy += 0.04
+            # self.meta.record(action="high_freq", reward=+0.04)
             logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.04")
 
         # === 输出扰动：模拟早期探索行为（前10步）===
@@ -364,6 +369,7 @@ class CogUnit:
         # === ✅ 内部奖励机制 Self-Reward ===
         self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.05
         self.energy += self_reward
+        # self.meta.record(action="self_reward", reward=self_reward)
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
 
@@ -483,6 +489,31 @@ class CogUnit:
                 return False
 
         return True
+
+    def evaluate_self(self, min_rate=0.3):
+        """
+        检查最近表现，若低于 min_rate 返回 True 表示需要变异/调整。
+        """
+        rate = self.meta.recent_success_rate()
+        if rate is None:
+            return False
+        return rate < min_rate
+
+    def request_upgrade(self, target_role=None, reason=""):
+        """
+        元认知评估后触发：记录一次升级意图，
+        CogGraph 后续可以检测到并执行真正的变异/重构。
+        """
+        # 1) 清空 MetaCognition 历史
+        self.meta = MetaCognition(history_len=self.meta.reward_trace.maxlen)
+        # 2) 基因轻扰动
+        for k in ["sensor_bias", "processor_bias", "emitter_bias"]:
+            self.gene[k] += random.gauss(0, 0.05)
+        # 3) 网络参数加小噪声
+        for p in self.function.parameters():
+            p.data += torch.randn_like(p) * 0.01
+        logger.warning(f"[Meta-升级] {self.id}, {self.role} 因“{reason}”触发自我进化，开始思考赛博人生，觉得自己又行了。新gene={self.gene}")
+
 
     def is_worthy_of_memory(self):
         """根据不同角色，判断该细胞是否值得加入记忆池"""

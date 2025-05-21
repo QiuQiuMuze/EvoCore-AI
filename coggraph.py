@@ -754,6 +754,7 @@ class CogGraph:
                 merged.state = (u1.state + u2.state) / 2
                 merged.age = int((u1.age + u2.age) / 2)
                 merged.energy = u1.energy + u2.energy + 0.02  # 奖励合并能量
+                # merged.meta.record(action="Combine", reward=+0.02)
                 merged.last_output = (u1.last_output + u2.last_output) / 2
 
                 # 加入新单元
@@ -891,7 +892,9 @@ class CogGraph:
                     new_e.last_output = (e1.last_output + e2.last_output) / 2
 
                     new_p.energy = p1.energy + p2.energy + 0.05
+                    # new_p.meta.record(action="Combine", reward=+0.05)
                     new_e.energy = e1.energy + e2.energy + 0.05
+                    # new_e.meta.record(action="Combine", reward=+0.05)
 
                     # 插入新单元
                     self.add_unit(new_p)
@@ -1636,9 +1639,11 @@ class CogGraph:
             if self.current_step < 1000:
                 unit.energy -= decay * 0.015
                 unit.energy = max(unit.energy, 0.0)
+                # unit.meta.record(action="For life", reward=-decay * 0.015)
             else:
                 unit.energy -= decay * 0.035
                 unit.energy = max(unit.energy, 0.0)
+                # unit.meta.record(action="For life", reward=-decay * 0.035)
 
             logger.debug("[代谢] %s var=%.3f conn_sum=%.2f",unit.id, var, conn_strength_sum)
             unit.current_step = self.current_step
@@ -1704,7 +1709,8 @@ class CogGraph:
                         # 删除连接后，给 from_unit 轻微能量惩罚
                         if from_id in self.unit_map:
                             self.unit_map[from_id].energy -= 0.015  # 可调参数
-                            logger.debug(f"[惩罚] {from_id} 因连接失效，能量 -0.01")
+                            # self.unit_map[from_id].meta.record(action="connect fail", reward=-0.015)
+                            logger.debug(f"[惩罚] {from_id} 因连接失效，能量 -0.015")
 
                     else:
                         # ✅ 削弱仍在用但表现差的连接
@@ -1770,8 +1776,11 @@ class CogGraph:
                 if is_hz_hit and (hx, hy) in self.env.hazards:
                     unit.energy -= 0.50
                     logger.debug("命中陷阱，该罚！")
+                    # 记录元认知：动作 idx, 奖励 -0.5
+                    unit.meta.record(action=pred_idx, reward=-0.5)
                     for p in upstream_processors:
                         p.energy -= 0.125
+                        p.meta.record(action=pred_idx, reward=-0.125)
                     unit.is_hazard_confirmed = True
                     unit.last_action_rewarded = False
                     # ====== ① 把这个资源从环境里移除 ======
@@ -1797,6 +1806,7 @@ class CogGraph:
                 # ========== 已确认陷阱且远离 ≥3 格：小奖 ==========
                 if unit.is_hazard_confirmed and hz_dist > 3.0:
                     unit.energy += 0.04
+                    unit.meta.record(action=pred_idx, reward=+0.04)
                     unit.is_hazard_confirmed = False
                     unit.last_reward_step = self.current_step
                     unit.last_action_rewarded = True
@@ -1823,12 +1833,15 @@ class CogGraph:
                     base_r = 0.02 * (1.0 - res_dist)        # 距离越近奖励越大
                     base_r = max(base_r, 0.0)
                     unit.energy += base_r
+                    unit.meta.record(action=cur_idx, reward=+base_r)
+                    logger.debug("进入范围，奖励！")
                     for p in upstream_processors:
-                        p.energy += base_r
-                        logger.debug("进入范围，奖励！")
+                        unit.meta.record(action=cur_idx, reward=+(base_r * 0.25))
+                        p.energy += base_r * 0.25
                     # 精准命中再加 0.5
                     if is_res_hit:
                         unit.energy += 0.8
+                        unit.meta.record(action=cur_idx, reward=+0.8)
                         # —— ① 从环境里移除资源 ——
                         self.env.resources.discard((x_res, y_res))
                         self.removed_resources_count += 1
@@ -1844,6 +1857,7 @@ class CogGraph:
                         # （可选）给 processor 分奖励
                         for p in upstream_processors:
                             p.energy += 0.2
+                            p.meta.record(action="cur_idx", reward=+0.2)
 
                     # 记录领奖状态
                     unit.last_rewarded_target_idx = cur_idx
@@ -1859,6 +1873,7 @@ class CogGraph:
                     if unit.linger_steps > 3:               # 逗留阈值
                         unit.energy -= 0.01                 # 轻微能量衰减，不撤回奖励
                         logger.info("范围内兜圈子，该罚！")
+                        unit.meta.record(action=cur_idx, reward=-0.01)
                     # 不再给新奖励
                     continue
 
@@ -1866,6 +1881,7 @@ class CogGraph:
                 if (unit.last_rewarded_target_idx == cur_idx) and res_dist > 4.0:
                     logger.warning("跑走了，奖金取消！")
                     unit.energy -= unit.last_reward_amount
+                    unit.meta.record(action=cur_idx, reward=-unit.last_reward_amount)
                     unit.last_rewarded_target_idx = None
                     unit.linger_steps             = 0
                     unit.last_reward_amount       = 0.0
@@ -1876,14 +1892,17 @@ class CogGraph:
                     most_common = max(set(action_indices), key=action_indices.count)
                     if action_indices.count(most_common) > len(action_indices) * 0.9:
                         unit.energy -= 0.05
+                        unit.meta.record(action="diversity_penalty", reward=-0.05)
                     elif len(set(action_indices)) > len(action_indices) * 0.6:
                         unit.energy += 0.05
+                        unit.meta.record(action="diversity_penalty", reward=+0.05)
 
                 # ------------ 衰减 + 兜圈 ------------
                 if self.current_step > 1500:
                     inactive_steps = self.current_step - unit.last_reward_step
                     if inactive_steps > decay_threshold:
                         unit.energy -= decay_amount * 0.1
+                        unit.meta.record(action="round", reward=-(decay_amount * 0.1))
 
                     if (hasattr(unit, "output_positions")
                             and len(unit.output_positions) >= 10
@@ -1893,10 +1912,13 @@ class CogGraph:
                         manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
                         if 3 <= manhattan < 5:
                             unit.energy -= 0.08
+                            unit.meta.record(action="move less", reward=-0.08)
                         elif 6 <= manhattan < 8:
                             unit.energy -= 0.10
+                            unit.meta.record(action="move less", reward=-0.1)
                         elif 9 <= manhattan <= 10:
                             unit.energy -= 0.12
+                            unit.meta.record(action="move less", reward=-0.12)
         # ---------- 奖励逻辑结束 ----------
 
 
@@ -2019,6 +2041,20 @@ class CogGraph:
             # 重置计数
             self.removed_resources_count = 0
             self.removed_hazards_count  = 0
+
+        # —— 元认知自评 ——
+        # 每 500 步检查一次，低成功率的 unit 请求升级
+        if self.current_step % 250 == 0:
+            for unit in self.units:
+                # 0.3 可调整阈值
+                if unit.role == "sensor":
+                    continue
+                if unit.evaluate_self(min_rate=0.5):
+                    unit.request_upgrade(
+                        target_role=unit.get_role(),
+                        reason="low_success_rate"
+                    )
+
 
     # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
     def expand_unit_dim(self, unit: CogUnit, new_input_size: int):
