@@ -23,7 +23,7 @@ except ImportError:
 import math
 from goal_generator import sample_unvisited, make_onehot
 from collections import Counter
-
+from self_model import build_self_model
 
 
 
@@ -253,6 +253,10 @@ class CogGraph:
         self.role2id = {"sensor": 0, "processor": 1, "emitter": 2}
         self.role_embed = torch.nn.Embedding(3, D).to(self.device)
         self.id_embed = torch.nn.Embedding(1_000_000, D).to(self.device)
+        # —— 新增：把 6 维 self_model 投影到 D 维 —— #
+        self.self_model_dim  = 6
+        self.self_model_proj = torch.nn.Linear(self.self_model_dim, D).to(self.device)
+
 
         if RF.use_compile and torch.cuda.is_available():
             # ⚠️ 千万别再写 “import torch._dynamo” —— 那会把 torch 当作局部变量
@@ -280,19 +284,29 @@ class CogGraph:
 
         toks = []
         for u in self.units:
+
+            role_id = self.role2id.get(u.role, 0)
+            # UUID → int → 0‥999 999
+            uid_idx = u.int_id % 1_000_000
+            # 1) 原始 state 向量
             vec = u.state.view(-1)
 
-            # pad / truncate 到当前 D
+            # 2) pad / truncate 到 D
             if vec.numel() < self.processor_hidden_size:
                 vec = F.pad(vec, (0, self.processor_hidden_size - vec.numel()))
             elif vec.numel() > self.processor_hidden_size:
                 vec = vec[: self.processor_hidden_size]
 
-            role_id = self.role2id.get(u.role, 0)
-            # UUID → int → 0‥999 999
-            uid_idx = u.int_id % 1_000_000
-            tok = vec + self.role_embed.weight[role_id] \
-                      + self.id_embed.weight[uid_idx]
+            # 3) 自我模型嵌入 （6→D）并相加
+            sm = build_self_model(u)               # [6]
+            sm_emb = self.self_model_proj(sm)      # [D]
+            vec = vec + sm_emb
+
+            # 4) 加上 role/id embedding
+            tok = vec \
+                + self.role_embed.weight[role_id] \
+                + self.id_embed.weight[uid_idx]
+
 
             toks.append(tok)
 

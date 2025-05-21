@@ -5,13 +5,12 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/checkpoints/agent_h0.pth" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/checkpoints/agent_h2.pth" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/checkpoints/agent_h4.pth" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/checkpoints/agent_h6.pth" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/goal_generator.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/self_model.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CogUnit.py" beforeDir="false" afterPath="$PROJECT_DIR$/CogUnit.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h0.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h0.pth" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h2.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h2.pth" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h4.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h4.pth" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h6.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h6.pth" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -167,7 +166,7 @@
       <workItem from="1747691517740" duration="3365000" />
       <workItem from="1747695955401" duration="19803000" />
       <workItem from="1747716784767" duration="4822000" />
-      <workItem from="1747723806211" duration="27387000" />
+      <workItem from="1747723806211" duration="28007000" />
     </task>
     <servers />
   </component>
