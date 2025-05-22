@@ -172,7 +172,7 @@ class CogGraph:
             e.visit_counts[cand] = 0
             taken.add(cand)
 
-            e.intrinsic_cooldown = 100  # 冷却 100 步
+            e.intrinsic_cooldown = 20  # 冷却 20 步
             e._last_intrinsic_step = -1e9  # 初始化为极早之前
 
         # 4) 连接：sensor → processor → emitter
@@ -184,11 +184,18 @@ class CogGraph:
                 self.connect(p, e)
 
     # -------------------------------------------------------------------
-    def __init__(self, rl_agent: RLAgent, device: str = "cpu"):
+    def __init__(self, rl_agent: RLAgent, device: str = "cpu", env: GridEnvironment | None = None):
         # 保存传入的 RLAgent 实例
         self.rl_agent = rl_agent
-        self.device   = torch.device(device)
-        # === RL 接口：Processor 输出的统一维度 ===
+        self.device = torch.device(device)
+        # ==== 环境注入 ====
+        if env is not None:
+            self.env = env
+            self.env_size = env.size
+        else:
+            self.env_size = 5
+            self.env = GridEnvironment(size=self.env_size)
+
         self._pending_deaths: List[CogUnit] = []
         self._death_energy_sum: Dict[str, float] = {}  # role -> total energy
         self.debug = False
@@ -198,8 +205,6 @@ class CogGraph:
         self.emitter_count = 0
         self.energy_pool = 0.0  # 中央能量池
         # self.memory_pool = []  # 存放死亡细胞的 gene + last_output + bias info
-        self.env_size = 5  # 初始环境 5x5
-        self.env = GridEnvironment(size=self.env_size)  # 创建环境
         initial_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
@@ -724,9 +729,23 @@ class CogGraph:
         merged_pairs = set()
         new_units = []
 
-        for i, u1 in enumerate(self.units):
-            for j in range(i + 1, len(self.units)):
-                u2 = self.units[j]
+        # —— STEP1：构建空间哈希（按位置格子划分） ——
+        grid = {}  # (gx,gy) -> [unit,...]
+        cell_size = 4  # 半径 3 内的邻居一定在同格或相邻格
+        for u in self.units:
+            gx, gy = u.position[0] // cell_size, u.position[1] // cell_size
+            grid.setdefault((gx, gy), []).append(u)
+
+        for u1 in self.units:
+            gx, gy = u1.position[0] // cell_size, u1.position[1] // cell_size
+            # 只拿本格和 8 个邻格里的单元做两两
+            neighbors = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    neighbors += grid.get((gx + dx, gy + dy), [])
+            for u2 in neighbors:
+                if u2 is u1:
+                    continue
 
                 # 跳过已标记
                 if u1.id in merged_pairs or u2.id in merged_pairs:
@@ -842,8 +861,18 @@ class CogGraph:
                 candidates.append((u1, u2))
 
         # 检查每对子图是否满足共现与输出相似
+        # —— STEP1：先只挑最近活跃 top-K 对子图 ——
+        # 记录每条 processor→emitter 边的 last call step
+        calls = sorted(self.connection_usage.items(), key=lambda x: x[1], reverse=True)
+        # 只保留调用最频繁的前 K 条
+        topk = min(len(calls), 100)
+        candidates = [(self.unit_map[p], self.unit_map[e]) for ((p, e), _) in calls[:topk]
+                      if p in self.unit_map and e in self.unit_map]
+
+        # 再在这 top-K 里两重比较
         for i in range(len(candidates)):
-            for j in range(i + 1, len(candidates)):
+            for j in range(i + 1, topk):
+
                 p1, e1 = candidates[i]
                 p2, e2 = candidates[j]
 
@@ -1047,7 +1076,12 @@ class CogGraph:
         def euclidean(p1, p2):
             return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
-        for unit in self.units:
+        # 只对最近 step 内更新过且能量高的前 M 个单元做新连尝试
+        scored = [(u, u.energy + u.avg_recent_calls) for u in self.units]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        hot_units = [u for u, _ in scored[: min(len(scored), 50)]]
+        for unit in hot_units:
+
             role = unit.get_role()
 
             if role == "processor":
@@ -1302,6 +1336,26 @@ class CogGraph:
         if RF.use_shared_tx and (self.current_step % RF.shared_tx_interval == 0):
             self._run_shared_transformer()
 
+        # ─── 开始：同步外部环境尺寸变化 ───
+        if self.env.size != self.env_size:
+            old_size = self.env_size
+            # 1) 更新内部记录
+            self.env_size = self.env.size
+            # 2) 更新处理器维度
+            self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
+            # 3) 调整 RLAgent 的状态向量长度（hidden + 2·env²）
+            full_state_dim = self.processor_hidden_size + 2 * (self.env_size * self.env_size)
+            self.rl_agent.resize_state_dim(full_state_dim)
+            # 4) 重新分配目标 one-hot 缓冲
+            self._target_buf = self._target_buf.new_zeros((2, self.env_size * self.env_size))
+            # 5) 如果使用共享 Transformer，要重建 Shared-Tx
+            if RF.use_shared_tx:
+                self._init_shared_tx()
+            logger.info(f"[Env Resize] {old_size}→{self.env_size}, synced CogGraph dims")
+        # ─── 结束：同步完毕，接下去走原有逻辑 ───
+
+        # —— 原有逻辑从这里开始 ——#
+
         self.current_step += 1
         # —— 改为拆分外部传入的 input_tensor ——
         # 假设调用方已经做了 torch.cat([env_state, goal_vec], dim=1)
@@ -1402,7 +1456,7 @@ class CogGraph:
                         f"[能量税] {self.current_step} 步：总能 {total_e:.2f} → 税 {tax:.2f}，池不足 → 细胞每个扣 {loss_per_unit:.4f}")
 
         # === Curriculum Learning: 每500步扩展一次环境大小
-        if self.current_step >= 1000 and self.current_step % 1000 == 0:
+        if 3000 > self.current_step >= 1000 and self.current_step % 1000 == 0:
             old_size = self.env_size
             self.env_size = min(self.env_size + 5, 25)  # 每次+5，最大到25x25
             self.env.resize(self.env_size) # 重新生成环境
@@ -1432,7 +1486,7 @@ class CogGraph:
             for u in self.units:
                 u.memory_buffer.clear()
 
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 4000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(f"[资源扩展] 第 {self.current_step} 步：MAX_TOTAL_ENERGY {old_max:.1f} → {self.max_total_energy:.1f}")
@@ -1915,7 +1969,12 @@ class CogGraph:
                     unit.last_action_rewarded = False
                     # ====== ① 把这个资源从环境里移除 ======
                     # —— 用真实的陷阱坐标删除陷阱 ——
-                    self.env.hazards.discard((hx, hy))
+                    # 减掉一份陷阱，计数归零时彻底删除这个键
+                    if self.env.hazards[(hx, hy)] > 0:
+                        self.env.hazards[(hx, hy)] -= 1
+                        if self.env.hazards[(hx, hy)] == 0:
+                            del self.env.hazards[(hx, hy)]
+
                     self.removed_hazards_count += 1
                     # —— 同步清空 goal_vec ——
                     hazard_idx = hy * self.env_size + hx
@@ -1973,7 +2032,12 @@ class CogGraph:
                         unit.energy += 0.5
                         unit.meta.record(action=cur_idx, reward=+0.5)
                         # —— ① 从环境里移除资源 ——
-                        self.env.resources.discard((x_res, y_res))
+                        # 减掉一份资源，计数归零时删除这个键
+                        if self.env.resources[(x_res, y_res)] > 0:
+                            self.env.resources[(x_res, y_res)] -= 1
+                            if self.env.resources[(x_res, y_res)] == 0:
+                                del self.env.resources[(x_res, y_res)]
+
                         self.removed_resources_count += 1
                         # —— ② 本帧也同步清空 goal_vec，避免后续误判 ——
                         unit.goal_vec[0, cur_idx] = 0.0
@@ -2002,7 +2066,7 @@ class CogGraph:
                     unit.linger_steps = min(unit.linger_steps + 1, 20)  # ← 在 0~20 之间递增
                     if unit.linger_steps > 3:               # 逗留阈值
                         unit.energy -= 0.01                 # 轻微能量衰减，不撤回奖励
-                        logger.info("范围内兜圈子，该罚！")
+                        logger.warning("范围内兜圈子，该罚！")
                         unit.meta.record(action=cur_idx, reward=-0.01)
                     # 不再给新奖励
                     continue
@@ -2077,10 +2141,12 @@ class CogGraph:
                 if role_counts.get(role, 0) < min_counts[role] and self.total_energy() < self.max_total_energy:
                     # ✅ 当前角色数量不足 或 系统能量未超载 → 强制分裂
                     expected_input = self.env_size * self.env_size * INPUT_CHANNELS
-                    child = unit.clone(new_input_size=expected_input if unit.input_size != expected_input else None,
-                                       global_resources=self.env.resources,
-                                       global_hazards=self.env.hazards,
-                                       )
+                    child = unit.clone(
+                        new_input_size=expected_input,
+                        global_resources=set(self.env.resources.keys()),
+                        global_hazards=set(self.env.hazards.keys())
+                    )
+
                     # 🔁 注入资源和陷阱信息（避免出生在危险地带）
                     # —— 分裂后给父细胞和子细胞各 +0.35 能量 —— #
                     if self.current_step < 2000:
@@ -2167,7 +2233,7 @@ class CogGraph:
         # —— 新增：周期性清理统计 ——
         if self.current_step % 50 == 0:
             logger.warning(f"[清理统计] 已清理资源 {self.removed_resources_count} 个，危险 {self.removed_hazards_count} 个")
-        if self.current_step % 1000 == 0:
+        if self.current_step % 1000 == 0 and self.current_step <= 3000:
             # 重置计数
             self.removed_resources_count = 0
             self.removed_hazards_count  = 0

@@ -2,8 +2,8 @@
 import numpy as np
 import random
 import logging
-import logging
 from collections import deque
+from collections import Counter
 
 class LimitedDebugHandler(logging.Handler):
     def __init__(self, capacity=100):
@@ -45,8 +45,8 @@ class GridEnvironment:
     def __init__(self, size=5, max_steps: int | None = None):
         self.size = size
         self.max_steps = max_steps
-        self.resources = set()
-        self.hazards = set()
+        self.resources = Counter()  # 同一格子可以有多份资源
+        self.hazards = Counter()  # 同一格子可以有多份陷阱
         self.step_count = 0
         self.explored_cells_count = 0
         self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
@@ -54,6 +54,8 @@ class GridEnvironment:
         self.refresh_environment(step=0, explored_cells_count=0, exclude_positions=exclude)
         self.visited_map = np.zeros((self.size, self.size), dtype=bool)  # ✅ 初始化探索标记
         self.reset()
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
 
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
@@ -65,23 +67,25 @@ class GridEnvironment:
         extra = max(((self.step_count - 1500) // 250), 0)
 
         attempts = 0
-        while len(self.resources) < int(self.size * self.size / 6) + extra and attempts < 1000:
+        total = int(self.size * self.size / 6) + extra
+        while sum(self.resources.values()) < total and attempts < 1000:
             pos = (
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
             )
             if pos not in exclude_positions:
-                self.resources.add(pos)
+                self.resources[pos] += 1
             attempts += 1
 
         attempts = 0
-        while len(self.hazards) < int(self.size * self.size / 3) + extra and attempts < 1000:
+        total_h = int(self.size * self.size / 3) + extra
+        while sum(self.hazards.values()) < total_h and attempts < 1000:
             pos = (
                 random.randint(0, self.size - 1),
                 random.randint(0, self.size - 1)
             )
             if pos not in exclude_positions:
-                self.hazards.add(pos)
+                self.hazards[pos] += 1
             attempts += 1
 
         # ✅ 每次刷新资源/陷阱后，也要刷新探索地图
@@ -91,12 +95,22 @@ class GridEnvironment:
     def reset(self):
         # agent 初始化在随机位置
         self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
-        # --- 新增: 重置计数 & 能量字段 ---
+
+        # --- 重置计数 & 能量 & 命中 & 访问记录 ---
         self.step_count = 0
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
         self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
         self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
+
+        # 清空访问轨迹
+        self.visited_map = np.zeros((self.size, self.size), dtype=bool)
+        self.explored_cells_count = 0
+
+        # 清空命中统计
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
+
         return self.get_state()
 
     def step(self, action, cog_step: int | None = None):
@@ -120,21 +134,25 @@ class GridEnvironment:
 
         # 环境交互逻辑
         pos = (x, y)
-        if pos in self.resources:
-            self.resources.remove(pos)
-            if self.step_count < 2000:
-                self.agent_energy_gain = 0.8
-            else:
-                self.agent_energy_gain = max(0.4 - max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.2)  # 单步奖励
-
+        # —— 资源命中 —— #
+        if self.resources[pos] > 0:
+            # 减掉一次出现
+            self.resources[pos] -= 1
+            # 如果计数归零，就删掉这个 key
+            if self.resources[pos] == 0:
+                del self.resources[pos]
+            self.reward_hit_count += 1
+            self.agent_energy_gain = 0.1
         else:
-            self.agent_energy_gain = 0
+            self.agent_energy_gain = 0.0
 
-        if pos in self.hazards:
-            if self.step_count < 2000:
-                self.agent_energy_penalty = 0.08
-            else:
-                self.agent_energy_penalty = min(0.2 + max(((self.step_count - 5000) // 1000) * 0.02, 0), 0.4)
+        # —— 陷阱命中 —— #
+        if self.hazards[pos] > 0:
+            self.hazards[pos] -= 1
+            if self.hazards[pos] == 0:
+                del self.hazards[pos]
+            self.danger_hit_count += 1
+            self.agent_energy_penalty = 0.1
         else:
             self.agent_energy_penalty = 0.0
 
@@ -153,17 +171,17 @@ class GridEnvironment:
 
         # —— reward shaping ——
         pos = (x, y)
-        # 1) 资源引导：走得更近 +0.1, 走远了 –0.1
+        # 1) 资源引导：走得更近 +0.001, 走远了 –0.001
         dist_res = self.distance_to_nearest_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.1 if delta_res > 0 else (-0.1 if delta_res < 0 else 0.0)
+        resource_shaping = 0.001 if delta_res > 0 else (-0.001 if delta_res < 0 else 0.0)
         self.prev_dist_resource = dist_res
 
         # 2) 危险引导（delta 版本）
         danger_dist = self.distance_to_nearest_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
-        # 如果比上一帧更远则 +0.1，离得更近则 –0.1 否则 0
-        danger_shaping = 0.1 if delta_danger > 0 else (-0.1 if delta_danger < 0 else 0.0)
+        # 如果比上一帧更远则 +0.001，离得更近则 –0.001 否则 0
+        danger_shaping = 0.001 if delta_danger > 0 else (-0.001 if delta_danger < 0 else 0.0)
         # 更新 prev_danger_dist 供下次比较
         self.prev_danger_dist = danger_dist
 
@@ -173,7 +191,7 @@ class GridEnvironment:
         if not self.visited_map[y, x]:
             self.visited_map[y, x] = True
             self.explored_cells_count += 1
-            explore_bonus = 0.005  # 或你想给的探索分数
+            explore_bonus = 0.0001  # 或你想给的探索分数
 
         reward = base + resource_shaping + danger_shaping + explore_bonus
 
@@ -212,10 +230,13 @@ class GridEnvironment:
         x, y = self.agent_pos
         agent_layer[y, x] = 1.0
 
-        for rx, ry in self.resources:
-            resource_layer[ry, rx] = 1.0
-        for hx, hy in self.hazards:
-            hazard_layer[hy, hx] = 1.0
+        for (rx, ry), cnt in self.resources.items():
+            if cnt > 0:
+                resource_layer[ry, rx] = 1.0
+
+        for (hx, hy), cnt in self.hazards.items():
+            if cnt > 0:
+                hazard_layer[hy, hx] = 1.0
 
         # ✅ 现在堆叠四层
         stacked = np.stack([agent_layer, resource_layer, hazard_layer, visited_layer], axis=0)
@@ -268,6 +289,40 @@ class GridEnvironment:
         # 3) 重新生成资源/危险，但不重置 step_count 等
         #    这里直接调用 refresh_environment，让它基于当前 step_count 重绘
         self.refresh_environment(step=self.step_count, explored_cells_count=self.explored_cells_count)
+
+    def reset_with_size(self, new_size: int):
+        import numpy as np
+        # —— 更新维度 ——#
+        self.size = new_size
+        # —— 随机初始化 agent_pos ——#
+        self.agent_pos = [
+            np.random.randint(0, self.size),
+            np.random.randint(0, self.size)
+        ]
+        # —— 清空资源/危险 ——#
+        self.resources = Counter()
+        self.hazards   = Counter()
+        # —— 清空统计 & 访问记录 ——#
+        self.step_count = 0
+        self.visited_map = np.zeros((self.size, self.size), dtype=bool)
+        self.explored_cells_count = 0
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
+        self.refresh_environment(step=0, explored_cells_count=0, exclude_positions={tuple(self.agent_pos)})
+
+    def inject_reward_map(self,
+                          reward_points: list[tuple[int,int]],
+                          punishment_points: list[tuple[int,int]]):
+        # "直接用外部生成的点来覆盖资源/危险集合。
+        self.resources = Counter(reward_points)
+        self.hazards   = Counter(punishment_points)
+        # 清零统计与访问
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
+        self.visited_map = np.zeros((self.size, self.size), dtype=bool)
+        self.explored_cells_count = 0
+
+
 
 if __name__ == "__main__":
     env = GridEnvironment(size=10)

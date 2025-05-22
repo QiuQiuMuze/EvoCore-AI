@@ -139,7 +139,7 @@ class CogUnit:
         self.visit_counts = {}               # {(x,y): 次数}
         self.intrinsic_reward = 0.5         # 达到内在目标奖励能量
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
-        self.intrinsic_cooldown = 200  # 冷却步数
+        self.intrinsic_cooldown = 20  # 冷却步数
         self._last_intrinsic_step = -float("inf")
 
         self.function = torch.nn.Sequential(
@@ -494,8 +494,8 @@ class CogUnit:
         if role != "sensor" and self.avg_recent_calls < rule["min_calls"]:
             return False
 
-        if len(self.output_history) >= 3:
-            recent = self.output_history[-3:]
+        if len(self.output_history) >= 6:
+            recent = self.output_history[-6:]
             if all(torch.equal(recent[0], o) for o in recent[1:]):
                 return False
 
@@ -827,8 +827,8 @@ class CogUnit:
             return (fallback_x, fallback_y)
 
         # ⚠️ 使用提前注入的资源和陷阱信息
-        resources = getattr(self, "global_resources", set())
-        hazards = getattr(self, "global_hazards", set())
+        resources = global_resources if global_resources is not None else set()
+        hazards = global_hazards if global_hazards is not None else set()
         clone_unit.position = find_safe_position(self.env_size, resources, hazards)
 
         clone_unit.energy = self.energy * 0.6
