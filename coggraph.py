@@ -1331,6 +1331,7 @@ class CogGraph:
         return (x, y) in self.env.hazards
 
     def step(self, input_tensor: torch.Tensor):
+        self._rebuild_free_positions()
         self._update_global_counts()
         # === Transformer 一网打尽 ===
         if RF.use_shared_tx and (self.current_step % RF.shared_tx_interval == 0):
@@ -2144,7 +2145,8 @@ class CogGraph:
                     child = unit.clone(
                         new_input_size=expected_input,
                         global_resources=set(self.env.resources.keys()),
-                        global_hazards=set(self.env.hazards.keys())
+                        global_hazards=set(self.env.hazards.keys()),
+                        free_positions=self.free_positions
                     )
 
                     # 🔁 注入资源和陷阱信息（避免出生在危险地带）
@@ -2177,6 +2179,7 @@ class CogGraph:
                 new_input_size=expected_input if parent.input_size != expected_input else None,
                 global_resources=self.env.resources,
                 global_hazards=self.env.hazards,
+                free_positions=self.free_positions
             )
             # 父子连接（含继承上下游）
             self.connect(parent, child)
@@ -2391,6 +2394,17 @@ class CogGraph:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()  # 立即释放旧显存
+
+    def _rebuild_free_positions(self):
+        """一次性扫描所有格子，生成安全出生点列表"""
+        occupied = set(self.env.resources.keys()) | set(self.env.hazards.keys())
+        size = self.env_size
+        self.free_positions = [
+            (x, y)
+            for x in range(size)
+            for y in range(size)
+            if (x, y) not in occupied
+        ]
 
     def summary(self):
         # # 打印当前图结构概况

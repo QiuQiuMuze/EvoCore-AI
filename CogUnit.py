@@ -116,6 +116,7 @@ class CogUnit:
             random.randint(0, env_size - 1),
             random.randint(0, env_size - 1),
         )
+        self._rebuild_safe_positions()
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
         self.memory_pool_limit = 50
@@ -746,7 +747,13 @@ class CogUnit:
                     return True
         return False
 
-    def clone(self, role_override=None, new_input_size=None,global_resources=None, global_hazards=None):
+    def clone(self,
+              role_override=None,
+              new_input_size=None,
+              global_resources=None,
+              global_hazards=None,
+              free_positions=None):
+
         role = role_override or self.role
         input_size = new_input_size if new_input_size is not None else self.input_size
 
@@ -812,24 +819,27 @@ class CogUnit:
                 clone_unit.gene[key] = max(0.5, min(2.0, clone_unit.gene[key] + mutation))
             logger.info(f"[突变] gene 突变为 {clone_unit.gene}")
 
-        def find_safe_position(env_size, resources: set, hazards: set, max_attempts=5):
-            for _ in range(max_attempts):
-                pos = (
-                    random.randint(0, env_size - 1),
-                    random.randint(0, env_size - 1)
-                )
-                if pos not in resources and pos not in hazards:
-                    return pos
-            # 🟡 安全位置找不到，就随机一个（哪怕是危险位置）
-            fallback_x = random.randint(0, self.env_size - 1)
-            fallback_y = random.randint(0, self.env_size - 1)
-            logger.warning(f"[出生回退] 未找到安全位置，随机出生在 ({fallback_x}, {fallback_y})")
-            return (fallback_x, fallback_y)
+        # —— 出生点：优先用外部传入的 free_positions，O(1) 随机选 ——
+        if free_positions:
+            clone_unit.position = random.choice(free_positions)
+        else:
+            # fallback：若外部没传，就自己做一次扫描（极少执行）
+            occupied = (set(global_resources or ()) | set(global_hazards or ()))
+            fps = [
+                (x, y)
+                for x in range(self.env_size)
+                for y in range(self.env_size)
+                if (x, y) not in occupied
+            ]
+            if fps:
+                clone_unit.position = random.choice(fps)
+            else:
+                # 真·全占时才随机
+                fx = random.randint(0, self.env_size - 1)
+                fy = random.randint(0, self.env_size - 1)
+                logger.warning(f"[出生回退] 未找到安全位置，随机在 ({fx},{fy})")
+                clone_unit.position = (fx, fy)
 
-        # ⚠️ 使用提前注入的资源和陷阱信息
-        resources = global_resources if global_resources is not None else set()
-        hazards = global_hazards if global_hazards is not None else set()
-        clone_unit.position = find_safe_position(self.env_size, resources, hazards)
 
         clone_unit.energy = self.energy * 0.6
         clone_unit.age = 0
