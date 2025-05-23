@@ -116,7 +116,7 @@ class CogUnit:
             random.randint(0, env_size - 1),
             random.randint(0, env_size - 1),
         )
-        self._rebuild_safe_positions()
+        # self._rebuild_safe_positions()
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
         self.memory_pool_limit = 50
