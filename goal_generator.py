@@ -21,7 +21,11 @@ def sample_unvisited(env_size, visit_counts, exclude=None):
         return random.choice(unvisited)
 
     # 全部都访问过，则按最少访问次数挑一个（也排除 exclude）
+    if not visit_counts:
+        return None  # 或者 return random_pos()
+
     min_cnt = min(visit_counts.values())
+
     rare = [pos for pos, c in visit_counts.items() if c == min_cnt and pos not in exclude]
     if rare:
         return random.choice(rare)

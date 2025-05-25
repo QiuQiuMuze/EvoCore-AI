@@ -5,6 +5,7 @@ import random
 from env import logger
 from collections import deque
 import torch.nn as nn
+from collections import defaultdict
 from config_runtime import RF            # ★ 新增
 from contextlib import nullcontext       # ★ autocast fallback
 from meta_cognition import MetaCognition
@@ -133,7 +134,7 @@ class CogUnit:
         self.linger_steps             = 0      # 在同一目标附近逗留的帧数
         self.latest_base_reward       = 0.0    # 上一次靠近时发的 base 奖励，用来扣回
         self.is_permanent_explorer = False
-
+        self.visit_counts = defaultdict(int)
         self.memory_buffer = MemoryBuffer(maxlen=200)
 
 
@@ -744,6 +745,7 @@ class CogUnit:
             role=role,
             env_size=self.env_size
         )
+        clone_unit.visit_counts = defaultdict(int)
 
         # 2) 继承父体的 network 权重
         import copy, torch.nn as nn
@@ -870,7 +872,6 @@ class CogUnit:
                 # ✅ 若母体是永久探索者，则子体也继承
                 if getattr(self, "is_permanent_explorer", False):
                     clone_unit.is_permanent_explorer = True
-                clone_unit.visit_counts = self.visit_counts.copy()
                 return clone_unit  # 跳过融合逻辑
             if "output" in memory:
                 o1 = self.last_output.squeeze(0) if self.last_output.dim() == 2 else self.last_output
@@ -901,7 +902,10 @@ class CogUnit:
         # ✅ 若母体是永久探索者，则子体也继承
         if getattr(self, "is_permanent_explorer", False):
             clone_unit.is_permanent_explorer = True
-        clone_unit.visit_counts = self.visit_counts.copy()
+        # ✅ 最终兜底：如果前面没赋值 visit_counts，则继承父体记录
+        if not hasattr(clone_unit, "visit_counts") or not clone_unit.visit_counts:
+            clone_unit.visit_counts = self.visit_counts.copy()
+
         return clone_unit
 
     def record_memory(self, state: torch.Tensor, action, reward: float, outcome: str):

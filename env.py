@@ -2,7 +2,6 @@
 import numpy as np
 import random
 import logging
-import torch
 from collections import deque
 from collections import Counter
 
