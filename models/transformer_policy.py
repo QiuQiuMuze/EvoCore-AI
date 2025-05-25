@@ -1,128 +1,123 @@
-"""
-TransformerPolicyNetwork
-------------------------
-将 (batch, seq_len, input_dim) 的状态序列 → (batch, num_actions) 的 logits。
-
-✦ 设计要点
-1. 先用 Linear 把输入映射到 d_model 维度；
-2. 加可学习的位置编码（支持最长 max_seq_len）；
-3. 使用 nn.TransformerEncoder 做时序特征提取；
-4. 对时序维做 mean-pool，接全连接层得到动作 logits。
-"""
-
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
+from typing import Optional
 
+# 尝试导入 Flash-Attn 的高效 Transformer 实现
+try:
+    from flash_attn.modules.transformer import TransformerLayer as FlashTransformerLayer
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+# 兼容性的正余弦位置编码
+from utils import sinusoidal_positional_encoding
 
 class TransformerPolicyNetwork(nn.Module):
-    """轻量级策略网络：TransformerEncoder ➜ 池化 ➜ 动作 logits"""
-
+    """
+    轻量级策略网络：支持 Flash-Attn + RoPE 或 原生 TransformerEncoder。
+    输入 (batch, seq_len, input_dim) → logits (batch, num_actions)
+    """
     def __init__(
         self,
-        input_dim: int,            # 传入 sensor / processor 的 state 向量维度（已统一）
-        num_actions: int,          # 环境动作数量（你的 GridEnvironment.action_space_n）
-        d_model: int = 128,        # Transformer 隐藏维度
-        nhead: int = 4,            # 多头注意力头数
-        num_layers: int = 3,       # Encoder 层数
+        input_dim: int,
+        num_actions: int,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 3,
         dim_feedforward: int = 512,
-        max_seq_len: int = 16,      # 允许的最大序列长度（默认足够你当前 2-token 输入）
-        use_action_noise: bool = True
-    ) -> None:
+        max_seq_len: int = 16,
+        use_action_noise: bool = True,
+        use_flash_attn: bool = True
+    ):
         super().__init__()
         self.max_seq_len = max_seq_len
-
-        # 1) 输入映射到 d_model
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-
-        # 3) TransformerEncoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
-
-        # 4) 输出头
-        self.fc_out = nn.Linear(d_model, num_actions)
-
-        # —— 新增动作噪声参数 ——
-        # 在训练时，logits 上加高斯噪声；eval 模式下保持确定性
         self.noise_std = 0.2
         self.use_action_noise = use_action_noise
 
-        # 初始化（官方推荐方式）
+        # 线性投影到 d_model
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        # 选择 Flash-Attn 或 原生 PyTorch Transformer
+        self.use_flash = use_flash_attn and FLASH_ATTN_AVAILABLE
+        if self.use_flash:
+            # Flash-Attn 的 TransformerLayer 支持 RoPE
+            self.transformer_encoder = nn.Sequential(*[
+                FlashTransformerLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.1,
+                    layer_norm_eps=1e-5,
+                    causal=False,
+                    use_flash_attn=True,
+                    rotary_emb=True
+                ) for _ in range(num_layers)
+            ])
+        else:
+            # 原生 TransformerEncoder
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                batch_first=True
+            )
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers
+            )
+
+        # 输出头
+        self.fc_out = nn.Linear(d_model, num_actions)
         self._reset_parameters()
 
-
-    # -------------------------------------------------------------
-
     def _reset_parameters(self):
-        """按照 PyTorch 官方初始化 Transformer 的做法轻微调优"""
+        # 官方推荐的 Xavier 初始化
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    # -------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
-            x: Tensor, shape = (batch_size, seq_len, input_dim)
-
+            x: (batch, seq_len, input_dim)
+            mask: optional padding mask of shape (batch, seq_len)
         Returns:
-            logits: Tensor, shape = (batch_size, num_actions)
+            logits: (batch, num_actions)
         """
-        # step-1 线性投影到 d_model
+        # 投影
         h = self.input_proj(x)  # (B, L, d_model)
 
-        # step-2 加上正余弦位置编码（任意长度都能支持）
-        seq_len = h.size(1)
-        # 从 utils.py 里拿正余弦编码
-        from utils import sinusoidal_positional_encoding
-        pos_emb = sinusoidal_positional_encoding(seq_len, h.size(-1), device=h.device)
-        h = h + pos_emb
+        if not self.use_flash:
+            # 手动加位置编码
+            seq_len = h.size(1)
+            pos_emb = sinusoidal_positional_encoding(
+                seq_len, h.size(-1), device=h.device
+            )
+            h = h + pos_emb
+            # 支持可变长度填充 mask
+            h = self.transformer_encoder(h, src_key_padding_mask=mask)
+        else:
+            # Flash-Attn 内部已处理 RoPE，无需手动编码
+            h = self.transformer_encoder(h)
 
-
-        # step-3 TransformerEncoder
-        h = self.transformer_encoder(h)  # (B, L, d_model)
-
-        # step-4 时序池化（平均）
+        # 池化
         h = h.mean(dim=1)  # (B, d_model)
+        logits = self.fc_out(h)
 
-        # step-5 分类头
-        logits = self.fc_out(h)  # (B, num_actions)
-        # —— 训练时加入高斯噪声 ——
+        # 动作噪声
         if self.training and self.use_action_noise:
-            # 生成和 logits 同 shape 的 Gaussian 噪声
             noise = torch.randn_like(logits) * self.noise_std
             logits = logits + noise
-
         return logits
 
-
 """
-⚙️ 使用方式简述
-from models.transformer_policy import TransformerPolicyNetwork
+# 安装 PyTorch（确保你用的是 CUDA 版本）
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-net = TransformerPolicyNetwork(
-    input_dim=graph.processor_hidden_size,   # 或你在 graph 中对齐的统一维度
-    num_actions=env.action_space_n
-)
-
-seq = torch.randn(8, 2, graph.processor_hidden_size)  # (batch=8, seq_len=2, dim)
-logits = net(seq)  # (8, num_actions)
-注意
-
-如果后续你想把序列长度扩展到 >16（例如加入时间窗口），把 max_seq_len 调大或改成动态注册方式即可；
-
-本实现没有做软性约束（mask）。如果需要处理可变长度/填充，可在调用处自带 src_key_padding_mask 传入 self.transformer_encoder。
-
-完成后，RLAgent 中即可 from models.transformer_policy import TransformerPolicyNetwork 正常使用。
+# 然后安装 flash-attn
+pip install flash-attn --no-build-isolation
 """

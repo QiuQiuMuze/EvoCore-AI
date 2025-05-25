@@ -1315,7 +1315,7 @@ class CogGraph:
         return list(approved)
 
     def _expand_energy_cap_if_needed(self):
-        if self.current_step > 0 and self.current_step % 1000 == 0:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(
@@ -1900,6 +1900,11 @@ class CogGraph:
         if self.static_mode:
             active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
         for unit in self.units[:]:
+            pos = tuple(self.env.agent_pos)
+            for u in self.units:
+                if u.get_role() == "emitter":
+                    u.visit_counts.setdefault(pos, 0)
+                    u.visit_counts[pos] += 1
             if active_ids is not None and unit.id not in active_ids:
                 continue
             unit_input = self._prepare_unit_before_update(unit, full_state, expected_input)

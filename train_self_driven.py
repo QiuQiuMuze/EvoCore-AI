@@ -111,7 +111,7 @@ def main(cfg):
     # 1) 初始化 CogGraph 内部环境 & 图
     # 先用一个临时 env 推断初始输入维度（Graph 还没挂 agent，所以不用它）
     temp_env = GridEnvironment(size=5)
-    init_state = torch.from_numpy(temp_env.get_state()).float()
+    init_state = temp_env.get_state().float()
     init_dim = _infer_input_dim(None, init_state)  # None 会让 _infer_input_dim 返回 env.size
 
     # 2) 根据推断维度创建 RLAgent
@@ -135,7 +135,7 @@ def main(cfg):
     # --------------------
 
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
-    init_state = torch.from_numpy(env.get_state()).float()
+    init_state = env.get_state().float()
     proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 125
     goal_dim = env.size * env.size * 2                               # 2 channels × env²
     full_dim = proc_dim + goal_dim                                   # e.g. 125+50=175
@@ -168,7 +168,7 @@ def main(cfg):
     if hasattr(graph, "reset_state"):
         graph.reset_state()
     env.reset()
-    state = torch.from_numpy(env.get_state()).float().to(device)
+    state = env.get_state().float()
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
     # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
@@ -307,7 +307,7 @@ def main(cfg):
         # —— ⑧ 组合最终外在奖励 ——
         ext_reward = raw_reward + proximity_bonus + danger_shaping
         # —— ⑨ 下一状态转张量 ——
-        next_raw = torch.from_numpy(next_state_np).float().to(device)
+        next_raw = next_state_np.float().to(device)
 
         # —— ⑩ 计算 Intrinsic Curiosity Reward —— #
         # 1) 下一个 Processor 特征
