@@ -138,7 +138,7 @@ class CogUnit:
         # —— 新增 Intrinsic Goal 支持 ——
         self.personal_goal = None            # 当前内在目标 (x,y)
         self.visit_counts = {}               # {(x,y): 次数}
-        self.intrinsic_reward = 0.5         # 达到内在目标奖励能量
+        self.intrinsic_reward = 1.0         # 达到内在目标奖励能量
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
         self.intrinsic_cooldown = 20  # 冷却步数
         self._last_intrinsic_step = -float("inf")
@@ -165,6 +165,7 @@ class CogUnit:
         self.last_rewarded_target_idx = None   # 上一次领奖的资源索引
         self.linger_steps             = 0      # 在同一目标附近逗留的帧数
         self.latest_base_reward       = 0.0    # 上一次靠近时发的 base 奖励，用来扣回
+        self.is_permanent_explorer = False
 
         self.memory_buffer = MemoryBuffer(maxlen=200)
 
@@ -363,7 +364,7 @@ class CogUnit:
         # === 高频调用奖励机制 ===
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
         if avg_recent_calls >= 4.0 and self.energy > 0.0:
-            self.energy += 0.04
+            self.energy += 0.05
             # self.meta.record(action="high_freq", reward=+0.04)
             logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.04")
 
@@ -379,7 +380,7 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.05
+        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.03
         self.energy += self_reward
         # self.meta.record(action="self_reward", reward=self_reward)
         if self_reward > 0:
@@ -676,20 +677,6 @@ class CogUnit:
             f"[记忆加入] {self.id}（{self.role}，Age={self.age}）加入本地记忆池，评分={mem['score']:.2f}，当前共 {len(self.local_memory_pool)} 条")
 
     def should_die(self) -> bool:
-
-        if self.role == "emitter" and getattr(self, "global_emitter_count", 1) <= 2:
-            if self.age < 600:
-                return False  # 不杀唯一 emitter
-
-        elif self.role == "processor" and getattr(self, "global_processor_count", 1) <= 4:
-            if self.age < 600:
-                return False
-
-
-        elif self.role == "sensor" and getattr(self, "global_sensor_count", 1) <= 2:
-            if self.age < 600:
-                return False
-
         if self.role == "processor":
             if self.energy <= 0.0:
                 return True
@@ -721,6 +708,12 @@ class CogUnit:
                 if self.is_worthy_of_memory():
                     self.add_to_local_memory()
                 return True
+
+        graph = getattr(self, "graph", None)
+        if graph is not None:
+            # 保护期内不进行非强制死亡
+            if 0 <= graph.current_step - graph.static_mode_exit_step <= 50:
+                return False
 
         # 平均调用频率太低（仅针对 emitter）
         if self.role in ["emitter"] and self.inactive_steps > 20:
@@ -886,6 +879,10 @@ class CogUnit:
             logger.debug(f"[记忆融合] {self.id} 结合 local memory 基因 → 子基因：{clone_unit.gene}")
 
             if self.last_output is None or memory.get("output") is None:
+                # ✅ 若母体是永久探索者，则子体也继承
+                if getattr(self, "is_permanent_explorer", False):
+                    clone_unit.is_permanent_explorer = True
+                clone_unit.visit_counts = self.visit_counts.copy()
                 return clone_unit  # 跳过融合逻辑
             if "output" in memory:
                 o1 = self.last_output.squeeze(0) if self.last_output.dim() == 2 else self.last_output
@@ -913,6 +910,10 @@ class CogUnit:
                         )
                         clone_unit.gene["hidden_size_tag"] = new_hidden
                         logger.debug(f"[网络融合] hidden_size 融合为 {new_hidden}")
+        # ✅ 若母体是永久探索者，则子体也继承
+        if getattr(self, "is_permanent_explorer", False):
+            clone_unit.is_permanent_explorer = True
+        clone_unit.visit_counts = self.visit_counts.copy()
         return clone_unit
 
     def record_memory(self, state: torch.Tensor, action, reward: float, outcome: str):

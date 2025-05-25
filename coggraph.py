@@ -143,6 +143,7 @@ class CogGraph:
                 self.connect(s, p)
 
         # 每个 emitter 只挑几个 processor 做上游
+
         for e in emitters:
             # 如果处理器太少，就连所有；否则随机取 3 条
             ups = processors if len(processors) <= 3 else random.sample(processors, 3)
@@ -167,6 +168,7 @@ class CogGraph:
         self._death_energy_sum: Dict[str, float] = {}  # role -> total energy
         self.debug = False
         self.reverse_connections = {}  # to_id -> set(from_ids)
+        self.static_mode_exit_step = -9999  # 初始化为很早以前
         self.sensor_count = 0
         self.processor_count = 0
         self.emitter_count = 0
@@ -342,6 +344,7 @@ class CogGraph:
         # 全局统一：始终迁移到 graph.device（在 __init__ 设定）,启用gpu的时候使用
         if unit.device != self.device:
             unit.to(self.device)
+        unit.graph = self
         # 将单元加入图结构中
         self.units.append(unit)
         self.unit_map[unit.id] = unit
@@ -857,7 +860,7 @@ class CogGraph:
 
     def auto_connect(self):
         # 退火：单元越多，触发间隔越长，避免 O(N²) 每步扫描
-        if self.current_step % max(40, len(self.units)//100) != 0:
+        if self.current_step % max(60, len(self.units)//100) != 0:
             return
 
         def euclidean(p1, p2):
@@ -1273,7 +1276,7 @@ class CogGraph:
         return list(approved)
 
     def _expand_energy_cap_if_needed(self):
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
+        if self.current_step > 0 and self.current_step % 1000 == 0:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(
@@ -1396,12 +1399,12 @@ class CogGraph:
                         self.reverse_connections.get(to_id, set()).discard(from_id)
                         logger.debug(f"[连接衰减清除] {from_id} → {to_id}")
 
-    def handle_energy_overflow(self):
+    def handle_energy_overflow(self) -> object:
         """处理能量超标的细胞，优先强制分裂，否则将能量存入能量池。"""
         if self.current_step % 40 != 0:
             return
 
-        over_energy_units = [u for u in self.units if u.energy > 3.5]
+        over_energy_units = [u for u in self.units if u.energy > 3.0]
         if not over_energy_units:
             return
 
@@ -1412,7 +1415,11 @@ class CogGraph:
             role = unit.get_role()
 
             # ✅ 分裂条件：当前角色不足 or 总能量未超标
-            if role_counts.get(role, 0) < min_counts[role] and self.total_energy() < self.max_total_energy:
+            if (
+                    role_counts.get(role, 0) < min_counts[role] and
+                    (self.total_energy() < self.max_total_energy)
+            ):
+
                 expected_input = self.env_size * self.env_size * INPUT_CHANNELS
                 child = unit.clone(
                     new_input_size=expected_input,
@@ -1432,8 +1439,8 @@ class CogGraph:
                 logger.info(f"[强制分裂] {unit.id} ({role}) → 数量不足/系统未满 → 复制")
             else:
                 # ⚠️ 不满足分裂条件 → 转为能量池
-                contribution = unit.energy * 0.5
-                unit.energy *= 0.5
+                contribution = unit.energy * 0.2
+                unit.energy *= 0.8
                 self.energy_pool += contribution
 
                 logger.debug(
@@ -1441,37 +1448,45 @@ class CogGraph:
 
     def supply_energy_from_pool(self):
         """
-        每 60 步触发一次，从能量池中为 age > 100 的细胞和能量过低的细胞补给能量。
+        每 10 步触发一次：从能量池中为细胞补能。
+        逻辑：
+        - 如果细胞总能量 < max_total_energy * 0.9：
+            → 从 energy_pool 补能，直到池为空或达到90%
+            → 优先补 age > 100 和 energy < 0.5 的细胞
+        - 无论总能量是否超限，都允许每 40 步为弱细胞额外补能（只要池里有）
         """
-        if self.current_step % 60 != 0:
+        if self.current_step % 10 != 0:
             return
 
-        total_cell_energy = sum(u.energy for u in self.units)
+        total_cell_energy = self.total_energy()
+        max_allowable = self.max_total_energy * 0.9
+        to_distribute = max(0.0, min(self.energy_pool, max_allowable - total_cell_energy))
 
-        if total_cell_energy < self.max_total_energy and self.energy_pool > 0.0:
-            needed = self.max_total_energy - total_cell_energy
-            to_distribute = min(self.energy_pool, needed)
+        # ✅ 优先补给老弱细胞（age>100 或 energy<0.5）
+        priority_units = [u for u in self.units if u.energy < 0.5 or u.age > 100]
+        all_units = self.units
 
-            aged_units = [u for u in self.units if getattr(u, "age", 0) > 100]
-            if aged_units and to_distribute > 0:
-                per_aged = to_distribute / len(aged_units)
-                for u in aged_units:
-                    u.energy += per_aged
-                self.energy_pool -= to_distribute
-                logger.info(
-                    f"[百岁补给] 对 {len(aged_units)} 个 age>100 细胞，每个补给 {per_aged:.2f}，"
-                    f"已从能量池扣除 {to_distribute:.2f}"
-                )
+        # —— 主补给逻辑（直到能量达到限制或池为空） ——
+        if to_distribute > 0 and all_units:
+            for unit in priority_units + all_units:
+                if to_distribute <= 0:
+                    break
+                give = min(0.2, to_distribute)
+                unit.energy += give
+                to_distribute -= give
+                self.energy_pool -= give
+            logger.info(
+                f"[主补给] 为 {len(all_units)} 个细胞发放能量，共消耗 {self.energy_pool:.2f} → 当前细胞总能量 {self.total_energy():.2f}"
+            )
 
-        if self.energy_pool > 1.0:
-            weak_units = [u for u in self.units if u.energy < 0.5]
-            if weak_units:
-                per_unit = min(0.2, self.energy_pool / len(weak_units))
-                for u in weak_units:
-                    u.energy += per_unit
-                    self.energy_pool -= per_unit
-                logger.info(f"[能量补给] 从能量池为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
-
+        # —— 额外弱细胞补给（无论总能量是否超限） ——
+        weak_units = [u for u in self.units if u.energy < 0.5]
+        if self.energy_pool > 0.1 and weak_units:
+            per_unit = min(0.2, self.energy_pool / len(weak_units))
+            for u in weak_units:
+                u.energy += per_unit
+                self.energy_pool -= per_unit
+            logger.info(f"[弱细胞补给] 为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     def clone_and_connect(self, parent):
         """
@@ -1521,6 +1536,33 @@ class CogGraph:
             outcome = "success" if reward > 0 else "fail"
             u.record_memory(state_snapshot, action, reward, outcome)
 
+    def _maintain_explorer_emitter_ratio(self):
+        emitters = [u for u in self.units if u.role == "emitter"]
+        total = len(emitters)
+        if total == 0:
+            return
+
+        target = max(1, int(total * 0.1))  # 目标探索者数量
+
+        explorers = [e for e in emitters if getattr(e, "is_permanent_explorer", False)]
+        non_explorers = [e for e in emitters if not getattr(e, "is_permanent_explorer", False)]
+
+        # === 补齐探索者 ===
+        if len(explorers) < target:
+            need = target - len(explorers)
+            non_explorers.sort(key=lambda u: -u.energy)  # 按能量从高到低挑
+            for u in non_explorers[:need]:
+                u.is_permanent_explorer = True
+                logger.info(f"[开拓者补齐] {u.id} 被标记为开拓 emitter，充满了决心！")
+
+        # === 削减多余探索者 ===
+        elif len(explorers) > target:
+            excess = len(explorers) - target
+            explorers.sort(key=lambda u: u.energy)  # 能量最低者先剔除
+            for u in explorers[:excess]:
+                delattr(u, "is_permanent_explorer")
+                logger.info(f"[开拓者削减] {u.id} 被取消开拓身份。列车人太多啦，下去点下去点。")
+
     def _apply_unit_metabolism(self, unit, unit_input):
         if getattr(unit, "resting", False):
             return
@@ -1540,8 +1582,8 @@ class CogGraph:
         call_density = freq / (conn + 1)
         conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
 
-        dim_scale = 1.0 if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
-            1.0 + 0.5 * ((self.current_step - 3000) / 3000)
+        dim_scale = 1.0 # if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
+        #     1.0 + 0.5 * ((self.current_step - 3000) / 3000)
 
         bias_factor = unit.gene.get(f"{unit.role}_bias", 1.0)
         step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
@@ -1550,7 +1592,7 @@ class CogGraph:
         decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
                 * dim_scale * bias_factor * step_factor * unit_factor
         # honor 单元自己的 metabolic_rate
-        base_factor = 0.015 if self.current_step < 1000 else 0.035
+        base_factor = 0.015 if self.current_step < 1000 else 0.030
         if unit.role == "emitter":
             unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0) * 0.1
         else:
@@ -1593,7 +1635,7 @@ class CogGraph:
 
     # —— 2) 判断是否进入静吸模式 —— #
     def _check_enter_static_mode(self):
-        if self.current_step >= 3500 and self.steps_since_last_reward >= 100 and not self.static_mode:
+        if self.current_step >= 1000 and self.steps_since_last_reward >= 100 and not self.static_mode:
             self._enter_static_mode()
 
     # —— 3) 进入静吸模式 —— #
@@ -1603,9 +1645,17 @@ class CogGraph:
         """
         # 1) 随机选 10% emitter
         logger.warning("没奖励，没动力了，睡大觉！")
-        emitters = [u for u in self.units if u.role == "emitter"]
+        # ❌ 排除探索者
+        emitters = [
+            u for u in self.units
+            if u.role == "emitter" and not getattr(u, "is_permanent_explorer", False)
+        ]
         n_active = max(1, math.ceil(0.1 * len(emitters)))
-        active_emitters = set(random.sample(emitters, n_active))
+        if n_active > len(emitters):
+            logger.warning("[静息模式] 可选的普通 emitter 不足，启用全部普通 emitter")
+            active_emitters = set(emitters)
+        else:
+            active_emitters = set(random.sample(emitters, n_active))
 
         # 2) 扩展到上游 processor 和最强 sensor
         active = set(active_emitters)
@@ -1627,7 +1677,7 @@ class CogGraph:
                     active.add(best)
 
         # 3) 记录原始 age，并设置 resting / metabolic_rate
-        self._orig_age = {u.id: u.age for u in active}
+        self._orig_age = {u.id: u.age for u in self.units}  # ✅ 不只是 active，而是所有细胞
         for u in self.units:
             u.resting = (u not in active)
             # 记录原始代谢率
@@ -1643,6 +1693,7 @@ class CogGraph:
     def _exit_static_mode(self):
         logger.warning("每日刷新了，集美们动起来动起来")
         self.static_mode = False
+        self.static_mode_exit_step = self.current_step  # ✅ 记录当前步数
         for u in self.units:
             # 如果这个单元进入了 resting，它才应该有一个原始 metabolic_rate
             if u.id in self._orig_metabolic:
@@ -1698,7 +1749,21 @@ class CogGraph:
         self._handle_reward_and_penalty()
 
         # 如果刚获得奖励，会在 _handle_reward_and_penalty 内 exit static
+        # ✅ 所有静息单元的 age 保持静止
+        for u in self.units:
+            if getattr(u, "resting", False):
+                u.age = self._orig_age.get(u.id, u.age)
+
+        self._perform_system_maintenance()
+
         return
+
+    def _perform_system_maintenance(self):
+        self.supply_energy_from_pool()
+
+        if self.debug and self.current_step % 40 == 0:
+            self.rebalance_cell_types()
+
 
     def step(self, input_tensor: torch.Tensor):
         if self.current_step % 1000 == 0:
@@ -1740,15 +1805,14 @@ class CogGraph:
 
         self._expand_environment_curriculum()
 
+        self._rebuild_free_positions()
+        
+        self._expand_energy_cap_if_needed()
+
         if self.static_mode:
             return self._static_step(input_tensor)
 
         self._apply_warmup_and_energy_tax()
-
-        self._rebuild_free_positions()
-
-        self._expand_energy_cap_if_needed()
-
 
         # 每次循环时，根据当前步数决定更新间隔
         step = self.current_step
@@ -1778,7 +1842,8 @@ class CogGraph:
         output_buffer = {}  # 缓存每个单元的输出 {unit_id: output_tensor}
 
         # === 系统总能量限制，保护 clone ===
-        allow_clone = self.total_energy() < self.max_total_energy
+        cell_energy = self.total_energy()
+        allow_clone = cell_energy < self.max_total_energy * 0.98
 
         # === 第一阶段：单元更新处理 ===
         # 统计当前 emitter 数量
@@ -1818,10 +1883,6 @@ class CogGraph:
 
         # —— 统一统计 & 连接打印（仅 debug） ——
         self._log_stats_and_conns()
-        if self.debug and self.current_step % 40 == 0:
-            self.rebalance_cell_types()
-
-        self.handle_energy_overflow()
 
         # === 40 %-限额复制（>15 细胞才触发） ===
         selected_parents = self._select_clone_parents(pending)
@@ -1833,16 +1894,17 @@ class CogGraph:
         for unit in new_units:
             self.add_unit(unit)
 
-        # —— 定期合并 & 重构（核心算法，必须保留） ——
-        interval = max(120, len(self.units) // 50)
+        self._perform_system_maintenance()
+
+        self.handle_energy_overflow()
+
+        interval = max(200, len(self.units) // 8)
         if self.current_step % interval == 0:
             self.merge_redundant_units()
             self.restructure_common_subgraphs()
 
-        self.supply_energy_from_pool()
-
         # —— 新增：周期性清理统计 ——
-        if self.current_step % 1 == 0:
+        if self.current_step % 50 == 0:
             res_cleared = self.removed_resources_count
             haz_by_reward = self.removed_hazards_by_reward
             haz_cleared = self.removed_hazards_count
@@ -1857,6 +1919,8 @@ class CogGraph:
 
         self.meta_self_evaluation()
         self.record_long_term_memory(prev_energies, state_snapshot)
+        if self.current_step % 50 == 0:
+            self._maintain_explorer_emitter_ratio()
 
     def _handle_reward_and_penalty(self):
         # 本步是否有 emitter 刚获得奖励？
@@ -1919,32 +1983,48 @@ class CogGraph:
             self.expand_unit_dim(unit, expected_input)
 
         if unit.get_role() == "emitter":
-            if unit.personal_goal is None and (
-                    self.current_step - unit._last_intrinsic_step) >= unit.intrinsic_cooldown:
+            # === 判断使用最近资源 / 陷阱 / 好奇点 ===
+            use_curiosity = getattr(unit, "is_permanent_explorer", False) and self.current_step >= 2000
+
+            if not use_curiosity:
+                pos = unit.get_position()
+                nearest_res = self.env.get_nearest_resource_to(pos)
+                nearest_hzd = self.env.get_nearest_danger_to(pos)
+
+                if nearest_res is not None:
+                    unit.personal_goal = nearest_res
+                    unit.goal_type = "resource"
+                elif nearest_hzd is not None:
+                    unit.personal_goal = nearest_hzd
+                    unit.goal_type = "hazard"
+                else:
+                    use_curiosity = True
+
+            if use_curiosity:
+                unit.goal_type = "curiosity"
                 taken = {
                     e.personal_goal for e in self.units
                     if e is not unit and e.get_role() == "emitter" and e.personal_goal is not None
                 }
-                all_positions = [(x, y) for x in range(self.env_size) for y in range(self.env_size)]
-                avail = [p for p in all_positions if p not in taken]
-                if avail:
-                    min_count = min(unit.visit_counts.get(p, 0) for p in avail)
-                    candidates = [p for p in avail if unit.visit_counts.get(p, 0) == min_count]
-                    unit.personal_goal = random.choice(candidates)
-                else:
-                    unit.personal_goal = random.choice(all_positions)
+                unit.visit_counts = getattr(unit, "visit_counts", Counter())
+                unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts, exclude=taken)
                 unit.visit_counts.setdefault(unit.personal_goal, 0)
 
-            ext_goal = self.target_vector.clone()
-            if not hasattr(unit, "personal_goal"):
-                unit.visit_counts = Counter()
-                unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts)
-                unit.visit_counts[unit.personal_goal] = 0
-            if unit.personal_goal is None:
-                int_onehot = torch.zeros(1, self.env_size * self.env_size, device=self.device)
-            else:
-                int_onehot = make_onehot(self.env_size, unit.personal_goal, device=self.device).unsqueeze(0)
-            unit.goal_vec = torch.cat([ext_goal, int_onehot], dim=0)
+            # === 构造目标向量 ===
+            res_map = torch.zeros(1, self.env_size * self.env_size, device=self.device)
+            hz_map = torch.zeros_like(res_map)
+            cu_map = torch.zeros_like(res_map)
+
+            if unit.personal_goal is not None:
+                idx = unit.personal_goal[1] * self.env_size + unit.personal_goal[0]
+                if unit.goal_type == "resource":
+                    res_map[0, idx] = 1.0
+                elif unit.goal_type == "hazard":
+                    hz_map[0, idx] = 1.0
+                elif unit.goal_type == "curiosity":
+                    cu_map[0, idx] = 1.0
+
+            unit.goal_vec = torch.cat([res_map, hz_map, cu_map], dim=0)
             unit.current_hazard_xy = getattr(self, "current_hazard_xy", None)
 
         unit.global_emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
@@ -1995,8 +2075,10 @@ class CogGraph:
                 unit.energy += unit.intrinsic_reward
                 unit.meta.record(action="intrinsic", reward=+unit.intrinsic_reward)
                 logger.info("你达到了你好奇的地方，心中充满了决心")
+                unit.visit_counts.setdefault((px, py), 0)
                 unit.visit_counts[(px, py)] += 1
-                unit._last_intrinsic_step = self.current_step
+                if not getattr(unit, "is_permanent_explorer", False):
+                    unit._last_intrinsic_step = self.current_step
                 unit.personal_goal = None
                 if getattr(unit, "goal_vec", None) is not None \
                         and unit.goal_vec.dim() == 2 \
@@ -2043,11 +2125,25 @@ class CogGraph:
                 if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
             ]
 
+            # === 靠近陷阱后又撤退，触发好奇点切换 ===
+            if getattr(unit, "goal_type", "") == "hazard" and hazard is not None:
+                px, py = torch.argmax(pred).item() % self.env_size, torch.argmax(pred).item() // self.env_size
+                hz_dist = math.hypot(px - hx, py - hy)
+
+                prev_dist = getattr(unit, "_last_hazard_dist", float("inf"))
+                unit._last_hazard_dist = hz_dist  # 更新距离记录
+
+                if prev_dist <= 3.0 and hz_dist > 4.0:
+                    unit.goal_type = "curiosity"
+                    unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts)
+                    unit.visit_counts[unit.personal_goal] = 0
+                    logger.info(f"[目标切换] emitter {unit.id} 接近陷阱后撤退，发现不对劲，有歹徒要害我！ → 切换为好奇点 {unit.personal_goal}")
+
             if is_hz_hit and (hx, hy) in self.env.hazards:
                 unit.energy -= 0.50
                 unit.meta.record(action=pred_idx, reward=-0.5)
                 for p in upstream_processors:
-                    p.energy -= 0.125
+                    p.energy -= 0.4
                     p.meta.record(action=pred_idx, reward=-0.125)
                 unit.is_hazard_confirmed = True
                 unit.last_action_rewarded = False
@@ -2058,6 +2154,9 @@ class CogGraph:
                 self.removed_hazards_count += 1
                 unit.goal_vec[1, hazard_idx] = 0.0
                 # —— 吃完这个资源之后，重新选最近的资源和惩罚点 —— #
+                if getattr(unit, "is_permanent_explorer", False):
+                    continue  # 永久探索者不应被重设为资源目标
+
                 next_res = self.env.get_nearest_resource_to(unit.get_position())
                 if next_res is not None:
                     ridx = next_res[1] * self.env_size + next_res[0]
@@ -2096,8 +2195,8 @@ class CogGraph:
                     p.meta.record(action=cur_idx, reward=+(base_r * 0.25))
 
                 if is_res_hit:
-                    unit.energy += 0.5
-                    unit.meta.record(action=cur_idx, reward=+0.5)
+                    unit.energy += 1.2
+                    unit.meta.record(action=cur_idx, reward=+1.2)
                     if self.env.resources[(x_res, y_res)] > 0:
                         self.env.resources[(x_res, y_res)] -= 1
                         if self.env.resources[(x_res, y_res)] == 0:
@@ -2112,6 +2211,9 @@ class CogGraph:
                         )
                         del self.env.hazards[far]
                         self.removed_hazards_by_reward += 1
+                    if getattr(unit, "is_permanent_explorer", False):
+                        continue  # 永久探索者不应被重设为资源目标
+
                     # —— 吃完资源后，重新选最近的资源&惩罚点 —— #
                     next_res = self.env.get_nearest_resource_to(unit.get_position())
                     if next_res is not None:
@@ -2128,8 +2230,8 @@ class CogGraph:
                     unit.linger_steps = 0
                     unit.last_reward_amount = 0.0
                     for p in upstream_processors:
-                        p.energy += 0.125
-                        p.meta.record(action="cur_idx", reward=+0.125)
+                        p.energy += 0.9
+                        p.meta.record(action="cur_idx", reward=+0.9)
 
                 unit.last_rewarded_target_idx = cur_idx
                 unit.last_reward_amount = base_r
@@ -2185,9 +2287,9 @@ class CogGraph:
 
 
     def _expand_environment_curriculum(self):
-        if 3000 > self.current_step >= 1000 and self.current_step % 1000 == 0:
+        if self.current_step >= 1000 and self.current_step % 1000 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 50)
+            self.env_size = min(self.env_size + 5, 500)
             self.env.resize(self.env_size)
 
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
