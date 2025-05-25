@@ -6,7 +6,7 @@ import random
 from env import GridEnvironment
 import torch.nn.functional as F
 import numpy as np
-import logging
+import gc, torch
 from collections import deque, Counter
 from env import logger
 from typing import List, Dict
@@ -185,9 +185,7 @@ class CogGraph:
         self.units = []
         self.removed_resources_count = 0
         self.removed_hazards_count = 0
-        # self.id2idx = {}  # 单元 id  → 索引 0..N-1
-        # self.idx2id = []  # 反向（保持 list 方便迭代）
-        # self.edge_dirty = True  # 只要连边变化就置 True
+        self.active_units = set()
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -242,6 +240,12 @@ class CogGraph:
             from torch import _dynamo as torch_dynamo      # 只绑定 torch_dynamo，不碰 torch
             torch_dynamo.config.suppress_errors = True
 
+            if RF.use_compile and torch.cuda.is_available():
+                try:
+                    self.shared_encoder = torch.compile(self.shared_encoder, mode=RF.compile_mode, fullgraph=False)
+                    logger.info("[Compile] shared_encoder 已 JIT 编译")
+                except Exception as e:
+                    logger.warning(f"[Compile] shared_encoder 编译失败：{e}")
 
             def _compile(m):
                 if getattr(m, "_compiled", False): return m
@@ -513,8 +517,10 @@ class CogGraph:
         # u.energy = u.initial_energy  # 需在 CogUnit 中保存初始能量
 
 
-    def merge_redundant_units(self):
+    def merge_redundant_units(self, max_merge_cells=100):
         merged_pairs = set()
+        use_cuda = torch.cuda.is_available() and self.device.type == "cuda"
+
         new_units = []
 
         # —— STEP1：构建空间哈希（按位置格子划分） ——
@@ -524,14 +530,41 @@ class CogGraph:
             gx, gy = u.position[0] // cell_size, u.position[1] // cell_size
             grid.setdefault((gx, gy), []).append(u)
 
-        for u1 in self.units:
+        # ✅ 限制参与者：根据能量+活跃度挑 top-N
+        scored = [(u, u.energy + getattr(u, "avg_recent_calls", 0)) for u in self.units]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        limited_units = [u for u, _ in scored[:max_merge_cells]]
+        # —— STEP1.5：提前缓存所有输出并 pad 到相同维度 ——
+        target_dim = self.env_size * self.env_size
+        output_cache = {}
+
+        for u in limited_units:
+            out = u.get_output().squeeze(0)
+            if out.shape[0] < target_dim:
+                out = F.pad(out, (0, target_dim - out.shape[0]))
+            elif out.shape[0] > target_dim:
+                out = out[:target_dim]
+            out = out.to(self.device, non_blocking=True)
+            output_cache[u.id] = out
+
+        if use_cuda:
+            unit_ids = [u.id for u in limited_units]
+            output_tensor = torch.stack([output_cache[uid] for uid in unit_ids], dim=0)  # [N,D]
+            output_tensor = F.normalize(output_tensor, dim=1)  # 单位化以计算 cosine
+            similarity_matrix = output_tensor @ output_tensor.T  # [N,N] cosine sim 矩阵
+
+        for u1 in limited_units:
             gx, gy = u1.position[0] // cell_size, u1.position[1] // cell_size
             # 只拿本格和 8 个邻格里的单元做两两
-            neighbors = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    neighbors += grid.get((gx + dx, gy + dy), [])
+            neighbor_cells = [
+                grid.get((gx + dx, gy + dy), [])
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            ]
+            neighbors = set().union(*neighbor_cells)  # 去重
             for u2 in neighbors:
+                if u2 not in limited_units:
+                    continue
+
                 if u2 is u1:
                     continue
 
@@ -553,21 +586,15 @@ class CogGraph:
 
                 # 输出相似度判断（cosine similarity）
                 # === 输出相似度判断（cosine similarity）===
-                output1 = u1.get_output().squeeze(0)
-                output2 = u2.get_output().squeeze(0)
+                output1 = output_cache[u1.id]
+                output2 = output_cache[u2.id]
 
-                # 🔥 自动补零到当前环境预期尺寸
-                target_dim = max(output1.shape[0], output2.shape[0])
-
-                if output1.shape[0] < target_dim:
-                    padding = (0, target_dim - output1.shape[0])
-                    output1 = torch.nn.functional.pad(output1, padding, value=0)
-
-                if output2.shape[0] < target_dim:
-                    padding = (0, target_dim - output2.shape[0])
-                    output2 = torch.nn.functional.pad(output2, padding, value=0)
-
-                sim = F.cosine_similarity(output1, output2, dim=0).item()
+                if use_cuda:
+                    idx1 = unit_ids.index(u1.id)
+                    idx2 = unit_ids.index(u2.id)
+                    sim = similarity_matrix[idx1, idx2].item()
+                else:
+                    sim = F.cosine_similarity(output1, output2, dim=0).item()
 
                 if sim < 0.95:
                     continue
@@ -823,6 +850,12 @@ class CogGraph:
                     if frm not in self.unit_map or \
                             to_id not in self.connections.get(frm, {}):
                         from_set.discard(frm)
+            # ✅ 清除连接记录中，指向已不存在或失效连接的条目
+            self.connection_usage = {
+                k: v for k, v in self.connection_usage.items()
+                if k[0] in self.unit_map and k[1] in self.unit_map and
+                   k[1] in self.connections.get(k[0], {})
+            }
 
             if not self.connection_usage:
                 return
@@ -853,8 +886,12 @@ class CogGraph:
 
             # 强化高效连接（可选：比如增加能量传递权重等）
             for conn in to_strengthen:
-                # 简单打印标记，可以后续加真实权重系统
-                logger.debug(f"[强化] 连接 {conn[0]} → {conn[1]} 被强化")
+                from_unit, to_unit = conn
+                if from_unit in self.connections and to_unit in self.connections[from_unit]:
+                    self.connections[from_unit][to_unit] *= 1.1  # 每次乘以 1.1
+                    self.connections[from_unit][to_unit] = min(self.connections[from_unit][to_unit], 3.0)  # 上限 cap
+                    logger.debug(
+                        f"[强化] 连接 {from_unit} → {to_unit} 权重提升为 {self.connections[from_unit][to_unit]:.2f}")
 
             logger.info(f"[剪枝] 剪掉 {len(to_prune)} 条弱连接，强化 {len(to_strengthen)} 条强连接")
 
@@ -867,10 +904,14 @@ class CogGraph:
             return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
         # 只对最近 step 内更新过且能量高的前 M 个单元做新连尝试
-        scored = [(u, u.energy + u.avg_recent_calls) for u in self.units]
+        # 优先使用活跃单元缓存（如为空则 fallback 全局）
+        active_units = list(self.active_units) if self.active_units else self.units
+        scored = [(u, u.energy + u.avg_recent_calls) for u in active_units]
         scored.sort(key=lambda x: x[1], reverse=True)
         hot_units = [u for u, _ in scored[: min(len(scored), 50)]]
         for unit in hot_units:
+            if unit.id not in self.connections:
+                self.connections[unit.id] = {}  # ✅ 加这个防御性初始化
 
             role = unit.get_role()
 
@@ -924,7 +965,7 @@ class CogGraph:
                     candidates.sort(key=connection_strength, reverse=True)
 
                     for target in candidates:
-                        if target.id not in current_connections:
+                        if target.id not in self.connections.get(unit.id, {}):
                             prev_conn_count = len(self.connections[unit.id])
                             self.connect(unit, target)
                             if len(self.connections[unit.id]) > prev_conn_count:
@@ -1061,7 +1102,6 @@ class CogGraph:
             conv_done += 1
             self._update_global_counts()
 
-        # 在 coggraph.py 里，把原来的 upscale_old_units 全部替换为下面这个
 
     def expand_unit_dim(self, unit: CogUnit, new_input_size: int):
         """仅将 *一个* unit 升维到 new_input_size（只升不降）"""
@@ -1185,7 +1225,6 @@ class CogGraph:
             # —— 6. 更新 input_size ——
             unit.input_size = new_input_size
 
-            import gc, torch
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()  # 立即释放旧显存
@@ -1428,6 +1467,9 @@ class CogGraph:
                     free_positions=self.free_positions
                 )
 
+                if self.device.type == "cuda":
+                    child.to(self.device)
+
                 split_bonus = 0.35 if self.current_step < 2000 else 0.0
                 unit.energy += split_bonus
                 child.energy += split_bonus
@@ -1615,6 +1657,8 @@ class CogGraph:
             pass
 
         unit.update(unit.last_output if hasattr(unit, "last_output") else None)
+        if hasattr(self, "active_units"):
+            self.active_units.add(unit)
         output_buffer[unit.id] = unit.get_output()
 
         for uid in self.reverse_connections.get(unit.id, ()):
@@ -1729,7 +1773,7 @@ class CogGraph:
                 u.current_hazard_xy = getattr(self, "current_hazard_xy", None)
 
         # upstream logic 重用 snapshot/prev_energies（如果需要 record_memory）
-        state_snapshot = full_state.clone().squeeze(0).detach()
+        state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
         prev_energies  = {u.id: u.energy for u in self.units}
 
         # 只更新 active 的单元
@@ -1771,6 +1815,8 @@ class CogGraph:
             self.removed_resources_count = 0
             self.removed_hazards_count  = 0
             self.removed_hazards_by_reward = 0
+        if self.current_step % 200 == 0:
+            self.active_units.clear()
 
         self.current_step += 1
         self._update_global_counts()
@@ -1796,7 +1842,7 @@ class CogGraph:
         full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
         # ─── 新增：长期记忆准备 ───
         # 1) 把 state snapshot 存下来（去掉 batch 维）
-        state_snapshot = full_state.clone().squeeze(0).detach()
+        state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
         # 2) 记录下此刻每个 unit 的能量，用来算 reward
         prev_energies = {u.id: u.energy for u in self.units}
 
@@ -1857,6 +1903,7 @@ class CogGraph:
             if active_ids is not None and unit.id not in active_ids:
                 continue
             unit_input = self._prepare_unit_before_update(unit, full_state, expected_input)
+            unit_input = unit_input.to(self.device)
             self._apply_unit_metabolism(unit, unit_input)
             self._finalize_unit_update(unit, state_snapshot, output_buffer, pending, allow_clone)
 
@@ -2040,6 +2087,8 @@ class CogGraph:
                 if unit.id not in self.connections.get(uid, {}):
                     continue
                 strength = self.connections[uid][unit.id]
+                if uid not in self.unit_map:
+                    continue  # 已被删除的单元，跳过
                 output = self.unit_map[uid].get_output().squeeze(0)
                 target_len = self.processor_hidden_size
                 if output.shape[0] != target_len:
@@ -2301,7 +2350,7 @@ class CogGraph:
 
             new_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
             self.task = TaskInjector(target_position=new_target)
-            self.target_vector = self.task.encode_goal(self.env_size)
+            self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
 
             logger.info(
                 f"[Curriculum升级] 第 {self.current_step} 步：环境大小 {old_size}x{old_size} → {self.env_size}x{self.env_size}，新目标 {new_target}")
@@ -2361,7 +2410,7 @@ class CogGraph:
 
         # length < goal_dim  → 右补零
         pad = (0, goal_dim - length)
-        return torch.nn.functional.pad(tensor, pad)
+        return torch.nn.functional.pad(tensor, pad, value=0).to(tensor.device)
 
     # ------------------------------------------------------------------
 
@@ -2392,6 +2441,11 @@ class CogGraph:
         sensors = [u for u in self.units if u.get_role() == "sensor"]
         if not sensors:
             return x            # 无 sensor 时直接返回
+
+        if not RF.batch_sensor:  # ← 用 config 统一控制是否 batch 模式
+            for s in sensors:
+                s.update(x.unsqueeze(0))
+            return torch.stack([s.last_output for s in sensors], dim=0).mean(dim=0)
 
         # ---- ⚡ 批量前向，仅做前向推理 ----
         # ① 把 N 份输入堆在一起
@@ -2494,7 +2548,7 @@ class CogGraph:
             inp = processor_out.to(dev).unsqueeze(0)
             for e in emitters:
                 e.update(inp)
-
+                e.last_output = e.get_output().detach()
 
     def _rebuild_free_positions(self):
         """一次性扫描所有格子，生成安全出生点列表"""
@@ -2533,7 +2587,7 @@ class CogGraph:
             aligned.append(vec.unsqueeze(0))
 
         if aligned:
-            stacked = torch.cat(aligned, dim=0)      # [N, goal_dim]
+            stacked = torch.cat(aligned, dim=0).to(self.device, non_blocking=True)      # [N, goal_dim]
             logger.debug(
                 "[输出检查] Emitter 对齐后均值(前5) : %s",
                 stacked.mean(dim=0)[:5]

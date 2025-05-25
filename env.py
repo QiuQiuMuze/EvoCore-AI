@@ -2,6 +2,7 @@
 import numpy as np
 import random
 import logging
+import torch
 from collections import deque
 from collections import Counter
 
@@ -60,7 +61,7 @@ class GridEnvironment:
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
 
-        extra = max(((self.step_count - 1500) // 250), 0)
+        extra = min(100,max(((self.step_count - 1500) // 250), 0))
 
         # —— 资源点 —— #
         total_res = int(self.size * self.size / 5) + extra

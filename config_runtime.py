@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 @dataclass
 class _Flags:
     # ---------- ① 批量前向 ----------
-    batch_sensor: bool = False       # sensor forward 已经改过
-    batch_processor: bool = False
+    batch_sensor: bool = True       # sensor forward 已经改过
+    batch_processor: bool = True
     batch_emitter: bool = False
 
     # ---------- ② torch.compile ----------
@@ -33,7 +33,7 @@ class _Flags:
     use_shared_tx: bool   = False   # 把 N 个 CogUnit 当序列一次性跑
     shared_tx_layers: int = 4      # 堆多少层
     shared_tx_heads: int  = 8      # Multi-Head 个数
-    shared_tx_interval: int = 1    # 每隔多少步跑一次（>1 可省 Python）
+    shared_tx_interval: int = 10    # 每隔多少步跑一次（>1 可省 Python）
     # ---------- ⑤ 全局开关 ----------
     def disable_all(self):
         """一次性关掉所有加速路径（Debug / CPU 训练用）。"""

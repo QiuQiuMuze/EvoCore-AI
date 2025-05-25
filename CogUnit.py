@@ -14,45 +14,10 @@ from memory_unit import MemoryBuffer
 
 # ======== CogUnit 全局功能开关 ========
 ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
-FOLLOW_INPUT_DEVICE = False  # ← 自动把内部张量跟随输入 device（GPU/CPU）
+FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
 # 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
 MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
 # ====================================
-
-
-# class LimitedDebugHandler(logging.Handler):
-#     def __init__(self, capacity=100):
-#         super().__init__(level=logging.DEBUG)  # 只处理 DEBUG
-#         self.buffer = deque(maxlen=capacity)
-#
-#     def emit(self, record):
-#         if record.levelno == logging.DEBUG:
-#             try:
-#                 msg = self.format(record)
-#                 self.buffer.append(msg)
-#             except Exception:
-#                 pass  # 防止格式化报错
-#
-#     def dump_to_console(self):
-#         print("\n==== [最近 Debug 日志] ====")
-#         for msg in self.buffer:
-#             print(msg)
-#
-# # === 设置 root logger ===
-# logger = logging.getLogger()
-# logger.setLevel(logging.DEBUG)
-# logger.handlers.clear()  # ✅ 防止重复打印（关键一步！）
-#
-# # ✅ 添加 Debug 缓存 Handler（不会显示、不输出、仅内存）
-# debug_handler = LimitedDebugHandler(capacity=100)
-# debug_handler.setFormatter(logging.Formatter('%(asctime)s [DEBUG] %(message)s', datefmt='%H:%M:%S'))
-# logger.addHandler(debug_handler)
-#
-# # ✅ 添加正常输出 Handler（只显示 INFO 及以上）
-# console_handler = logging.StreamHandler()
-# console_handler.setLevel(logging.INFO)
-# console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
-# logger.addHandler(console_handler)
 
 
 
@@ -116,6 +81,8 @@ class CogUnit:
             random.randint(0, env_size - 1),
             random.randint(0, env_size - 1),
         )
+        self.output_history_tensor = torch.zeros((5, input_size), device="cpu")
+        self.output_history_ptr = 0
         # self._rebuild_safe_positions()
         self.state_memory = []  # 记忆队列
         self.memory_limit = 5  # 可调整为 k 步
@@ -225,8 +192,18 @@ class CogUnit:
         reward = 0.01 * (self.input_size / 50) * (1.0 - error.item())  # error越小奖励越高
         return max(reward, 0.0)  # 不让奖励为负数
 
+    def get_recent_outputs(self, n=5):
+        """按时间顺序返回最近 n 帧输出（张量列表）"""
+        L = min(n, self.output_history_tensor.size(0))
+        idxs = [(self.output_history_ptr - i - 1) % L for i in reversed(range(L))]
+        return [self.output_history_tensor[i] for i in idxs]
 
     def update(self, input_tensor: torch.Tensor):
+        # 🚨 安全检查：function 权重与输入 tensor 一致
+        if not FOLLOW_INPUT_DEVICE:
+            if self.function[0].weight.device != input_tensor.device:
+                self.to(input_tensor.device)  # 强制迁移 function、state、last_output 等
+
         if input_tensor.dim() == 3 and input_tensor.size(1) == 1:
             input_tensor = input_tensor.squeeze(1)  # (1, D)
 
@@ -297,6 +274,8 @@ class CogUnit:
             # 重新组装 function，更新 input_size
             self.function = nn.Sequential(new_l1, nn.ReLU(), new_l2)
             self.input_size = current_input_size
+            self.output_history_tensor = torch.zeros((5, self.input_size), device="cpu")
+            self.output_history_ptr = 0
 
             new_hist = []
             for out in self.output_history:
@@ -324,24 +303,34 @@ class CogUnit:
         # === Forward: 内部处理 ===
         use_grad = ENABLE_MINI_LEARN
         # —— 前向只用于推理时关闭 Autograd ——
-        if not use_grad:
-            # inference_mode 更快且更彻底
-            with torch.inference_mode():
-                raw_output = self.function(input_tensor)
-        else:
+        ctx = (torch.autocast("cuda", dtype=torch.float16)
+               if (RF.use_fp16 and self.device.type == "cuda") else nullcontext())
+
+        with ctx, torch.inference_mode():
             raw_output = self.function(input_tensor)
 
         self.last_output = raw_output.detach().clone()  # ⚡ 关键：detach掉，避免污染计算图
         self.state = self.last_output.clone()
 
         # ✅ 存储输出历史，供行为质量判断用
-        self.output_history.append(self.last_output.detach().clone())
-        if len(self.output_history) > 5:
-            self.output_history.pop(0)
+        # ✅ 若升维后，output_history_tensor 的列数不一致，立即重建
+        if self.output_history_tensor.shape[1] != self.last_output.shape[0]:
+            self.output_history_tensor = torch.zeros((5, self.last_output.shape[0]), device="cpu")
+            self.output_history_ptr = 0
+
+        # ✅ 存储输出历史，供行为质量判断用
+        out = self.last_output.detach().cpu().view(-1)  # 保证是 1D 向量
+        if out.shape[0] != self.output_history_tensor.shape[1]:
+            # 自动重建历史缓存，确保维度对齐
+            self.output_history_tensor = torch.zeros((5, out.shape[0]), device="cpu")
+            self.output_history_ptr = 0
+        self.output_history_tensor[self.output_history_ptr] = out
+        self.output_history_ptr = (self.output_history_ptr + 1) % self.output_history_tensor.shape[0]
+
         self.age += 1
 
         # === 外部状态记忆（用于后续奖励机制） ===
-        self.state_memory.append(self.state.clone())
+        self.state_memory.append(self.state.detach().cpu())
         if len(self.state_memory) > self.memory_limit:
             self.state_memory.pop(0)
 
@@ -496,10 +485,9 @@ class CogUnit:
         if role != "sensor" and self.avg_recent_calls < rule["min_calls"]:
             return False
 
-        if len(self.output_history) >= 6:
-            recent = self.output_history[-6:]
-            if all(torch.equal(recent[0], o) for o in recent[1:]):
-                return False
+        history = self.get_recent_outputs(6)
+        if len(history) >= 6 and all(torch.equal(history[0], h) for h in history[1:]):
+            return False
 
         return True
 
