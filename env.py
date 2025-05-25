@@ -60,35 +60,29 @@ class GridEnvironment:
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
 
-        """刷新资源与危险格子的位置（每隔一段时间）"""
-        self.resources.clear()
-        self.hazards.clear()
-        # 修正语法：先计算增量
         extra = max(((self.step_count - 1500) // 250), 0)
 
-        attempts = 0
-        total = int(self.size * self.size / 6) + extra
-        while sum(self.resources.values()) < total and attempts < 1000:
-            pos = (
-                random.randint(0, self.size - 1),
-                random.randint(0, self.size - 1)
-            )
-            if pos not in exclude_positions:
-                self.resources[pos] += 1
-            attempts += 1
+        # —— 资源点 —— #
+        total_res = int(self.size * self.size / 5) + extra
+        self.resources.clear()
+        candidates = [
+            (x, y)
+            for x in range(self.size)
+            for y in range(self.size)
+            if (x, y) not in exclude_positions
+        ]
+        random.shuffle(candidates)
+        for pos in candidates[: total_res]:
+            self.resources[pos] = 1
 
-        attempts = 0
-        total_h = int(self.size * self.size / 3) + extra
-        while sum(self.hazards.values()) < total_h and attempts < 1000:
-            pos = (
-                random.randint(0, self.size - 1),
-                random.randint(0, self.size - 1)
-            )
-            if pos not in exclude_positions:
-                self.hazards[pos] += 1
-            attempts += 1
+        # —— 危险点 —— #
+        total_haz = int(self.size * self.size / 3) + extra
+        self.hazards.clear()
+        random.shuffle(candidates)
+        for pos in candidates[: total_haz]:
+            self.hazards[pos] = 1
 
-        # ✅ 每次刷新资源/陷阱后，也要刷新探索地图
+        # 刷新探索标记
         self.visited_map = np.zeros((self.size, self.size), dtype=bool)
         self.explored_cells_count = 0
 
@@ -136,23 +130,17 @@ class GridEnvironment:
         pos = (x, y)
         # —— 资源命中 —— #
         if self.resources[pos] > 0:
-            # 减掉一次出现
-            self.resources[pos] -= 1
-            # 如果计数归零，就删掉这个 key
-            if self.resources[pos] == 0:
-                del self.resources[pos]
+            # 只发信号，不删 data，让 CogGraph 来处理
             self.reward_hit_count += 1
             self.agent_energy_gain = 0.1
         else:
             self.agent_energy_gain = 0.0
 
-        # —— 陷阱命中 —— #
         if self.hazards[pos] > 0:
-            self.hazards[pos] -= 1
-            if self.hazards[pos] == 0:
-                del self.hazards[pos]
+            # 同上，仅发信号
             self.danger_hit_count += 1
             self.agent_energy_penalty = 0.1
+
         else:
             self.agent_energy_penalty = 0.0
 

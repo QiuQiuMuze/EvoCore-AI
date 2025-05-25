@@ -23,8 +23,7 @@ import argparse
 import os
 import time
 import torch
-from input_handler import InputProcessor
-import torch
+
 from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
@@ -33,8 +32,6 @@ from collections import deque
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 超参，可以改成命令行参数
-EARLY_STOP_COVERAGE = 0.9
 def resize_input_proj(net: nn.Module, new_dim: int, device):
     """
     把 net.policy_net.input_proj 从（old_dim→d_model）换成 (new_dim→d_model)，
@@ -111,45 +108,31 @@ def main(cfg):
     # ──────────────────────────────────────────────────────
     device = torch.device(cfg.device)
 
-    # 1) 初始化环境，并用它推断初始输入维度
-    env = GridEnvironment(size=5)
-    init_state = torch.from_numpy(env.get_state()).float()
-    init_dim = _infer_input_dim(None, init_state)
+    # 1) 初始化 CogGraph 内部环境 & 图
+    # 先用一个临时 env 推断初始输入维度（Graph 还没挂 agent，所以不用它）
+    temp_env = GridEnvironment(size=5)
+    init_state = torch.from_numpy(temp_env.get_state()).float()
+    init_dim = _infer_input_dim(None, init_state)  # None 会让 _infer_input_dim 返回 env.size
 
     # 2) 根据推断维度创建 RLAgent
     agent = RLAgent(
         input_dim=init_dim,
-        num_actions=env.action_space_n,
+        num_actions=temp_env.action_space_n,
         lr=cfg.lr,
         gamma=cfg.gamma,
         d_model=64,
         device=device
     )
-    # === 初始化 InputProcessor（外部环境） === #
-    from input_handler import InputProcessor
-    from self_feedback_module import SelfFeedback
 
-    # 你需要自定义策略函数池
-    strategy_pool = {
-        "len_based": lambda txt: {"reward": min(1.0, len(txt) / 1000.0)}
-    }
-    input_processor = InputProcessor(
-        input_dir="input_texts",  # 你的文本输入文件夹
-        strategy_pool=strategy_pool,
-        env_class=GridEnvironment,
-        env_kwargs={},
-        device=cfg.device
-    )
-    use_input_env = False
-    input_env_steps = 0  # 当前文本生成环境要运行的步数
-
-    # 3) 创建 CogGraph 并注入外部环境
-    graph = CogGraph(agent, device=cfg.device, env=env)
+    # 3) 现在把 agent 注入 CogGraph，再取它的 env
+    graph = CogGraph(agent, device=cfg.device)
     graph.debug = True
+    env = graph.env
 
-    # —— 强制 CogUnit 输出不超过隐藏维度 ——#
+    # ---- 新增 ----
     import CogUnit
     CogUnit.MAX_OUTPUT_DIM = graph.processor_hidden_size
+    # --------------------
 
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
     init_state = torch.from_numpy(env.get_state()).float()
@@ -173,7 +156,7 @@ def main(cfg):
         hidden_dim= 128,    # 隐藏层大小，你可以改成 d_model 或者 128
         lr=1e-4           # ICM 学习率
     ).to(device)
-    curiosity_beta = 0.02 if cfg.use_curiosity else 0.0  # 内在奖励权重
+    curiosity_beta = 0.3 if cfg.use_curiosity else 0.0  # 内在奖励权重
 
     last_dim = full_dim
 
@@ -216,29 +199,6 @@ def main(cfg):
     horizon_id = 0
     for global_step in range(1, TOTAL_STEPS + 1):
         step_in_horizon += 1
-        # ==== 切换为文本驱动环境（在第3000步后） ==== #
-        if not use_input_env and global_step >= 3000:
-            # 尝试拿下一批 txt，如果没有就进入“暂停”状态
-            steps = input_processor.step()
-            if steps is None:
-                print("[·] 文本文件夹空啦，训练暂停，等待新文件 ...")
-                # 只要没新文件，就每隔 60s 重试一次
-                import time
-                while steps is None:
-                    time.sleep(60)
-                    steps = input_processor.step()
-                # 一旦检测到新文本，就恢复
-                print(f"[·] 检测到新文本要学习，开工开工！恢复训练！")
-            # 切换到文本驱动环境
-            env = input_processor.env
-            graph.env = env
-            use_input_env = True
-            # —— 切换到文本环境，清空历史奖励 ——#
-            reward_history.clear()
-            input_env_steps = steps
-            step_in_horizon = 0
-            ep_reward = 0.0
-            print(f"[Switch] 我补药当打工人！！！滴滴，切换至文本输入环境，步数限制为 {steps}")
 
         # —— ① 打印信息 ——
         logger.warning(f"\n==== Step {global_step} (within horizon step {step_in_horizon}) ====")
@@ -342,9 +302,10 @@ def main(cfg):
         # + danger_shaping   (±0.2)
         # + explore_bonus    (首次访问格子 +0.005)
         # 这里再加上你原来的 proximity_bonus
+        ext_reward = raw_reward + proximity_bonus + danger_shaping
         # —— ⑨ 下一状态转张量 —— #
         # —— ⑧ 组合最终外在奖励 ——
-        ext_reward = raw_reward
+        ext_reward = raw_reward + proximity_bonus + danger_shaping
         # —— ⑨ 下一状态转张量 ——
         next_raw = torch.from_numpy(next_state_np).float().to(device)
 
@@ -369,7 +330,9 @@ def main(cfg):
         ) if cfg.use_curiosity else 0.0
 
         # —— ⑧ 计算衰减因子 & 合并奖励 ——
-        total_reward = ext_reward + curiosity_beta * ic_reward
+        progress = min(global_step, 5000) / 5000
+        decay    = 1.0 - 0.35 * progress
+        total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
 
         agent.store_reward(total_reward)
         ep_reward += total_reward
@@ -381,68 +344,26 @@ def main(cfg):
         # —— ⑨ 更新 state ——
         state = next_raw
 
-        # —— ⑩ “文本环境”早停判定 + “模拟环境”按 max_steps 截断 ——#
-        if use_input_env:
-            # 计算“净命中”＝移除的奖励点数 − 移除的惩罚点数
-            net_hits = graph.removed_resources_count - graph.removed_hazards_count
-            # 除以文本环境中总的奖励点数
-            coverage = net_hits / input_processor.num_rewards
-            worst_courage = input_processor.num_rewards - graph.removed_hazards_count/ input_processor.num_rewards
-
-            # 计算最近 5 个 horizon 的平均外部奖励
-            recent = reward_history[-5:]
-            avg_ext_reward = sum(recent) if recent else 0.0
-            early_stop_reward = 0.11 * input_processor.num_rewards * 0.8 + 0.02 * 50
-
-            if coverage >= EARLY_STOP_COVERAGE and avg_ext_reward >= early_stop_reward:
-                agent.finish_episode()
-                avg_reward = ep_reward
-                reward_history.append(avg_reward)
-                print(f"[Early Stop] 文本 “{input_processor.files[input_processor.counter - 1]}” 学完，"
-                      f"覆盖率 {coverage:.2%}，avg_reward={avg_ext_reward:.3f}。下班收工！")
-                use_input_env = False
-                reward_history.clear()
-                ep_reward = 0.0
-                step_in_horizon = 0
-            elif step_in_horizon >= input_env_steps or worst_courage < EARLY_STOP_COVERAGE:
-                print(f"[Text End] 文本步数用完或训练效果太差：{step_in_horizon}/{input_env_steps}，给我重做！你不干，有的是赛博细胞干！")
-                agent.finish_episode()
-                avg_reward = ep_reward
-                reward_history.append(avg_reward)
-                # 没达到覆盖率/奖励 → 重启当前文本训练（不 ++）
-                input_processor.counter -= 1  # 退回当前文件
-                use_input_env = False
-                reward_history.clear()
-                ep_reward = 0.0
-                step_in_horizon = 0
-
-            else:
-                # 既没达到资源/奖励阈值，也没到步数上限，继续训练
-                pass
-        else:
-            # 原来的 MAX_STEPS 截断
-            if step_in_horizon >= cfg.max_steps:
-                horizon_id += 1
-                agent.finish_episode()
-                if cfg.use_curiosity:
-                    icm.update_parameters()
-                # 计算平均 reward/step
-                avg_reward = ep_reward
-                reward_history.append(avg_reward)
-                print(f"[Episode {horizon_id}] Avg reward/step: {avg_reward:.4f}")
-                step_in_horizon = 0
-                ep_reward = 0.0
-
+        # —— ⑩ 达到截断长度，做一次“Episode”更新 ——
+        if step_in_horizon >= cfg.max_steps:
+            horizon_id += 1
+            agent.finish_episode()
+            if cfg.use_curiosity:
+                icm.update_parameters()
+            reward_history.append(ep_reward)
+            step_in_horizon = 0
+            ep_reward = 0.0
+            # 注意：不调用 env.reset()
         if cfg.save_every and horizon_id % cfg.save_every == 0:
             os.makedirs("checkpoints", exist_ok=True)
             ckpt = f"checkpoints/agent_h{horizon_id}.pth"
             agent.save(ckpt)
             print(f"[Save] saved {ckpt}")
 
-        # —— （可选）每隔 5 个 horizon 打印一次平均奖励 ——
-        if global_step % (cfg.max_steps * 5) == 0 and reward_history:
-            last5 = reward_history[-5:]
-            print(f"[Step {global_step}] avg_reward(last 5 horizons) = {sum(last5)/len(last5):.4f}")
+        # —— （可选）每隔 10 个 horizon 打印一次平均奖励 ——
+        if global_step % (cfg.max_steps * 10) == 0 and reward_history:
+            last10 = reward_history[-10:]
+            print(f"[Step {global_step}] avg_reward(last10 horizons) = {sum(last10)/len(last10):.4f}")
 
     # 收尾：如果最后一段未满 max_steps，也要做一次更新
     if step_in_horizon > 0:
@@ -450,8 +371,7 @@ def main(cfg):
         agent.finish_episode()
         if cfg.use_curiosity:
             icm.update_parameters()
-        avg_reward = ep_reward
-        reward_history.append(avg_reward)
+        reward_history.append(ep_reward)
 
     # —— 训练总结 & 最终保存 ——
     print(f"Training finished ✓  total horizons = {horizon_id}")

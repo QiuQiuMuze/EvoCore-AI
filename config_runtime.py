@@ -7,7 +7,7 @@ config_runtime.py
 
 >>> from config_runtime import RF
 >>> RF.disable_all()          # 关闭所有加速
->>> RF.batch_processor = True # 单独再开某一项
+>>> RF.batch_processor = False # 单独再开某一项
 """
 
 from dataclasses import dataclass, field
@@ -15,9 +15,9 @@ from dataclasses import dataclass, field
 @dataclass
 class _Flags:
     # ---------- ① 批量前向 ----------
-    batch_sensor: bool = True       # sensor forward 已经改过
-    batch_processor: bool = True
-    batch_emitter: bool = True
+    batch_sensor: bool = False       # sensor forward 已经改过
+    batch_processor: bool = False
+    batch_emitter: bool = False
 
     # ---------- ② torch.compile ----------
     use_compile: bool = True        # 编译 Shared-Net，mode 见 compile_mode

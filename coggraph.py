@@ -137,13 +137,18 @@ class CogGraph:
             e.intrinsic_cooldown = 20  # 冷却 20 步
             e._last_intrinsic_step = -1e9  # 初始化为极早之前
 
-        # 4) 连接：sensor → processor → emitter
+        # 4) 连接：sensor→processor（保持全连），processor→emitter 随机连几条
         for s in sensors:
             for p in processors:
                 self.connect(s, p)
-        for p in processors:
-            for e in emitters:
+
+        # 每个 emitter 只挑几个 processor 做上游
+        for e in emitters:
+            # 如果处理器太少，就连所有；否则随机取 3 条
+            ups = processors if len(processors) <= 3 else random.sample(processors, 3)
+            for p in ups:
                 self.connect(p, e)
+
 
     # -------------------------------------------------------------------
     def __init__(self, rl_agent: RLAgent, device: str = "cpu", env: GridEnvironment | None = None):
@@ -172,6 +177,7 @@ class CogGraph:
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
         self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
         self.max_total_energy = 500  # 初始最大总能量
+        self.removed_hazards_by_reward = 0
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
@@ -185,6 +191,10 @@ class CogGraph:
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
         self._target_buf = torch.zeros((2, self.env_size * self.env_size),
                                        device=self.device)
+        self.steps_since_last_reward = 0
+        self.static_mode = False
+        self._orig_metabolic = {}   # 存储进入静吸模式前的速率
+        self.static_mode_allowed = False
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1203,7 +1213,7 @@ class CogGraph:
                 logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.02")
 
         # 🟠 能量税（每 10 步）
-        if self.current_step > 200 and self.current_step % 10 == 0:
+        if self.current_step > 200 and self.current_step % 100 == 0:
             total_cell_energy = self.total_energy()
             pool_energy = self.energy_pool
             total_e = total_cell_energy + pool_energy
@@ -1213,10 +1223,10 @@ class CogGraph:
                 excess = total_e - max_e
                 tiers = [
                     (0.00, 0.10, 0.05),
-                    (0.10, 0.15, 0.15),
-                    (0.15, 0.35, 0.25),
-                    (0.35, 0.55, 0.35),
-                    (0.50, float("inf"), 0.5)
+                    (0.10, 0.15, 0.10),
+                    (0.15, 0.35, 0.15),
+                    (0.35, 0.55, 0.20),
+                    (0.50, float("inf"), 0.25)
                 ]
                 tax = 0.0
                 for lower, upper, rate in tiers:
@@ -1263,7 +1273,7 @@ class CogGraph:
         return list(approved)
 
     def _expand_energy_cap_if_needed(self):
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(
@@ -1512,6 +1522,8 @@ class CogGraph:
             u.record_memory(state_snapshot, action, reward, outcome)
 
     def _apply_unit_metabolism(self, unit, unit_input):
+        if getattr(unit, "resting", False):
+            return
         incoming = self.reverse_connections.get(unit.id, ())
         unit.recent_calls = len(incoming)
         unit.connection_count = len(self.connections.get(unit.id, {}))
@@ -1535,10 +1547,15 @@ class CogGraph:
         step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
         unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
 
-        decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) * \
-                dim_scale * bias_factor * step_factor * unit_factor
-        factor = 0.015 if self.current_step < 1000 else 0.035
-        unit.energy -= decay * factor
+        decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
+                * dim_scale * bias_factor * step_factor * unit_factor
+        # honor 单元自己的 metabolic_rate
+        base_factor = 0.015 if self.current_step < 1000 else 0.035
+        if unit.role == "emitter":
+            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0) * 0.1
+        else:
+            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0)
+
         unit.energy = max(unit.energy, 0.0)
 
         logger.debug("[代谢] %s var=%.3f conn_sum=%.2f", unit.id, var, conn_strength_sum)
@@ -1573,9 +1590,126 @@ class CogGraph:
             logger.debug(f"[死亡] {unit.id} 被移除")
             self.remove_unit(unit)
 
+
+    # —— 2) 判断是否进入静吸模式 —— #
+    def _check_enter_static_mode(self):
+        if self.current_step >= 3500 and self.steps_since_last_reward >= 100 and not self.static_mode:
+            self._enter_static_mode()
+
+    # —— 3) 进入静吸模式 —— #
+    def _enter_static_mode(self):
+        """
+        静息模式：只有 10% 的 emitter 及其上游 processor+sensor 活跃。
+        """
+        # 1) 随机选 10% emitter
+        logger.warning("没奖励，没动力了，睡大觉！")
+        emitters = [u for u in self.units if u.role == "emitter"]
+        n_active = max(1, math.ceil(0.1 * len(emitters)))
+        active_emitters = set(random.sample(emitters, n_active))
+
+        # 2) 扩展到上游 processor 和最强 sensor
+        active = set(active_emitters)
+        for e in active_emitters:
+            # 找到上游 processor
+            proc_ids = self.reverse_connections.get(e.id, ())
+            procs = {self.unit_map[p] for p in proc_ids
+                     if p in self.unit_map and self.unit_map[p].role == "processor"}
+            active |= procs
+            # 每个 processor 找一个能量最高的 sensor
+            for p in procs:
+                sensor_ids = self.reverse_connections.get(p.id, ())
+                best = max(
+                    (self.unit_map[s] for s in sensor_ids
+                     if s in self.unit_map and self.unit_map[s].role == "sensor"),
+                    key=lambda u: u.energy, default=None
+                )
+                if best:
+                    active.add(best)
+
+        # 3) 记录原始 age，并设置 resting / metabolic_rate
+        self._orig_age = {u.id: u.age for u in active}
+        for u in self.units:
+            u.resting = (u not in active)
+            # 记录原始代谢率
+            self._orig_metabolic[u.id] = getattr(u, "metabolic_rate", 1.0)
+            if u in active_emitters:
+                u.metabolic_rate = 0.1  # emitter 只消耗 10%
+            else:
+                u.metabolic_rate = 0.0  # 上游 processor/sensor 不消耗
+
+        self.static_mode = True
+
+    # —— 4) 退出静吸模式 —— #
+    def _exit_static_mode(self):
+        logger.warning("每日刷新了，集美们动起来动起来")
+        self.static_mode = False
+        for u in self.units:
+            # 如果这个单元进入了 resting，它才应该有一个原始 metabolic_rate
+            if u.id in self._orig_metabolic:
+                u.metabolic_rate = self._orig_metabolic[u.id]
+            else:
+                # 没有原始记录时，设置一个安全的默认值
+                u.metabolic_rate = getattr(u, "metabolic_rate", 1.0)
+            # 清除 resting 标记
+            if hasattr(u, "resting"):
+                delattr(u, "resting")
+
+        self._orig_metabolic.clear()
+        self._orig_age.clear()
+
+    def _static_step(self, input_tensor: torch.Tensor):
+        """
+        静息模式下的单步，只对 active_ids 单元做“追目标→更新→奖励/惩罚”，跳过其它逻辑。
+        """
+        # —— 拆 env_state + goal ——
+        env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
+        batch = input_tensor
+        env_state = batch[:, :env_dim]
+        res_map   = self.target_vector[0].unsqueeze(0)
+        hzd_map   = self.target_vector[1].unsqueeze(0)
+        full_state = torch.cat([env_state, torch.cat([res_map, hzd_map], dim=1)], dim=1)
+
+        # —— ⚙️ 静息模式下也要给 emitter 初始化 goal_vec —— #
+        for u in self.units:
+            if u.get_role() == "emitter":
+                ext = self.target_vector.clone()            # [2, env²]
+                int_zero = torch.zeros(1, self.env_size*self.env_size, device=self.device)
+                u.goal_vec = torch.cat([ext, int_zero], dim=0)
+                u.current_hazard_xy = getattr(self, "current_hazard_xy", None)
+
+        # upstream logic 重用 snapshot/prev_energies（如果需要 record_memory）
+        state_snapshot = full_state.clone().squeeze(0).detach()
+        prev_energies  = {u.id: u.energy for u in self.units}
+
+        # 只更新 active 的单元
+        active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
+        expected_in = self.env_size * self.env_size * INPUT_CHANNELS
+        for u in self.units:
+            if u.id not in active_ids:
+                continue
+            inp = self._prepare_unit_before_update(u, full_state, expected_in)
+            self._apply_unit_metabolism(u, inp)
+            u.update(inp)
+            # —— 恢复 age，不让寿命增加 —— #
+            u.age = self._orig_age.get(u.id, u.age)
+
+        # 奖励/惩罚 + 统计连续无奖励步数
+        self.reward_emitter_grid_environment()
+        self._handle_reward_and_penalty()
+
+        # 如果刚获得奖励，会在 _handle_reward_and_penalty 内 exit static
+        return
+
     def step(self, input_tensor: torch.Tensor):
-        self._rebuild_free_positions()
+        if self.current_step % 1000 == 0:
+            # 重置计数
+            self.removed_resources_count = 0
+            self.removed_hazards_count  = 0
+            self.removed_hazards_by_reward = 0
+
+        self.current_step += 1
         self._update_global_counts()
+
         # === Transformer 一网打尽 ===
         if RF.use_shared_tx and (self.current_step % RF.shared_tx_interval == 0):
             self._run_shared_transformer()
@@ -1583,7 +1717,6 @@ class CogGraph:
         # 同步环境尺寸
         self._sync_environment_dimensions()
 
-        self.current_step += 1
         # —— 改为拆分外部传入的 input_tensor ——
         # 假设调用方已经做了 torch.cat([env_state, goal_vec], dim=1)
         batch = input_tensor             # (1, env_dim+goal_dim)
@@ -1605,9 +1738,14 @@ class CogGraph:
         # 准备目标向量
         self._update_target_vector()
 
+        self._expand_environment_curriculum()
+
+        if self.static_mode:
+            return self._static_step(input_tensor)
+
         self._apply_warmup_and_energy_tax()
 
-        self._expand_environment_curriculum()
+        self._rebuild_free_positions()
 
         self._expand_energy_cap_if_needed()
 
@@ -1646,10 +1784,17 @@ class CogGraph:
         # 统计当前 emitter 数量
         expected_input = self.env_size * self.env_size * INPUT_CHANNELS
 
+        # —— 如果处于静吸模式，先筛掉“休眠”的单元 —— #
+        active_ids = None
+        if self.static_mode:
+            active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
         for unit in self.units[:]:
+            if active_ids is not None and unit.id not in active_ids:
+                continue
             unit_input = self._prepare_unit_before_update(unit, full_state, expected_input)
             self._apply_unit_metabolism(unit, unit_input)
             self._finalize_unit_update(unit, state_snapshot, output_buffer, pending, allow_clone)
+
 
         if self.current_step > 0 and self.current_step % 50 == 0:
             self.finalize_deaths()
@@ -1658,7 +1803,12 @@ class CogGraph:
 
         self.prune_dead_connections()
 
+        # 在执行环境奖励逻辑之后：
         self.reward_emitter_grid_environment()
+        # 加入这一行：处理删除惩罚 & 计数
+        self._handle_reward_and_penalty()
+        # 再判断是否要进静吸
+        self._check_enter_static_mode()
 
         # === 重度维护：只在部分步数执行，避免每步循环开销 ===
 
@@ -1692,15 +1842,43 @@ class CogGraph:
         self.supply_energy_from_pool()
 
         # —— 新增：周期性清理统计 ——
-        if self.current_step % 50 == 0:
-            logger.warning(f"[清理统计] 已清理资源 {self.removed_resources_count} 个，危险 {self.removed_hazards_count} 个")
-        if self.current_step % 1000 == 0 and self.current_step <= 3000:
-            # 重置计数
-            self.removed_resources_count = 0
-            self.removed_hazards_count  = 0
+        if self.current_step % 1 == 0:
+            res_cleared = self.removed_resources_count
+            haz_by_reward = self.removed_hazards_by_reward
+            haz_cleared = self.removed_hazards_count
+            res_left = sum(self.env.resources.values())
+            haz_left = sum(self.env.hazards.values())
+            logger.warning(
+                f"[清理统计] 已清理资源 {res_cleared} 个，"
+                f"已清理危险 {haz_cleared} 个，因资源奖励移除危险 {haz_by_reward} 个；"
+                f"剩余资源 {res_left} 个，剩余危险 {haz_left} 个"
+            )
+
 
         self.meta_self_evaluation()
         self.record_long_term_memory(prev_energies, state_snapshot)
+
+    def _handle_reward_and_penalty(self):
+        # 本步是否有 emitter 刚获得奖励？
+        found = any(
+            getattr(u, "last_reward_step", None) == self.current_step
+            for u in self.units if u.role == "emitter"
+        )
+
+        if found:
+            self.steps_since_last_reward = 0
+            # 找到这一步获得奖励的 emitter
+            last = max(
+                (u for u in self.units
+                 if u.role == "emitter"
+                 and u.last_reward_step == self.current_step),
+                key=lambda u: u.last_reward_step,
+                default=None
+            )
+            if self.static_mode:
+                self._exit_static_mode()
+        else:
+            self.steps_since_last_reward += 1
 
     def _sync_environment_dimensions(self):
         if self.env.size != self.env_size:
@@ -1831,7 +2009,14 @@ class CogGraph:
             pred = torch.softmax(pred, dim=0)
 
             if unit.goal_vec.dim() == 2 and unit.goal_vec.size(0) >= 2:
-                res_vec = unit.goal_vec[0]
+                # 用 personal_goal 而不是全局最近资源
+                if unit.personal_goal is not None:
+                    idx = unit.personal_goal[1] * self.env_size + unit.personal_goal[0]
+                    res_vec = torch.zeros_like(unit.goal_vec[0])
+                    res_vec[idx] = 1.0
+                else:
+                    res_vec = unit.goal_vec[0]
+
                 hz_vec = unit.goal_vec[1]
             else:
                 res_vec = unit.goal_vec.view(-1) if unit.goal_vec.dim() == 1 else unit.goal_vec[0]
@@ -1872,6 +2057,18 @@ class CogGraph:
                         del self.env.hazards[(hx, hy)]
                 self.removed_hazards_count += 1
                 unit.goal_vec[1, hazard_idx] = 0.0
+                # —— 吃完这个资源之后，重新选最近的资源和惩罚点 —— #
+                next_res = self.env.get_nearest_resource_to(unit.get_position())
+                if next_res is not None:
+                    ridx = next_res[1] * self.env_size + next_res[0]
+                    unit.goal_vec[0].zero_()
+                    unit.goal_vec[0, ridx] = 1.0
+                next_hz = self.env.get_nearest_danger_to(unit.get_position())
+                if next_hz is not None:
+                    hidx = next_hz[1] * self.env_size + next_hz[0]
+                    unit.goal_vec[1].zero_()
+                    unit.goal_vec[1, hidx] = 1.0
+
                 continue
 
             hz_dist = float("inf")
@@ -1906,7 +2103,27 @@ class CogGraph:
                         if self.env.resources[(x_res, y_res)] == 0:
                             del self.env.resources[(x_res, y_res)]
                     self.removed_resources_count += 1
-                    unit.goal_vec[0, cur_idx] = 0.0
+                    # 2) 因资源奖励，额外删一个最远的坑
+                    if self.env.hazards:
+                        # 最远距离可以根据当前 (x_res,y_res) 算，也可以随意取
+                        far = max(
+                            self.env.hazards.keys(),
+                            key=lambda p: (p[0] - x_res) ** 2 + (p[1] - y_res) ** 2
+                        )
+                        del self.env.hazards[far]
+                        self.removed_hazards_by_reward += 1
+                    # —— 吃完资源后，重新选最近的资源&惩罚点 —— #
+                    next_res = self.env.get_nearest_resource_to(unit.get_position())
+                    if next_res is not None:
+                        ridx = next_res[1] * self.env_size + next_res[0]
+                        unit.goal_vec[0].zero_()
+                        unit.goal_vec[0, ridx] = 1.0
+                    next_hz = self.env.get_nearest_danger_to(unit.get_position())
+                    if next_hz is not None:
+                        hidx = next_hz[1] * self.env_size + next_hz[0]
+                        unit.goal_vec[1].zero_()
+                        unit.goal_vec[1, hidx] = 1.0
+
                     unit.last_rewarded_target_idx = None
                     unit.linger_steps = 0
                     unit.last_reward_amount = 0.0
@@ -1970,7 +2187,7 @@ class CogGraph:
     def _expand_environment_curriculum(self):
         if 3000 > self.current_step >= 1000 and self.current_step % 1000 == 0:
             old_size = self.env_size
-            self.env_size = min(self.env_size + 5, 25)
+            self.env_size = min(self.env_size + 5, 50)
             self.env.resize(self.env_size)
 
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
