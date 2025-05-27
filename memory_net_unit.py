@@ -6,6 +6,7 @@ from models.transformer_policy import TransformerPolicyNetwork
 from typing import Optional
 from torch.nn import CrossEntropyLoss
 import torch.nn as nn
+from torch import cdist
 
 
 def fgsm_attack(model, loss_fn, data_vec, epsilon=0.05):
@@ -58,13 +59,32 @@ class MemoryNetUnit(MemoryBuffer):
         # —— 新增这一行 ——
         try:
             import faiss
-            _FAISS_AVAILABLE = True
+            self._FAISS_AVAILABLE = True
         except ImportError:
-            _FAISS_AVAILABLE = False
+            self._FAISS_AVAILABLE = False
 
         self.feature_extractor = feature_extractor
 
 
+
+    # -------- GPU 距离矩阵版 KNN --------
+    def _gpu_knn(self, query_vec: torch.Tensor, k: int = 8):
+        """
+        不依赖 faiss，用 torch.cdist 在 GPU 上一次性算完 L2 距离。
+        返回 buffer 中最相近的 k 条记录（list[dict]，已按距离升序）。
+        """
+        if len(self.buffer) == 0:
+            return []
+
+        # [M, D] 记忆矩阵
+        mem = torch.stack([rec["state"].to(query_vec.device)
+                           for rec in self.buffer])          # (M, D)
+        q   = query_vec.view(1, -1)                          # (1, D)
+        dist = cdist(q, mem).squeeze(0)                      # (M,)
+
+        k = min(k, mem.size(0))
+        topk_idx = torch.topk(dist, k, largest=False).indices  # 最小距离
+        return [self.buffer[i] for i in topk_idx.cpu()]
 
     def store_attack(self, attack_vec: torch.Tensor, defense_action: dict):
         # 原有存抗体
@@ -119,7 +139,15 @@ class MemoryNetUnit(MemoryBuffer):
         :return: 最匹配的防御策略(dict)或 None
         """
         # 仅匹配 reward >= 1.0 的抗体记录
-        records = self.recall(query_state=query_vec, k=k, metric="cosine", reward_filter=1.0)
+        # ① 优先用 faiss（若已构建）；② 否则走 GPU KNN
+        if getattr(self, "_FAISS_AVAILABLE", False) and hasattr(self, "_index"):
+            import faiss, numpy as np
+            q = query_vec.detach().cpu().view(1, -1).numpy().astype("float32")
+            D, I = self._index.search(q, min(k, len(self.buffer)))   # I: (1, k)
+            records = [self.buffer[i] for i in I[0] if i != -1]
+        else:
+            records = self._gpu_knn(query_vec, k=k)
+
         if not records:
             return None
 

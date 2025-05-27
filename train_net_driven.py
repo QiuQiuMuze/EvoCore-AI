@@ -18,6 +18,13 @@ from collections import deque
 from env_net import GridSecurityEnv
 from ImmuneCogGraph import ImmuneCogGraph
 from agents.rl_agent import RLAgent
+from contextlib import nullcontext
+
+# tools.py 或直接放在 train_net_driven.py 顶部
+def can_compile(device: torch.device) -> bool:
+    return hasattr(torch, "compile") and device.type == "cuda"
+
+torch.set_float32_matmul_precision("high")  # 让 matmul 用高精度实现
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -66,9 +73,20 @@ def main(cfg):
         env=env
     )
 
+    if can_compile(device):  # 仅在 CUDA + PyTorch>=2 时启用
+        graph = torch.compile(graph)
+
     episode_rewards = []
 
+    # ----------- 选 autocast 上下文 ----------- #
+    from contextlib import nullcontext
+    if device.type == "cuda":
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        autocast_ctx = nullcontext()
+
     for ep in range(1, cfg.episodes + 1):
+
         # Episode 开始前，只 reset env，memory 保持累积
         total_reward = 0.0
 
@@ -80,19 +98,36 @@ def main(cfg):
         prev_hack_total = env.hack_history.sum().item()
 
         for step in range(1, cfg.max_steps + 1):
+            if step == 1:  # 本 Episode 第一次进入循环
+                virus_cleared_roll = 0  # 1000 步累计清除病毒
+                hack_cleared_roll = 0  # 1000 步累计清除黑客
+                last_reset_step = global_step
             global_step += 1
             # 环境当前状态张量
-            state_tensor = env.get_state_tensor().view(1, -1)  # (1, C×H×W)
+            with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                  if device.type == "cuda" else nullcontext()):
+                # env.get_state_tensor() 已经在 GPU，无需再 .to()
+                state_tensor = env.get_state_tensor().view(1, -1)  # (1, C×H×W)
+                graph.step(state_tensor)
 
-            # 把它送入 immune-graph，让它内部推进一次（包含环境 .step() 和单元决策）
-            graph.step(state_tensor)
             # 当前状态
-            curr_inf_total = env.infected_map.sum().item()
-            curr_hack_total = env.hack_history.sum().item()
+            # --- 当前活跃威胁 ---
+            curr_inf_total = env.infected_map.sum().item()  # 仍然用感染格计数
+            curr_hack_total = (env.privilege_level > 0.05).sum().item()  # <— 只统计仍在提权的格子
 
-            # 清除量 = 之前有、现在没有
+            # >>> PATCH-BEGIN: update & roll
             delta_inf_cleared = max(0, prev_inf_total - curr_inf_total)
             delta_hack_cleared = max(0, prev_hack_total - curr_hack_total)
+
+            virus_cleared_roll += delta_inf_cleared
+            hack_cleared_roll += delta_hack_cleared
+
+            # 1000 步清零一次
+            if global_step - last_reset_step >= 1000:
+                virus_cleared_roll = 0
+                hack_cleared_roll = 0
+                last_reset_step = global_step
+            # <<< PATCH-END
 
             # 更新历史记录
             prev_inf_total = curr_inf_total
@@ -102,20 +137,36 @@ def main(cfg):
             curr_inf  = env.infected_map.sum().item()
             curr_hack = env.hack_history.sum().item()
 
-            delta_inf  = curr_inf  - prev_inf
-            delta_hack = curr_hack - prev_hack
+            delta_inf = curr_inf_total - prev_inf_total
+            delta_hack = curr_hack_total - prev_hack_total
+
             if delta_inf < 0:
                 delta_inf *= 2
-
-            # 简单的 reward 设计：每个新感染 -1，每个新黑客事件 -hack_penalty
-            delta_inf_cleared = max(0, prev_inf_total - curr_inf_total)
-            reward = delta_inf_cleared * 2.0 - curr_inf_total * 0.5 - delta_hack * cfg.hack_penalty
+            # >>> PATCH-BEGIN: new reward
+            new_infections = max(0, delta_inf)  # Δinf >0 才算新增
+            reward = (
+                    delta_inf_cleared * 1.0  # +1 / 成功清除
+                    - new_infections * 1.0  # -1 / 新增感染
+                    - delta_hack * cfg.hack_penalty  # 黑客惩罚保持不变
+            )
+            # <<< PATCH-END
+            # --- 统计黑客 ---
+            hack_stats = env.get_hack_stats()
+            hack_msg = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
 
             total_reward += reward
-            print(f"[Step {global_step:3d} | Ep {ep:3d} Step {step:3d}] "
-                  f"病毒数={curr_inf_total:.0f}, 黑客数={curr_hack_total:.0f}, "
-                  f"清除病毒={delta_inf_cleared:.0f}, 清除黑客={delta_hack_cleared:.0f}, "
-                  f"total_reward={reward:.2f}")
+            # >>> PATCH-BEGIN: print rolling totals
+            if step % 50 == 0:
+                print(
+                    f"[Step {global_step} | Ep {ep} Step {step}]\n"
+                    f"病毒数 = {curr_inf_total:.0f}，黑客数 = {curr_hack_total:.0f}\n"
+                    f"黑客类型统计 [{hack_msg}]\n"
+                    f"累计清除病毒 = {virus_cleared_roll:.0f}，累计清除黑客 = {hack_cleared_roll:.0f}\n"
+                    f"step 奖励 = {reward:.2f}，总奖励 = {total_reward:.2f}\n"
+                    f"权限总和 = {hack_stats['total_priv']:.1f}，威胁度 = {hack_stats['threat_score']:.2f}"
+                )
+
+            # <<< PATCH-END
 
             # 更新历史
             prev_inf  = curr_inf

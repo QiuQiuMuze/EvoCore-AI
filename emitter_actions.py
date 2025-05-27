@@ -79,6 +79,14 @@ class EmitterActions:
         self.env.vulnerability[y, x] *= 0.5
         logger.info(f"[HACK_DEFENSE] 在 {pos} 执行黑客防御：降权 & 重置登录失败 & 修补脆弱度")
 
+        # 4) 清 hack_strength 并从 hacks 字典删除
+        self.env.hack_strength[y, x] = 0.0
+        if (x, y) in self.env.hacks:
+            del self.env.hacks[(x, y)]
+        # 5) 清 hack_history 里最近一次记录（避免累计条目总是递增）
+        self.env.hack_history[y, x] = max(0.0, self.env.hack_history[y, x] - 1.0)
+
+
 
     def block(self, pos: Tuple[int, int]):
         """

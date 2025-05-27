@@ -67,8 +67,8 @@ def get_cfg():
                         help="discount factor")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="save checkpoint every N episodes (0 = never)")
-    parser.add_argument("--device", type=str, default="cpu",
-                        help="cpu | cuda")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"],
+                        help="训练设备")
     parser.add_argument(
         "--fastflag", action="store_true",
         help="关闭 torch.compile / amp / CUDA-Graph 等所有加速开关（debug 或 CPU 模式用）"

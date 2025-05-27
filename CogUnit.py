@@ -41,9 +41,9 @@ def _get_hi(table, total):
 
 # ── 角色分裂最低能量阈值 以及 最低调用频率 ────────────
 ROLE_SPLIT_RULE = {
-    "sensor":    {"min_e": 1.2, "min_calls": 0},   # 轻量，几乎不限制调用频率
-    "processor": {"min_e": 1.2, "min_calls": 1},   # 中等
-    "emitter":   {"min_e": 0.6, "min_calls": 0},   # 最重，门槛最高
+    "sensor":    {"min_e": 0.9, "min_calls": 0},   # 轻量，几乎不限制调用频率
+    "processor": {"min_e": 0.9, "min_calls": 1},   # 中等
+    "emitter":   {"min_e": 0.6, "min_calls": 0},
 }
 # ----------------------------------------------------
 

@@ -120,7 +120,7 @@ class CogGraph:
     # 自动生成种子细胞（sensor=1, processor=4, emitter=1，可调）
     def _init_seed_units(self,
                          n_sensor: int = 16,
-                         n_processor: int = 34,
+                         n_processor: int = 32,
                          n_emitter: int = 16,
                          device: str = "cpu"):
 
@@ -1354,7 +1354,7 @@ class CogGraph:
         return list(approved)
 
     def _expand_energy_cap_if_needed(self):
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(
@@ -1660,10 +1660,15 @@ class CogGraph:
         unit.current_step = self.current_step
 
         var = float(unit_input.var(unbiased=False))
-        freq = unit.avg_recent_calls
-        conn = unit.connection_count
-        call_density = freq / (conn + 1)
-        conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
+
+        # —— 改成一次张量化统计 —— #
+        conn_strength_sum = torch.as_tensor(
+            list(self.connections.get(unit.id, {}).values()),
+            dtype=torch.float32,
+            device=self.device
+        ).sum().item()
+
+        call_density = unit.avg_recent_calls / (unit.connection_count + 1)
 
         dim_scale = 1.0 # if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
         #     1.0 + 0.5 * ((self.current_step - 3000) / 3000)
@@ -2611,37 +2616,40 @@ class CogGraph:
             merged = merged[: self.processor_hidden_size]
         return merged.to(dev)
 
-
-    def emitter_forward(self, processor_out):
+    def emitter_forward(self, proc_out: torch.Tensor):
         """
-        把 processor_out 递给所有 emitter 做一次更新；
-        不要求返回值（若你想调试，可 return 平均输出）。
+        批量版：把 for-loop --> 单次 repeat + Linear，逻辑不变
         """
-        dev = self.device
-        emitters = [u for u in self.units if u.role == "emitter"]
-        if not emitters:
-            return
+        # ---- 0) 统一输入形状 ----
+        if proc_out.dim() == 1:
+            proc_out = proc_out.unsqueeze(0)  # [1, H_p]
 
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "emitter"):
-            for s in (u for u in self.units if u.role == "emitter"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
-        D = processor_out.size(-1)
-        if RF.batch_emitter:
-            batch_in = processor_out.to(dev).expand(len(emitters), -1)  # [N,D]
-            net = emitters[0].function
-            ctx = (torch.autocast("cuda", dtype=torch.float16)
-                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
-            with ctx, torch.inference_mode():
-                batch_out = net(batch_in)
-            for u, o in zip(emitters, batch_out):
-                u.last_output = o.detach()
-        else:
-            inp = processor_out.to(dev).unsqueeze(0)
-            for e in emitters:
-                e.update(inp)
-                e.last_output = e.get_output().detach()
+        # ---- 1) 对齐到 emitter_hidden_size ----
+        vec = proc_out[0]
+        H_e = self.emitter_hidden_size
+        if vec.shape[0] < H_e:
+            vec = F.pad(vec, (0, H_e - vec.shape[0]))
+        elif vec.shape[0] > H_e:
+            vec = vec[:H_e]
+
+        # ---- 2) 收集 emitter 索引（一次性）----
+        em_idx = [i for i, u in enumerate(self.units) if u.role == "emitter"]
+        if not em_idx:  # 没有 emitter
+            return None
+
+        # ★可选：一次性把所有 emitter 线性层升维
+        for i in em_idx:
+            self.expand_unit_dim(self.units[i], H_e)
+
+        # ---- 3) 单次 forward ----
+        batch_in = vec.repeat(len(em_idx), 1)  # [N_emit, H_e]
+        logits = self.emitter_net(batch_in)  # [N_emit, seq_len]
+
+        # ---- 4) 写回各 emitter.last_output ----
+        for idx, lg in zip(em_idx, logits):
+            self.units[idx].last_output = lg.detach()
+
+        return logits
 
     def _rebuild_free_positions(self):
         """一次性扫描所有格子，生成安全出生点列表"""
