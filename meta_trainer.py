@@ -23,8 +23,7 @@ class MetaTrainer:
         if not tasks_batch:
             return
 
-        # 用 tensor 初始化，这样加 loss_q 后会保留梯度
-        meta_loss = torch.tensor(0.0, device=self.device)
+        meta_loss = torch.tensor(0., device=self.device)
 
         for task in tasks_batch:
             support = task['support']
