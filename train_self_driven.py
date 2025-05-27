@@ -6,14 +6,6 @@ train_self_driven.py
 启动自驱动强化学习训练：
     GridEnvironment  ←→  CogGraph  ←→  RLAgent (TransformerPolicyNetwork)
 
-❖ 主要假设
-- env.step(action) **原实现不返回** 新状态 / 奖励 / done，所以：
-    • 执行 env.step(action) 后，直接用 env.get_state() 取下一状态；
-    • 奖励 = env.agent_energy_gain - env.agent_energy_penalty（env.step 内已更新）；
-    • 每个 episode 固定 MAX_STEPS 步视为终止。
-- CogGraph 需要你补充 sensor_forward / processor_forward / emitter_forward。
-  若暂未实现，则脚本会 fallback：直接把环境状态张量当作 sensor / processor 输出。
-
 ❖ 运行示例
 $ python train_self_driven.py --episodes 5000 --max-steps 256
 """
@@ -97,8 +89,8 @@ def _infer_input_dim(graph: CogGraph, env_state: torch.Tensor) -> int:
 # -------------------------------------------------------------------------- #
 def main(cfg):
     import logging
-    logging.debug("✅ Logger 测试 Debug")
-    logging.info("✅ Logger 测试 Info")
+    logging.debug("Logger 测试 Debug")
+    logging.info("Logger 测试 Info")
     # ────────── ① 根据 fastflag 决定是否全关加速 ──────────
     from config_runtime import RF          # ★ 必须在 disable 前 import
     if not cfg.fastflag:                   # 没加 --fastflag → 启用全部加速
@@ -153,7 +145,7 @@ def main(cfg):
     icm = IntrinsicCuriosityModule(
         state_dim=full_dim,
         action_dim=agent.policy_net.fc_out.out_features,
-        hidden_dim= 128,    # 隐藏层大小，你可以改成 d_model 或者 128
+        hidden_dim= 128,    # 隐藏层大小，可以改成 d_model
         lr=1e-4           # ICM 学习率
     ).to(device)
     curiosity_beta = 0.3 if cfg.use_curiosity else 0.0  # 内在奖励权重
@@ -244,7 +236,7 @@ def main(cfg):
         env.render()
 
         # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
-        # flatten 到一维（2*env²） 或者你也可以只取资源通道 goal_vec = graph.target_vector[0]
+        # flatten 到一维（2*env²）
         # —— 更新历史 & 构造带目标的特征 —— #
         tv = graph.target_vector.to(device)
         if tv.dim() == 1:
@@ -301,7 +293,7 @@ def main(cfg):
         # + resource_shaping (±0.01)
         # + danger_shaping   (±0.2)
         # + explore_bonus    (首次访问格子 +0.005)
-        # 这里再加上你原来的 proximity_bonus
+        # 这里再加上 proximity_bonus
         ext_reward = raw_reward + proximity_bonus + danger_shaping
         # —— ⑨ 下一状态转张量 —— #
         # —— ⑧ 组合最终外在奖励 ——
@@ -353,14 +345,13 @@ def main(cfg):
             reward_history.append(ep_reward)
             step_in_horizon = 0
             ep_reward = 0.0
-            # 注意：不调用 env.reset()
         if cfg.save_every and horizon_id % cfg.save_every == 0:
             os.makedirs("checkpoints", exist_ok=True)
             ckpt = f"checkpoints/agent_h{horizon_id}.pth"
             agent.save(ckpt)
             print(f"[Save] saved {ckpt}")
 
-        # —— （可选）每隔 10 个 horizon 打印一次平均奖励 ——
+        # —— 每隔 10 个 horizon 打印一次平均奖励 ——
         if global_step % (cfg.max_steps * 10) == 0 and reward_history:
             last10 = reward_history[-10:]
             print(f"[Step {global_step}] avg_reward(last10 horizons) = {sum(last10)/len(last10):.4f}")

@@ -141,7 +141,6 @@ class ImmuneCogGraph(CogGraph):
             gamma=0.8  # 学习率乘 0.8
         )
         # ===================================================================
-        # ----------- ★PATCH 1: 为每个 emitter 设定起始坐标 ------------
         self._rebuild_free_positions()            # 保证有 free_positions
         for u in self.units:
             if u.role == "emitter":
@@ -151,7 +150,7 @@ class ImmuneCogGraph(CogGraph):
                     u.position = self.free_positions[idx]
                 u.output_positions = deque(maxlen=20)   # 轨迹用于惩罚
         # --------------------------------------------------------------
-        # --- 元学习 trainer（假设你已经按前面示例实现过 MetaTrainer）---
+        # --- 元学习 trainer
         # ---------- 预分配一次 full_state 缓冲 ----------
         size2 = self.env.size * self.env.size
         D_env = size2 * N_STATE_CHANNELS
@@ -175,11 +174,9 @@ class ImmuneCogGraph(CogGraph):
             if hasattr(u, "compute_self_reward"):
                 u.compute_self_reward = types.MethodType(_safe_compute, u)
 
-        # ------- Patch CogUnit.clone（不要再用 MethodType）-------
         _orig_clone = CogUnit.clone  # 备份原方法
 
         def _clone_patched(self, *args, **kwargs):
-            """克隆时，先调用原 clone，再把 child 的首层 Linear 扩宽到 ≥ parent.l1.in_features。"""
             child = _orig_clone(self, *args, **kwargs)  # 这里 self 是实例
 
             src_l1 = getattr(self, "l1", None) or getattr(self, "linear1", None)
@@ -201,7 +198,7 @@ class ImmuneCogGraph(CogGraph):
                     child.input_size = need
             return child
 
-        CogUnit.clone = _clone_patched  # 直接覆盖即可
+        CogUnit.clone = _clone_patched
         # -----------------------------------------------------------
 
     def _should_evolve(self) -> bool:
@@ -225,7 +222,6 @@ class ImmuneCogGraph(CogGraph):
         ).to(self.device)
 
         # 2) processor_net：刚从 sensor_net 拿到的 out_features → emitter_hidden_size
-        #    （下一行会同步 emitter_hidden_size，但这里先用旧值构建，保证不报错）
         self.processor_net = nn.Sequential(
             nn.Linear(self.sensor_net[0].out_features, self.emitter_hidden_size),
             nn.ReLU(),
@@ -240,7 +236,6 @@ class ImmuneCogGraph(CogGraph):
         self.processor_hidden_size = self.sensor_net[0].out_features
         self.emitter_hidden_size  = self.processor_net[0].out_features
 
-        # === 关键：让下次 forward 重新 compile 新网络 ===
         if hasattr(self, "_compiled_sensor_net"):
             del self._compiled_sensor_net
         if hasattr(self, "_compiled_processor_net"):
@@ -250,7 +245,7 @@ class ImmuneCogGraph(CogGraph):
         """
         重写版本：允许基于“病毒痕迹”直接退出静息模式，而不仅仅是 reward。
         """
-        # —— 1. 原 reward 唤醒机制保留（可选）——
+        # —— 1. 原 reward 唤醒机制——
         found = any(
             getattr(u, "last_reward_step", None) == self.current_step
             for u in self.units if u.role == "emitter"
@@ -263,14 +258,13 @@ class ImmuneCogGraph(CogGraph):
 
         self.steps_since_last_reward += 1
 
-        # —— 2. 病毒痕迹触发唤醒（新增）——
+        # —— 2. 病毒痕迹触发唤醒——
         tensor_state = self.env.get_state_tensor()
         infected_count = (tensor_state[0] > 0.5).sum().item()  # 通道0：是否感染
         if self.static_mode and infected_count >= 1:
             logger.warning(f"[静息唤醒] 来敌人啦，快干他！检测到病毒痕迹，感染点数 = {infected_count}")
             self._exit_static_mode()
 
-    # ▼放在 _decode_action_from_output() 之前即可
     def _step_toward(self, start, goal):
         sx, sy = start
         gx, gy = goal
@@ -303,7 +297,6 @@ class ImmuneCogGraph(CogGraph):
         # —— 1) 通道 1：感染点 —— #
         if hasattr(self.env, "infected_map"):
             full_inf = self.env.infected_map.clone()    # (H, W)
-            # >>> PATCH: vectorised 9×9 采样，彻底去掉 Python-for<<<
             local_inf = torch.zeros_like(full_inf)  # (H,W)
             emitters_xy = [
                 u.position for u in self.units
@@ -372,7 +365,6 @@ class ImmuneCogGraph(CogGraph):
                 if strength == 0.0 or uid not in self.unit_map:
                     continue
                 out = self.unit_map[uid].get_output().squeeze(0)
-                # pad / truncate 到 processor_hidden_size
                 if out.shape[0] < self.processor_hidden_size:
                     out = F.pad(out, (0, self.processor_hidden_size - out.shape[0]))
                 elif out.shape[0] > self.processor_hidden_size:
@@ -437,10 +429,10 @@ class ImmuneCogGraph(CogGraph):
         state_snapshot = full_state.detach().squeeze(0).to(self.device)
         prev_energies = {u.id: u.energy for u in self.units}
         self._update_target_vector()
-        # ✅ 正式执行动作（静息中的探索者 emitter）
+        #  正式执行动作（静息中的探索者 emitter）
         self._run_emitter_actions()
 
-        # ✅ 更新 active 单元（静息者不动）
+        #  更新 active 单元（静息者不动）
         active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
         expected_in = self.env_size * self.env_size * INPUT_CHANNELS
         for u in self.units:
@@ -451,10 +443,10 @@ class ImmuneCogGraph(CogGraph):
             u.update(inp)
             u.age = self._orig_age.get(u.id, u.age)
 
-        # ✅ 奖励 / 惩罚（是否触发退出静息）
+        #  奖励 / 惩罚（是否触发退出静息）
         self._handle_reward_and_penalty()
 
-        # ✅ 所有 resting 单元的 age 冻结
+        #  所有 resting 单元的 age 冻结
         for u in self.units:
             if getattr(u, "resting", False):
                 u.age = self._orig_age.get(u.id, u.age)
@@ -495,7 +487,7 @@ class ImmuneCogGraph(CogGraph):
                 )
             except Exception:
                 self._compiled_sensor_net = self.sensor_net  # 回退 CPU Interpreter
-            net_use = self._compiled_sensor_net  # 🟢 新 Callable OK
+            net_use = self._compiled_sensor_net  #  新 Callable OK
 
         # ----------------------------------------
         # 1) 保证形状 [B, D_in]
@@ -520,7 +512,7 @@ class ImmuneCogGraph(CogGraph):
 
             local_stealth = self.env.hack_strength[ys, xs].sum().item()
             if local_stealth > 1.0:  # 阈值可调
-                # 通知所有 processor 前往 (0,0) 方向—你也可换成更智能的 direction
+                # 通知所有 processor 前往 (0,0)
                 for p in (u for u in self.units if u.role == "processor"):
                     p.hotspots = getattr(p, "hotspots", set())
                     p.hotspots.add((0, 0))
@@ -646,7 +638,7 @@ class ImmuneCogGraph(CogGraph):
         else:
             pos_list = torch.nonzero(unvisited > 0.5)
             goal_type = "curiosity"
-        # --- PATCH: 过滤距离太近的巡逻点 -------------------------
+        # --- 过滤距离太近的巡逻点 -------------------------
         if goal_type == "curiosity" and hasattr(u, "position"):
             ex, ey = u.position
             mask = [
@@ -755,7 +747,6 @@ class ImmuneCogGraph(CogGraph):
         都扩到 new_in。兼容 unit/function 双路径；若找不到 Linear 则跳过。
         """
 
-        ################ helper ################
         def first_linear(root):
             if isinstance(root, nn.Module):
                 for m in root.modules():
@@ -770,7 +761,6 @@ class ImmuneCogGraph(CogGraph):
                         return m
             return None
 
-        ########################################
 
         # ---------- 获取首层 ----------
         net_root = unit if isinstance(unit, nn.Module) else getattr(unit, "function", None)
@@ -833,7 +823,7 @@ class ImmuneCogGraph(CogGraph):
         unit.l1 = new_l1
 
     def step(self, input_tensor: torch.Tensor):
-        # --- PATCH: 巡逻计时器递增，必要时自动扩张 -------------------
+        # --- 巡逻计时器递增，必要时自动扩张 -------------------
         if self.visit_age_map.shape != self.env.infected_map.shape:
             # 地图扩容后同步 shape
             self.visit_age_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
@@ -855,7 +845,6 @@ class ImmuneCogGraph(CogGraph):
 
         # ------------------------------------------------------------
 
-        # >>> PATCH-BEGIN: periodic kill report
         if self.current_step % 50 == 0:
             span = self.current_step - self.kill_stats["last_reset"]
             logger.warning(
@@ -863,10 +852,10 @@ class ImmuneCogGraph(CogGraph):
                 f"病毒-自主={self.kill_stats['self_direct']}, 病毒-指引={self.kill_stats['guided']} | "
                 f"Hack-自主={self.hack_kill_stats['self_direct']}, Hack-指引={self.hack_kill_stats['guided']}"
             )
-        if self.current_step - self.kill_stats["last_reset"] >= 1000:
-            self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
-            self.hack_kill_stats.update(self_direct=0, guided=0)
-        # <<< PATCH-END
+        # if self.current_step - self.kill_stats["last_reset"] >= 1000:
+        #     self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
+        #     self.hack_kill_stats.update(self_direct=0, guided=0)
+
 
         self._update_target_vector()
 
@@ -915,7 +904,7 @@ class ImmuneCogGraph(CogGraph):
         # 替换掉原来的无条件扩容：
         # self.env._expand_environment()
 
-        # ✅ 改为：仅当 size 小于阈值，且间隔一定步数再扩一次
+        #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
         if self.current_step % 1000 == 0 and self.env.size < 20:
             # --- 新增：同步巡逻计时表尺寸 --------------------------
             self.visit_age_map = torch.zeros_like(
@@ -1086,7 +1075,7 @@ class ImmuneCogGraph(CogGraph):
         # === meta-learning ===
         if self.current_step % 1000 == 0:
             tasks = self._sample_meta_tasks()  # 从 replay_buffer 中采 support/query
-            if tasks:  # ✅ 非空才更新
+            if tasks:  #  非空才更新
                 self.meta_trainer.meta_update(tasks)
         self.meta_self_evaluation()
 
@@ -1215,13 +1204,18 @@ class ImmuneCogGraph(CogGraph):
 
     def report_antibody_stats(self):
         mem_size = len(self.memory.buffer)
-        last_sim = getattr(self.immune_processor, "last_similarity", 0.0)
+        # 如果 last_similarity 还没设，就默认为 0.0
+        last_sim = getattr(self.immune_processor, "last_similarity", None)
+        if last_sim is None:
+            last_sim = 0.0
+
         total = self.antibody_success_count + self.antibody_failure_count
         success_rate = (self.antibody_success_count / total) if total > 0 else 0.0
         if self.current_step % 100 == 0:
             logger.warning(
                 f"[抗体统计] 成功 {self.antibody_success_count} 次，失败 {self.antibody_failure_count} 次，"
-                f"成功率 {success_rate:.2%}, Memory={mem_size}, last_sim={last_sim:.3f}")
+                f"成功率 {success_rate:.2%}, Memory={mem_size}, last_sim={last_sim:.3f}"
+            )
 
     def _reward_curiosity(self):
 
@@ -1332,11 +1326,10 @@ class ImmuneCogGraph(CogGraph):
                     f"[滞留惩罚] emitter {farthest.id} 扣能量 {penalty},摸鱼的下场！"
                 )
 
-            # ✅ 标记该点已惩罚
+            # 标记该点已惩罚
             # self.punished_map[y, x] = True
 
             self.env.infected_duration_map[y, x] = 0
-            # 如果你也想维护 self.prev_dur，就同步清零它
             if hasattr(self, "prev_dur"):
                 self.prev_dur[y, x] = 0
 
@@ -1428,11 +1421,10 @@ class ImmuneCogGraph(CogGraph):
                 logger.info(
                     f"[黑客惩罚] emitter {u.id} 在 {u.position} 未清除提权，扣能量 {penalty_per_node}，菜就多练!"
                 )
-            # ---------- NEW: “不动 / 原地打圈” 惩罚 ------------------
+            # ---------- “不动 / 原地打圈” 惩罚 ------------------
             # 如果之前还没创建 output_positions（可能这一局从未遇到过病毒）
             if not hasattr(u, "output_positions"):
                 u.output_positions = deque(maxlen=20)
-            # ---------- NEW: “不动 / 原地打圈” 惩罚 ------------------
             # 每 10 步检查一次最近 20 步的活动范围
             if (len(u.output_positions) == u.output_positions.maxlen
                     and self.current_step % 10 == 0):
@@ -1563,7 +1555,7 @@ class ImmuneCogGraph(CogGraph):
                 unit.guided_this_round = True  # ← 标记“被系统指引”
         else:
             unit.guided_this_round = False  # ← 正常自主
-            # ---------- PATCH-B2: 若格子也不是 hack，但仍有提权节点 → 指向最近 hack ---
+            # ---------- 若格子也不是 hack，但仍有提权节点 → 指向最近 hack ---
             if not unit.guided_this_round and self.env.privilege_level.sum() > 0 \
                     and self.env.privilege_level[y, x] <= 0.02:
                 cx, cy = unit.position
@@ -1574,7 +1566,6 @@ class ImmuneCogGraph(CogGraph):
                     y, x = hy, hx
                     unit.guided_this_round = True
 
-        # PATCH HACK-GUIDE
         if not unit.guided_this_round and self.env.privilege_level.sum() > 0:
             if random.random() < 0.4:
                 cx, cy = unit.position

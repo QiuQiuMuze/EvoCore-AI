@@ -13,9 +13,9 @@ from typing import List, Dict
 from agents.rl_agent import RLAgent
 import copy
 # from triton_scatter import scatter_sum
-from config_runtime import RF            # ★ 新增
-from contextlib import nullcontext       # ★ autocast fallback
-try:                                     # Flash-Attn / TE 优先
+from config_runtime import RF
+from contextlib import nullcontext
+try:
     import transformer_engine.pytorch as te
     HAS_TE = True
 except ImportError:
@@ -64,7 +64,7 @@ class TaskInjector:
         index = self.target_position[1] * env_size + self.target_position[0]
         vec = torch.zeros(2, env_size * env_size)  # 2 通道
         vec[0, index] = 1.0  # 资源层 one-hot
-        # vec[1] 先保持全 0（陷阱层以后再写）
+
         return vec
 
     def evaluate(self, env, emitter_outputs):
@@ -117,7 +117,7 @@ class CogGraph:
     """
 
     # -------------------------------------------------------------------
-    # 自动生成种子细胞（sensor=1, processor=4, emitter=1，可调）
+    # 自动生成种子细胞
     def _init_seed_units(self,
                          n_sensor: int = 16,
                          n_processor: int = 32,
@@ -650,8 +650,8 @@ class CogGraph:
                 from torch import nn
                 if hasattr(merged, "l1") and isinstance(merged.l1, nn.Linear):
                     if merged.l1.in_features < L:
-                        # 复用你之前的 expand_unit_dim，或简单重建一层
-                        from ImmuneCogGraph import ImmuneCogGraph  # 或其他文件里你已有的函数
+                        # 复用之前的 expand_unit_dim，或简单重建一层
+                        from ImmuneCogGraph import ImmuneCogGraph
                         ImmuneCogGraph.expand_unit_dim(self, merged, L)
 
                 merged.age = int((u1.age + u2.age) / 2)
@@ -918,7 +918,7 @@ class CogGraph:
                 if conn in self.connection_usage:
                     del self.connection_usage[conn]
 
-            # 强化高效连接（可选：比如增加能量传递权重等）
+            # 强化高效连接
             for conn in to_strengthen:
                 from_unit, to_unit = conn
                 if from_unit in self.connections and to_unit in self.connections[from_unit]:
@@ -2002,7 +2002,7 @@ class CogGraph:
         # 判断是否进入静息模式（满足条件：长时间无奖励等）
         self._check_enter_static_mode()
 
-        # 可选：调试路径跟踪，记录细胞目标行动路线
+        # 调试路径跟踪，记录细胞目标行动路线
         if self.debug and self.current_step % 100 == 0:
             self.trace_info_paths()
 
@@ -2555,7 +2555,7 @@ class CogGraph:
         batch_out = net(batch_in)                                # [N, D]
 
         # ③ 分别写回每个 sensor 的 last_output（不调用 update()，
-        #    省掉 split/代谢等逻辑；这些逻辑你已经在 Graph.step() 外部显式调用）
+        #    省掉 split/代谢等逻辑；这些逻辑已经在 Graph.step() 外部显式调用）
         for s, o in zip(sensors, batch_out):
             s.last_output = o.detach()
 
@@ -2637,7 +2637,7 @@ class CogGraph:
         if not em_idx:  # 没有 emitter
             return None
 
-        # ★可选：一次性把所有 emitter 线性层升维
+        # 一次性把所有 emitter 线性层升维
         for i in em_idx:
             self.expand_unit_dim(self.units[i], H_e)
 

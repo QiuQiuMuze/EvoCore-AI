@@ -6,7 +6,7 @@ def sample_unvisited(env_size, visit_counts, exclude=None):
     """
     从所有格子中挑一个访问次数最少（==0）或者随机的格子
     visit_counts: dict[(x,y)] -> count
-    exclude: set[(x,y)] -> 被排除的目标点（可选）
+    exclude: set[(x,y)] -> 被排除的目标点
     """
     exclude = exclude or set()
 

@@ -19,7 +19,7 @@ class ImmuneProcessor(nn.Module):
     """
 
     def __init__(self, memory_pool: MemoryNetUnit, feature_extractor=None, similarity_threshold=0.8):
-        super().__init__()  # ✅ 调用父类构造器
+        super().__init__()  # 调用父类构造器
         """
         初始化 ImmuneProcessor
         :param memory_pool: 存储抗体记忆的 MemoryNetUnit 实例
@@ -29,12 +29,24 @@ class ImmuneProcessor(nn.Module):
         self.memory = memory_pool
         self.feature_extractor = feature_extractor
         self.similarity_threshold = similarity_threshold
+        # —— 新增：对 meta-learning 提供分类头 —— #
+        # 推断特征维度：如果是 Transformer，就用它的 fc_out.in_features
+        if isinstance(self.feature_extractor, TransformerPolicyNetwork):
+            feat_dim = self.feature_extractor.fc_out.in_features
+        else:
+            raise RuntimeError(
+                "无法推断特征维度：当前只支持 TransformerPolicyNetwork，请手动指定 feat_dim"
+            )
+        self.classifier = nn.Linear(feat_dim, 2)
+
+
+
         # —— 新增：基于 syscall 序列的轻量 RNN —— #
-        # self.use_rnn = True
+        # self.use_rnn = Tru
         # self.rnn = nn.LSTM(input_size=self.memory.device and 1 or 1,  # 单特征
         #                    hidden_size=64,
         #                    batch_first=True)
-        # C = N_STATE_CHANNELS  # 你的环境 state_tensor 一共是 9 个通道
+        # C = N_STATE_CHANNELS
         # self.cnn = nn.Sequential(
         #     nn.Conv2d(in_channels=C, out_channels=16, kernel_size=3, padding=1),
         #     nn.ReLU(),
@@ -66,9 +78,15 @@ class ImmuneProcessor(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        支持像 nn.Module 一样调用：返回特征向量
+        支持像 nn.Module 一样调用：把 state 先 extract → 再 classifier → 返回 [B,2] logits
         """
-        return self._extract_features(state)
+        # 先提取特征
+        feats = self._extract_features(state)
+        # 如果是一条样本，就补一个 batch 维度
+        if feats.dim() == 1:
+            feats = feats.unsqueeze(0)
+        return self.classifier(feats)
+
 
     def classify_and_match(self, state: torch.Tensor) -> Optional[Dict]:
         """
@@ -78,10 +96,21 @@ class ImmuneProcessor(nn.Module):
         """
         vec = self._extract_features(state)
 
-        # 1. 抗体记忆匹配
-        action = self.memory.match(vec, k=3, similarity_threshold=self.similarity_threshold)
+        # —— 安全解包 memory.match 的返回值 —— #
+        match_res = self.memory.match(
+            vec, k=3, similarity_threshold=self.similarity_threshold
+        )
+        if match_res is None:
+            action, sim = None, None
+        elif isinstance(match_res, tuple):
+            action, sim = match_res
+        else:
+            action, sim = match_res, None
+        # 记录一下最后一次相似度
+        self.last_similarity = sim
         if action:
             return action  # 特异性防御
+
 
         # 2. 模糊规则：根据行为异常评分决定通用隔离
         anomaly_score = state[3].mean().item()  # 通道3：行为评分

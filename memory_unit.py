@@ -13,9 +13,9 @@ except ImportError:
 class MemoryBuffer:
     """
     经验回放缓冲池：
-      ✔ 精确 KNN（支持 GPU）
-      ✔ 可选 FAISS 加速（近似 ANN）
-      ✔ 支持 reward filter / embedding 输出
+      精确 KNN（支持 GPU）
+      可选 FAISS 加速（近似 ANN）
+      支持 reward filter / embedding 输出
     """
 
     def __init__(self, maxlen=200, device=None, use_faiss=False):

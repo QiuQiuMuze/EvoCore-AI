@@ -22,7 +22,7 @@ MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
 
 
 
-# === Split-Gate 动态阈值表（过量上限）===========================
+# === Split-Gate 动态阈值表===========================
 # 比例 k_es：Emitter <-> Sensor   ／  k_p： 相对 Processor/2
 SPLIT_HI_ES_TABLE = { 50: 1.30, 200: 1.20, 500: 1.12, float("inf"): 1.05 }
 SPLIT_HI_P_TABLE  = { 50: 1.20, 200: 1.15, 500: 1.08, float("inf"): 1.03 }
@@ -86,11 +86,11 @@ class CogUnit:
         self.output_history_ptr = 0
         # self._rebuild_safe_positions()
         self.state_memory = []  # 记忆队列
-        self.memory_limit = 5  # 可调整为 k 步
+        self.memory_limit = 5
         self.memory_pool_limit = 50
         self.role = role
         self.cleared_positions = set()
-        self.uuid = uuid.uuid4()          # 唯一标识
+        self.uuid = uuid.uuid4()
         self.id = id or str(uuid.uuid4())
         self.int_id = self.uuid.int & 0xFFFFFFFF
         self.energy = 1.0               # 初始能量
@@ -104,7 +104,6 @@ class CogUnit:
         self.is_hazard_confirmed = False
         # 元认知记录器
         self.meta = MetaCognition(history_len=100)
-        # —— 新增 Intrinsic Goal 支持 ——
         self.personal_goal = None            # 当前内在目标 (x,y)
         self.visit_counts = {}               # {(x,y): 次数}
         self.intrinsic_reward = 1.0         # 达到内在目标奖励能量
@@ -268,7 +267,7 @@ class CogUnit:
                 self.to(input_tensor.device)
 
 
-        # 🚨 先检查 input_size 是否需要扩展（动态适配环境变化）
+        # 先检查 input_size 是否需要扩展（动态适配环境变化）
         current_input_size = input_tensor.shape[-1]
         if current_input_size > self.input_size:
             old_l1, old_l2 = self.function[0], self.function[2]
@@ -331,13 +330,13 @@ class CogUnit:
         self.last_output = raw_output.detach().clone()  # ⚡ 关键：detach掉，避免污染计算图
         self.state = self.last_output.clone()
 
-        # ✅ 存储输出历史，供行为质量判断用
-        # ✅ 若升维后，output_history_tensor 的列数不一致，立即重建
+        # 存储输出历史，供行为质量判断用
+        # 若升维后，output_history_tensor 的列数不一致，立即重建
         if self.output_history_tensor.shape[1] != self.last_output.shape[0]:
             self.output_history_tensor = torch.zeros((5, self.last_output.shape[0]), device="cpu")
             self.output_history_ptr = 0
 
-        # ✅ 存储输出历史，供行为质量判断用
+        # 存储输出历史，供行为质量判断用
         out = self.last_output.detach().cpu().view(-1)  # 保证是 1D 向量
         if out.shape[0] != self.output_history_tensor.shape[1]:
             # 自动重建历史缓存，确保维度对齐
@@ -354,19 +353,19 @@ class CogUnit:
             self.state_memory.pop(0)
 
         # ========================
-        # 🚨 动态能量消耗逻辑部分
+        #  动态能量消耗逻辑部分
         # ========================
 
-        # 1️⃣ 输入复杂度：使用方差作为熵的近似
+        # ️ 输入复杂度：使用方差作为熵的近似
         input_var = float(input_tensor.var())
 
-        # 2️⃣ 调用频率：外部由 Graph 写入 recent_calls 属性
+        #  调用频率：外部由 Graph 写入 recent_calls 属性
         recent_call_freq = getattr(self, "recent_calls", 1)
 
-        # 3️⃣ 活跃连接数：外部由 Graph 写入 connection_count 属性
+        #  活跃连接数：外部由 Graph 写入 connection_count 属性
         connection_count = getattr(self, "connection_count", 1)
 
-        # ⚠️ 代谢已由 CogGraph 控制，这里不再消耗 energy
+        #  代谢已由 CogGraph 控制，这里不再消耗 energy
 
 
         # === 高频调用奖励机制 ===
@@ -387,14 +386,14 @@ class CogUnit:
                 self.last_output += noise
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
-        # === ✅ 内部奖励机制 Self-Reward ===
+        # ===  内部奖励机制 Self-Reward ===
         self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.03
         self.energy += self_reward
         # self.meta.record(action="self_reward", reward=self_reward)
         if self_reward > 0:
             logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
 
-        # === ✅ 局部微型学习
+        # ===  局部微型学习
         # ---------- 新增【探测-判定-更新目标】----------
         if self.role == "emitter" and hasattr(self, "goal_vec"):
             # ① 找到 emit 最高激活格子的坐标
@@ -450,7 +449,7 @@ class CogUnit:
 
         role = self.get_role()
 
-        # ✅ 各类细胞紧急增殖
+        #  各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 8:
             logger.warning(f"[紧急增殖] {self.id} 是唯一 emitter，强制尝试分裂并补给")
             self.energy += 1  # 💡 补给能量
@@ -695,7 +694,7 @@ class CogUnit:
                 if random.random() < death_chance:
                     logger.info(f"[衰老死亡] {self.id} 年龄={self.age}，概率={death_chance:.2f} → 死亡")
                     self.death_by_aging = True
-                    # ✅ 值得记录的细胞才加入 local memory
+                    #  值得记录的细胞才加入 local memory
                     if self.is_worthy_of_memory():
                         self.add_to_local_memory()
                     return True
@@ -711,7 +710,7 @@ class CogUnit:
             if random.random() < death_chance:
                 logger.info(f"[衰老死亡] {self.id} 年龄={self.age}，概率={death_chance:.2f} → 死亡")
                 self.death_by_aging = True
-                # ✅ 值得记录的细胞才加入 local memory
+                #  值得记录的细胞才加入 local memory
                 if self.is_worthy_of_memory():
                     self.add_to_local_memory()
                 return True
@@ -802,11 +801,11 @@ class CogUnit:
                 new_l2
             )
 
-        # 🔬 基因复制（深拷贝）
+        #  基因复制（深拷贝）
         clone_unit.gene = {k: v for k, v in self.gene.items()}
 
-        # 🌱 突变机制（小概率触发）
-        # ✅ 强制“只升不降”
+        #  突变机制（小概率触发）
+        #  强制“只升不降”
         if random.random() < self.gene.get("mutation_rate", 0.01):
             delta = random.choice([2, 4])  # 只允许正增
             new_hidden = self.hidden_size + delta
@@ -861,7 +860,7 @@ class CogUnit:
             clone_unit.last_output = self.last_output.clone()
 
         self.energy *= 0.4
-        # ✅ 继承局部记忆池（只保留最新的 75 条）
+        #  继承局部记忆池（只保留最新的 75 条）
         # 保留有 score 的记忆
         scored_memories = [m for m in self.local_memory_pool if "score" in m]
 
@@ -883,9 +882,9 @@ class CogUnit:
         clone_unit.to(self.device)
         # --------------------
 
-        # 🎯 改为融合 local memory（局部记忆池）
+        #  改为融合 local memory（局部记忆池）
         if hasattr(self, "local_memory_pool") and len(self.local_memory_pool) >= 1:
-            # 可选：更智能挑选最近最活跃的记忆
+            # 更智能挑选最近最活跃的记忆
             memory = random.choice(self.local_memory_pool[-5:])  # 可换成 max(..., key=...)
 
             for key in ["sensor_bias", "processor_bias", "emitter_bias"]:
@@ -925,10 +924,10 @@ class CogUnit:
                         )
                         clone_unit.gene["hidden_size_tag"] = new_hidden
                         logger.debug(f"[网络融合] hidden_size 融合为 {new_hidden}")
-        # ✅ 若母体是永久探索者，则子体也继承
+        #  若母体是永久探索者，则子体也继承
         if getattr(self, "is_permanent_explorer", False):
             clone_unit.is_permanent_explorer = True
-        # ✅ 最终兜底：如果前面没赋值 visit_counts，则继承父体记录
+        #  最终兜底：如果前面没赋值 visit_counts，则继承父体记录
         if not hasattr(clone_unit, "visit_counts") or not clone_unit.visit_counts:
             clone_unit.visit_counts = self.visit_counts.copy()
 

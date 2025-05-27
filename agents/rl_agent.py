@@ -97,7 +97,7 @@ class RLAgent:
         old_policy = self.policy_net
         old_dim = self.state_dim
 
-        # 1) 构建新策略网络（参数同原来）
+        # 1) 构建新策略网络
         self.policy_net = TransformerPolicyNetwork(
             input_dim=new_input_dim,
             num_actions=self.num_actions,
@@ -136,7 +136,7 @@ class RLAgent:
         log_prob = dist.log_prob(action)      # Tensor([logp])
 
         # 缓存
-        # state_feat: 简化后的状态表示 (input_dim,)
+        # state_feat: 简化后的状态
         state_feat = state_seq.detach().mean(dim=1).squeeze(0)  # (input_dim,)
         value = self.value_head(state_feat).squeeze(0)         # (1,) -> scalar
 
@@ -176,7 +176,7 @@ class RLAgent:
                 pad_sz = self.state_dim - cur_d
                 s = F.pad(s, (0, pad_sz), value=0.0)
             elif cur_d > self.state_dim:
-                # 截断多余维度（一般不会出现）
+                # 截断多余维度
                 s = s[:self.state_dim]
             padded_states.append(s)
         states = torch.stack(padded_states)  # (T, state_dim)

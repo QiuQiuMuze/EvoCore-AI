@@ -3,7 +3,7 @@ config_runtime.py
 =================
 
 集中放所有 **运行期加速选项**。
-*默认全部打开*，但是你在训练脚本里可以一键关闭：
+*默认全部打开*，但是在训练脚本里可以一键关闭：
 
 >>> from config_runtime import RF
 >>> RF.disable_all()          # 关闭所有加速

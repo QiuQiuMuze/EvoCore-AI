@@ -112,7 +112,7 @@ class MemoryNetUnit(MemoryBuffer):
         """保留最近 keep_last 条，其余丢弃（含 faiss index 对齐）"""
         if len(self.buffer) <= keep_last:
             return
-        # 简单 FIFO；若你有打分可替换成按 score
+        # 简单 FIFO
         while len(self.buffer) > keep_last:
             self.buffer.popleft()
         if self._FAISS_AVAILABLE and hasattr(self, "_index"):

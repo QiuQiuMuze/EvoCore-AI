@@ -74,7 +74,6 @@ class SpecialEmitter(CogUnit):
             elif state.dim() == 1:
                 # [D] → [1, D]
                 state = state.unsqueeze(0)
-            # 现在一定是二维了
             super().update(state)
 
     def _detect_attack_positions(self) -> List[Tuple[int,int]]:
@@ -103,5 +102,5 @@ class SpecialEmitter(CogUnit):
         # 将 new_unit 注册到 CogGraph 中（需在外部调用注册函数）
         if hasattr(self.env, 'register_special'):
             self.env.register_special(new_unit)
-        # 可在此记录分化日志
+
 

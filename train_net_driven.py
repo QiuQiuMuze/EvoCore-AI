@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 train_net_driven.py
 ===================
@@ -106,7 +104,6 @@ def main(cfg):
             # 环境当前状态张量
             with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                   if device.type == "cuda" else nullcontext()):
-                # env.get_state_tensor() 已经在 GPU，无需再 .to()
                 state_tensor = env.get_state_tensor().view(1, -1)  # (1, C×H×W)
                 graph.step(state_tensor)
 
@@ -115,7 +112,6 @@ def main(cfg):
             curr_inf_total = env.infected_map.sum().item()  # 仍然用感染格计数
             curr_hack_total = (env.privilege_level > 0.05).sum().item()  # <— 只统计仍在提权的格子
 
-            # >>> PATCH-BEGIN: update & roll
             delta_inf_cleared = max(0, prev_inf_total - curr_inf_total)
             delta_hack_cleared = max(0, prev_hack_total - curr_hack_total)
 
@@ -142,20 +138,18 @@ def main(cfg):
 
             if delta_inf < 0:
                 delta_inf *= 2
-            # >>> PATCH-BEGIN: new reward
+
             new_infections = max(0, delta_inf)  # Δinf >0 才算新增
             reward = (
                     delta_inf_cleared * 1.0  # +1 / 成功清除
                     - new_infections * 1.0  # -1 / 新增感染
                     - delta_hack * cfg.hack_penalty  # 黑客惩罚保持不变
             )
-            # <<< PATCH-END
             # --- 统计黑客 ---
             hack_stats = env.get_hack_stats()
             hack_msg = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
 
             total_reward += reward
-            # >>> PATCH-BEGIN: print rolling totals
             if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
@@ -166,7 +160,6 @@ def main(cfg):
                     f"权限总和 = {hack_stats['total_priv']:.1f}，威胁度 = {hack_stats['threat_score']:.2f}"
                 )
 
-            # <<< PATCH-END
 
             # 更新历史
             prev_inf  = curr_inf

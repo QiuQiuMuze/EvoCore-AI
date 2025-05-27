@@ -75,7 +75,7 @@ class EmitterActions:
         self.env.privilege_level[y, x] = 0.0
         # 2) 重置暴力破解计数
         self.env.login_failures[y, x] = 0.0
-        # 3) （可选）修补漏洞强度
+        # 3) 修补漏洞强度
         self.env.vulnerability[y, x] *= 0.5
         logger.info(f"[HACK_DEFENSE] 在 {pos} 执行黑客防御：降权 & 重置登录失败 & 修补脆弱度")
 

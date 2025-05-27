@@ -118,7 +118,7 @@ class GridSecurityEnv:
     def _expand_environment(self, growth=2):
         old_size = self.size
         new_size = old_size + growth
-        new_size = min(25, new_size)  # 你可以把最大尺寸设为 25
+        new_size = min(25, new_size)
         self.size = new_size
 
         def expand(tensor, fill=0.0):
@@ -259,7 +259,6 @@ class GridSecurityEnv:
 
             spread_prob_map = F.conv2d(prob_seed.unsqueeze(0).unsqueeze(0),
                                        kernel_4, padding=1).squeeze()
-            # <<< PATCH end
         else:
             spread_prob_map = torch.zeros_like(self.infected_map)
 
@@ -290,7 +289,6 @@ class GridSecurityEnv:
             self.infected_map[burst_new]       = 1.0
             self.infection_strength[burst_new] = 1.0
 
-        # （可选）你如果还想在 new_attacks 里登记，可把 new_inf / burst_new 的坐标加进去
         self.attacks.update(new_attacks)
 
         self.attack_history += self.infected_map
@@ -300,7 +298,7 @@ class GridSecurityEnv:
 
         self.attack_history.clamp_(0, 10)
 
-        # 🔁 代替固定间隔触发入侵
+        # 代替固定间隔触发入侵
         spawn_chance = 20.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
         if random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
@@ -330,7 +328,7 @@ class GridSecurityEnv:
                 dst = dst[:, free]
                 if dst.numel():
                     vul = self.vulnerability[dst[1], dst[0]]
-                    p = 0.1  # 你可以根据 hack 类型决定
+                    p = 0.1  # 可以根据 hack 类型决定
                     keep = (torch.rand_like(vul) < vul * p)
                     dst = dst[:, keep]
                     self.hack_history.index_put_((dst[1], dst[0]),
@@ -414,13 +412,12 @@ class GridSecurityEnv:
     def _extract_syscall_vector(self) -> torch.Tensor:
         """
         模拟获取当前系统调用特征向量，shape=[H, W]。
-        你可以替换为实际的调用序列统计。
         """
         # 这里用随机噪声做示例
         return torch.randn((self.size, self.size), device=self.device) * 0.01
 
 
-# ⚠️ 安全包装器：屏蔽旧接口
+# 安全包装器：屏蔽旧接口
 class SecureGridEnv(GridSecurityEnv):
     def consume_resource(self, *args, **kwargs): return 0.0
     def get_nearest_resource_to(self, *args, **kwargs): return None

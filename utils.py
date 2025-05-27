@@ -45,7 +45,7 @@ def sinusoidal_positional_encoding(seq_len: int, d_model: int, device="cpu") -> 
     生成与 Transformer 论文同款的 sin/cos 位置编码。
 
     说明：
-    - 若你改用 learnable embedding，可忽略本函数；
+    - 若用 learnable embedding，可忽略本函数；
     - 返回 shape = (seq_len, d_model)。
 
     Example
@@ -150,7 +150,7 @@ class IntrinsicCuriosityModule(nn.Module):
 
         # 更新记录
         self.state_dim = new_state_dim
-        # ⚠️ 扩维后清空所有旧 transition 缓存，避免不同维度冲突
+        # ⚠扩维后清空所有旧 transition 缓存，避免不同维度冲突
         self.states.clear()
         self.next_states.clear()
         self.actions.clear()
