@@ -43,7 +43,7 @@ def _get_hi(table, total):
 ROLE_SPLIT_RULE = {
     "sensor":    {"min_e": 1.2, "min_calls": 0},   # 轻量，几乎不限制调用频率
     "processor": {"min_e": 1.2, "min_calls": 1},   # 中等
-    "emitter":   {"min_e": 1.2, "min_calls": 0},   # 最重，门槛最高
+    "emitter":   {"min_e": 0.6, "min_calls": 0},   # 最重，门槛最高
 }
 # ----------------------------------------------------
 
@@ -58,7 +58,7 @@ class CogUnit:
     - 可克隆生成新单元（clone）
     """
 
-    def __init__(self, input_size=50, hidden_size=16, role="processor",env_size=5):
+    def __init__(self, input_size=50, hidden_size=16, role="processor",env_size=5, id=None, **kwargs):
         self.is_elite = False
         self.local_memory_pool = []  # 每个单元的私有记忆池
 
@@ -89,8 +89,9 @@ class CogUnit:
         self.memory_limit = 5  # 可调整为 k 步
         self.memory_pool_limit = 50
         self.role = role
+        self.cleared_positions = set()
         self.uuid = uuid.uuid4()          # 唯一标识
-        self.id = self.uuid
+        self.id = id or str(uuid.uuid4())
         self.int_id = self.uuid.int & 0xFFFFFFFF
         self.energy = 1.0               # 初始能量
         self.age = 0                    # 生存步数
@@ -200,6 +201,8 @@ class CogUnit:
         return [self.output_history_tensor[i] for i in idxs]
 
     def update(self, input_tensor: torch.Tensor):
+        input_tensor = input_tensor.squeeze()  # ← 保证不是 3 维
+
         # 🚨 安全检查：function 权重与输入 tensor 一致
         if not FOLLOW_INPUT_DEVICE:
             if self.function[0].weight.device != input_tensor.device:
@@ -217,10 +220,31 @@ class CogUnit:
             input_tensor = input_tensor.unsqueeze(0)
 
         # —— 拼接目标向量 ——
-        if hasattr(self, "goal_vec"):
-            # self.goal_vec: (goal_dim,)
-            gv = self.goal_vec.view(1, -1)  # → (1, goal_dim)
+        # ✅ 保证 input_tensor 至少是 [1, D] 或 [B, D]
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)  # [D] → [1, D]
+        elif input_tensor.dim() == 3 and input_tensor.size(1) == 1:
+            input_tensor = input_tensor.squeeze(1)  # [1, 1, D] → [1, D]
+
+        if hasattr(self, "goal_vec") and self.goal_vec is not None:
+            gv = self.goal_vec
+            if gv.dim() == 2:
+                gv = gv.reshape(1, -1)  # [3, size²] → [1, 3×size²]
+            elif gv.dim() == 1:
+                gv = gv.unsqueeze(0)  # [D] → [1, D]
+            elif gv.dim() == 3 and gv.shape[1] == 1:
+                gv = gv.squeeze(1)  # [1, 1, D] → [1, D]
+            else:
+                raise RuntimeError(f"[goal_vec 异常] 当前 shape={gv.shape}")
+
+            if input_tensor.dim() == 3 and input_tensor.size(1) == 1:
+                input_tensor = input_tensor.squeeze(1)  # [B, 1, D] → [B, D]
+
+            if input_tensor.dim() == 1:
+                input_tensor = input_tensor.unsqueeze(0)
+
             input_tensor = torch.cat([input_tensor, gv], dim=-1)
+
         # —— 对齐到 current network 的 input_size ——
         D = input_tensor.shape[-1]
         if D < self.input_size:
@@ -243,12 +267,6 @@ class CogUnit:
             if self.function[0].weight.device != input_tensor.device:
                 self.to(input_tensor.device)
 
-        """更新 CogUnit 状态"""
-        if input_tensor.dim() == 1:
-            input_tensor = input_tensor.unsqueeze(0)
-            if hasattr(self, "goal_vec"):
-                gv = self.goal_vec.unsqueeze(0)  # → (1, goal_dim)
-                input_tensor = torch.cat([input_tensor, gv], dim=-1)
 
         # 🚨 先检查 input_size 是否需要扩展（动态适配环境变化）
         current_input_size = input_tensor.shape[-1]
@@ -765,10 +783,18 @@ class CogUnit:
 
             # 把旧权重拷到新层的左上角
             with torch.no_grad():
-                new_l1.weight[:, :w1.shape[1]].copy_(w1)
+                cols = min(new_l1.in_features, w1.shape[1])  # 取两者较小值
+                new_l1.weight.data[:, :cols].copy_(w1[:, :cols])
+                # 如果还要复制 bias，可保持原句；bias 维度本来就对齐
+
                 new_l1.bias.copy_(b1)
-                new_l2.weight[:w2.shape[0], :w2.shape[1]].copy_(w2)
-                new_l2.bias[:b2.shape[0]].copy_(b2)
+                # ----- 安全复制 new_l2 -----
+                rows = min(new_l2.out_features, w2.shape[0])  # 取行的较小值
+                cols = min(new_l2.in_features, w2.shape[1])  # 取列的较小值
+                new_l2.weight.data[:rows, :cols].copy_(w2[:rows, :cols])
+
+                # bias 只在行一致时才能完整 copy
+                new_l2.bias.data[:rows].copy_(b2[:rows])
 
             clone_unit.function = nn.Sequential(
                 new_l1,

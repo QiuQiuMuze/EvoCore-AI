@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional
-
+import random
 # 尝试导入 Flash-Attn 的高效 Transformer 实现
 try:
     from flash_attn.modules.transformer import TransformerLayer as FlashTransformerLayer
@@ -108,11 +108,38 @@ class TransformerPolicyNetwork(nn.Module):
         h = h.mean(dim=1)  # (B, d_model)
         logits = self.fc_out(h)
 
+        # ---------- ε-greedy 探索：训练时 5% 概率全随机 ------------------
+        if self.training and random.random() < 0.05:
+            return torch.rand_like(logits)
+
         # 动作噪声
         if self.training and self.use_action_noise:
             noise = torch.randn_like(logits) * self.noise_std
             logits = logits + noise
         return logits
+
+    def resize_head(self, new_num_actions: int):
+        old_out = self.fc_out
+        in_f = old_out.in_features
+        self.fc_out = nn.Linear(in_f, new_num_actions).to(old_out.weight.device)
+
+    def encode(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        将输入 (B, L, input_dim) 映射到隐藏表示 (B, L, d_model)
+        """
+        h = self.input_proj(x)  # (B, L, d_model)
+
+        if not self.use_flash:
+            # 添加位置编码
+            pe = sinusoidal_positional_encoding(seq_len=h.size(1), d_model=h.size(2), device=h.device)
+            h = h + pe.unsqueeze(0)
+            h = self.transformer_encoder(h, src_key_padding_mask=mask)
+        else:
+            # Flash-Attn 内部已含位置编码逻辑
+            h = self.transformer_encoder(h)
+
+        return h  # (B, L, d_model)
+
 
 """
 # 安装 PyTorch（确保你用的是 CUDA 版本）

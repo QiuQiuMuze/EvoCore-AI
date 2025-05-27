@@ -33,6 +33,25 @@ N_GOAL_CHANNELS = 3
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
 
+def _align_vec(a: torch.Tensor, b: torch.Tensor, mode="pad"):
+    """
+    把 a、b 对齐到同长度并返回新张量。
+    mode = "pad"  → 把短的右侧补 0
+    mode = "truncate" → 把长的截到短的
+    """
+    la, lb = a.shape[-1], b.shape[-1]
+    if la == lb:
+        return a, b, la          # 已经一样长
+    if mode == "pad":
+        L = max(la, lb)
+        if la < L:
+            a = F.pad(a, (0, L - la))
+        if lb < L:
+            b = F.pad(b, (0, L - lb))
+        return a, b, L           # 返回对齐后的向量和最终长度
+    else:
+        L = min(la, lb)
+        return a[..., :L], b[..., :L], L
 
 
 
@@ -101,7 +120,7 @@ class CogGraph:
     # 自动生成种子细胞（sensor=1, processor=4, emitter=1，可调）
     def _init_seed_units(self,
                          n_sensor: int = 16,
-                         n_processor: int = 32,
+                         n_processor: int = 34,
                          n_emitter: int = 16,
                          device: str = "cpu"):
 
@@ -178,7 +197,7 @@ class CogGraph:
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
         self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
-        self.max_total_energy = 500  # 初始最大总能量
+        self.max_total_energy = 1000  # 初始最大总能量
         self.removed_hazards_by_reward = 0
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
@@ -359,6 +378,7 @@ class CogGraph:
         # self.edge_dirty = True
 
         self._update_global_counts()
+
 
     def _get_min_target_counts(self):
         """
@@ -620,11 +640,25 @@ class CogGraph:
                     (u1.get_position()[0] + u2.get_position()[0]) // 2,
                     (u1.get_position()[1] + u2.get_position()[1]) // 2
                 )
-                merged.state = (u1.state + u2.state) / 2
+                # ---- 1) 对齐 state ----
+                s1, s2, L = _align_vec(u1.state.view(-1), u2.state.view(-1), mode="pad")
+                merged.state = (s1 + s2) / 2  # 已经同长度
+
+                # ---- 2) 跟着更新 merged 的尺寸记录 ----
+                merged.input_size = L
+                # 若 merged 里有 l1 层，保证 in_features ≥ L
+                from torch import nn
+                if hasattr(merged, "l1") and isinstance(merged.l1, nn.Linear):
+                    if merged.l1.in_features < L:
+                        # 复用你之前的 expand_unit_dim，或简单重建一层
+                        from ImmuneCogGraph import ImmuneCogGraph  # 或其他文件里你已有的函数
+                        ImmuneCogGraph.expand_unit_dim(self, merged, L)
+
                 merged.age = int((u1.age + u2.age) / 2)
                 merged.energy = u1.energy + u2.energy + 0.02  # 奖励合并能量
                 # merged.meta.record(action="Combine", reward=+0.02)
-                merged.last_output = (u1.last_output + u2.last_output) / 2
+                o1, o2, _ = _align_vec(u1.last_output.view(-1), u2.last_output.view(-1), mode="pad")
+                merged.last_output = (o1 + o2) / 2
 
                 # 加入新单元
                 new_units.append(merged)
@@ -1115,8 +1149,10 @@ class CogGraph:
         old_out = unit.last_output
         if old_out.dim() == 2 and old_out.shape[0] == 1:
             old_out = old_out.squeeze(0)
+        old_out_flat = old_out.view(-1)  # flatten 成 1D，确保无维度冲突
         new_out = torch.zeros(new_input_size, device=old_out.device)
-        new_out[: old_out.shape[0]] = old_out
+        usable = min(new_input_size, old_out_flat.shape[0])
+        new_out[:usable] = old_out_flat[:usable]
         unit.last_output = new_out
 
         new_history = []
@@ -1127,15 +1163,18 @@ class CogGraph:
             new_history.append(p.unsqueeze(0))
         unit.output_history = new_history
 
-        old_state = unit.state.squeeze(0) if unit.state.dim() == 2 else unit.state
-        new_state = torch.zeros(new_input_size, device=old_state.device)
-        new_state[: old_state.shape[0]] = old_state
+        old_state_flat = unit.state.view(-1)  # flatten 成 1D，防止维度不一致
+        new_state = torch.zeros(new_input_size, device=old_state_flat.device)
+        usable = min(new_input_size, old_state_flat.shape[0])
+        new_state[:usable] = old_state_flat[:usable]
         unit.state = new_state
 
         new_mem = []
         for mem in unit.state_memory:
-            p = torch.zeros(new_input_size, device=mem.device)
-            p[: mem.shape[-1]] = mem
+            m_flat = mem.view(-1)
+            p = torch.zeros(new_input_size, device=m_flat.device)
+            usable = min(new_input_size, m_flat.shape[0])
+            p[:usable] = m_flat[:usable]
             new_mem.append(p)
         unit.state_memory = new_mem
 
@@ -1251,8 +1290,8 @@ class CogGraph:
         # 🟡 预热补偿（前 500 步）
         if self.current_step < 500:
             for unit in self.units:
-                unit.energy += 0.02
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.02")
+                unit.energy += 0.05
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
 
         # 🟠 能量税（每 10 步）
         if self.current_step > 200 and self.current_step % 100 == 0:
@@ -1522,7 +1561,7 @@ class CogGraph:
             )
 
         # —— 额外弱细胞补给（无论总能量是否超限） ——
-        weak_units = [u for u in self.units if u.energy < 0.5]
+        weak_units = [u for u in self.units if u.energy < 1.0]
         if self.energy_pool > 0.1 and weak_units:
             per_unit = min(0.2, self.energy_pool / len(weak_units))
             for u in weak_units:
@@ -1536,11 +1575,13 @@ class CogGraph:
         返回新生成的 child 单元。
         """
         expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+        resources = getattr(self.env, "resources", {})  # 默认空字典
+        hazards = getattr(self.env, "hazards", {})
 
         child = parent.clone(
             new_input_size=expected_input if parent.input_size != expected_input else None,
-            global_resources=self.env.resources,
-            global_hazards=self.env.hazards,
+            global_resources = resources,
+            global_hazards=hazards,
             free_positions=self.free_positions
         )
 
@@ -1808,61 +1849,73 @@ class CogGraph:
         if self.debug and self.current_step % 40 == 0:
             self.rebalance_cell_types()
 
-
     def step(self, input_tensor: torch.Tensor):
+
+        # 每 1000 步重置资源/危险点清理计数器
         if self.current_step % 1000 == 0:
-            # 重置计数
             self.removed_resources_count = 0
-            self.removed_hazards_count  = 0
+            self.removed_hazards_count = 0
             self.removed_hazards_by_reward = 0
+
+        # 每 200 步清空“活跃单元”缓存
         if self.current_step % 200 == 0:
             self.active_units.clear()
 
+        # 记录当前步数 +1
         self.current_step += 1
+
+        # 更新全局统计量（单元数、平均能量等）
         self._update_global_counts()
 
-        # === Transformer 一网打尽 ===
+        # 如果使用共享 Transformer，每隔固定步数运行一次所有单元的统一 forward
         if RF.use_shared_tx and (self.current_step % RF.shared_tx_interval == 0):
             self._run_shared_transformer()
 
-        # 同步环境尺寸
+        # 确保环境维度与系统一致（例如动态网格扩展后）
         self._sync_environment_dimensions()
 
-        # —— 改为拆分外部传入的 input_tensor ——
-        # 假设调用方已经做了 torch.cat([env_state, goal_vec], dim=1)
-        batch = input_tensor             # (1, env_dim+goal_dim)
-        env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
-        env_state = batch[:, :env_dim]                    # (1, env_dim)
-        # ---------- NEW: 把目标 one-hot 变成 2 个平面 ----------
-        res_map = self.target_vector[0].unsqueeze(0)  # (1, env²)  资源
-        hzd_map = self.target_vector[1].unsqueeze(0)  # (1, env²)  陷阱
+        # === 解包输入张量：状态 + 目标 ===
+        batch = input_tensor  # (1, env_dim+goal_dim)
+
+        # 提取环境状态部分（4 通道）
+        env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
+        env_state = batch[:, :env_dim]  # (1, env_dim)
+
+        # 提取目标向量：资源 + 陷阱各一张 env² 维度的 one-hot 图
+        res_map = self.target_vector[0].unsqueeze(0)
+        hzd_map = self.target_vector[1].unsqueeze(0)
         goal_flat = torch.cat([res_map, hzd_map], dim=1)  # (1, 2·env²)
 
-        # 6 通道打包
-        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
-        # ─── 新增：长期记忆准备 ───
-        # 1) 把 state snapshot 存下来（去掉 batch 维）
+        # 拼成最终的全状态张量：共 6 通道（4 状态 + 2 目标）
+        full_state = torch.cat([env_state, goal_flat], dim=1)
+
+        # 存一份当前状态快照（用于奖励计算与记忆）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
-        # 2) 记录下此刻每个 unit 的能量，用来算 reward
+
+        # 记录所有单元当前能量
         prev_energies = {u.id: u.energy for u in self.units}
 
-        # 准备目标向量
+        # 刷新目标向量（最近资源和陷阱点 one-hot）
         self._update_target_vector()
 
+        # 如果启用课程式学习环境，动态扩展环境内容
         self._expand_environment_curriculum()
 
+        # 重新标定哪些位置是空闲的可出生点
         self._rebuild_free_positions()
-        
+
+        # 如有必要，扩充细胞系统总能量上限
         self._expand_energy_cap_if_needed()
 
+        # —— 若处于静息模式，使用专用静态处理流程 —— #
         if self.static_mode:
             return self._static_step(input_tensor)
 
+        # 启动能量预热机制（前 N 步发育期）与能量税（系统维持费用）
         self._apply_warmup_and_energy_tax()
 
-        # 每次循环时，根据当前步数决定更新间隔
+        # 动态决定结构维护步数间隔
         step = self.current_step
-
         if step < 1000:
             interval = 1000
         elif step < 1500:
@@ -1874,88 +1927,106 @@ class CogGraph:
         else:
             interval = 100
 
-        # # 然后用这个 interval 来判断是否需要更新 target_vector
+        # 裁剪过多连接，避免系统过于冗余
         self.prune_connections()
 
+        # 分配子系统 ID，便于系统结构解耦与对抗/协作
         self.assign_subsystems()
 
+        # 启动子系统之间的竞争机制（保留强者）
         self.run_subsystem_competition()
 
+        # 精英选择机制：每隔 N 步选出最优单元给予保留/资源倾斜
         self.select_elites()
 
-        new_units = []  # 新生成的单元（复制）
-        pending = {"sensor": [], "processor": [], "emitter": []}  # NEW: 待复制父单元
-        output_buffer = {}  # 缓存每个单元的输出 {unit_id: output_tensor}
+        # 新生成的细胞（复制而来）缓存区
+        new_units = []
+        pending = {"sensor": [], "processor": [], "emitter": []}  # 准备被复制的细胞
+        output_buffer = {}  # 缓存每个细胞的输出（避免重复计算）
 
-        # === 系统总能量限制，保护 clone ===
+        # 只有当系统能量未接近上限，才允许复制
         cell_energy = self.total_energy()
         allow_clone = cell_energy < self.max_total_energy * 0.98
 
-        # === 第一阶段：单元更新处理 ===
-        # 统计当前 emitter 数量
+        # —— 单元行为更新：包括 forward、奖励、记忆等 —— #
         expected_input = self.env_size * self.env_size * INPUT_CHANNELS
 
-        # —— 如果处于静吸模式，先筛掉“休眠”的单元 —— #
+        # 静息模式下，筛选活跃单元 ID（剩余10%）
         active_ids = None
         if self.static_mode:
             active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
+
         for unit in self.units[:]:
+            # 所有 emitter 的 visit_counts 累积当前位置的访问次数
             pos = tuple(self.env.agent_pos)
             for u in self.units:
                 if u.get_role() == "emitter":
                     u.visit_counts.setdefault(pos, 0)
                     u.visit_counts[pos] += 1
+
+            # 如果静息模式下该单元是“静止”单元，则跳过
             if active_ids is not None and unit.id not in active_ids:
                 continue
+
+            # 构造单元输入：截取状态、连接信息
             unit_input = self._prepare_unit_before_update(unit, full_state, expected_input)
             unit_input = unit_input.to(self.device)
+
+            # 应用能量代谢（消耗能量 + 生存开销）
             self._apply_unit_metabolism(unit, unit_input)
+
+            # 更新细胞状态、奖励计算、分裂准备等
             self._finalize_unit_update(unit, state_snapshot, output_buffer, pending, allow_clone)
 
-
+        # 每 50 步，清理死亡细胞并统计
         if self.current_step > 0 and self.current_step % 50 == 0:
             self.finalize_deaths()
 
+        # 自动连接孤立单元或构建局部拓扑
         self.auto_connect()
 
+        # 清理无效连接（死细胞、悬空等）
         self.prune_dead_connections()
 
-        # 在执行环境奖励逻辑之后：
+        # 应用环境奖励机制：根据 emitter 表现给予奖励/惩罚
         self.reward_emitter_grid_environment()
-        # 加入这一行：处理删除惩罚 & 计数
+
+        # 处理奖励引发的惩罚点删除等副作用
         self._handle_reward_and_penalty()
-        # 再判断是否要进静吸
+
+        # 判断是否进入静息模式（满足条件：长时间无奖励等）
         self._check_enter_static_mode()
 
-        # === 重度维护：只在部分步数执行，避免每步循环开销 ===
-
-        # —— 可选路径追踪（纯调试，不影响状态） ——
+        # 可选：调试路径跟踪，记录细胞目标行动路线
         if self.debug and self.current_step % 100 == 0:
             self.trace_info_paths()
 
-        # —— 统一统计 & 连接打印（仅 debug） ——
+        # 输出系统日志：连接数、存活率等
         self._log_stats_and_conns()
 
-        # === 40 %-限额复制（>15 细胞才触发） ===
+        # 从待复制列表中选取适合复制的父单元
         selected_parents = self._select_clone_parents(pending)
         for parent in selected_parents:
             child = self.clone_and_connect(parent)
             new_units.append(child)
 
-            # —— 最终一次性把所有 child 加入图结构 ——
+        # 最终将所有新细胞加入系统结构
         for unit in new_units:
             self.add_unit(unit)
 
+        # 运行维护逻辑（调整遗传机制、能量调配等）
         self._perform_system_maintenance()
 
+        # 如果能量过高，触发回流机制（例如惩罚高能细胞）
         self.handle_energy_overflow()
 
+        # 周期性触发：合并冗余单元、优化公共子图结构
         interval = max(200, len(self.units) // 8)
         if self.current_step % interval == 0:
             self.merge_redundant_units()
             self.restructure_common_subgraphs()
 
-        # —— 新增：周期性清理统计 ——
+        # 每 50 步打印清理统计信息
         if self.current_step % 50 == 0:
             res_cleared = self.removed_resources_count
             haz_by_reward = self.removed_hazards_by_reward
@@ -1968,9 +2039,13 @@ class CogGraph:
                 f"剩余资源 {res_left} 个，剩余危险 {haz_left} 个"
             )
 
-
+        # 执行自我评价模块，分析系统运行趋势与效率
         self.meta_self_evaluation()
+
+        # 记录长期记忆（细胞能量、行为与输入状态）
         self.record_long_term_memory(prev_energies, state_snapshot)
+
+        # 保持探索型 emitter 始终占据 10% 比例（否则自动补充）
         if self.current_step % 50 == 0:
             self._maintain_explorer_emitter_ratio()
 
@@ -2366,6 +2441,19 @@ class CogGraph:
             for u in self.units:
                 u.memory_buffer.clear()
 
+            # ------- env 扩容完成后，确保所有栅格张量 shape = new_size ----------
+            new_H, new_W = self.env.size, self.env.size
+
+            def _resize(m):
+                if m.shape[0] == new_H:  # 已是新尺寸
+                    return m
+                pad_h, pad_w = new_H - m.shape[0], new_W - m.shape[1]
+                return F.pad(m, (0, pad_w, 0, pad_h))  # 右下补 0
+
+            self.env.privilege_level = _resize(self.env.privilege_level)
+            self.env.infected_map = _resize(self.env.infected_map)
+            self.env.infected_duration_map = _resize(self.env.infected_duration_map)
+            # ------------------------------------------------------------------
 
     def trim_weak_memories(self):
         """环境发生变化时，清除所有细胞记忆池中的一半最弱记忆"""
