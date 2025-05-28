@@ -48,6 +48,7 @@ class ImmuneCogGraph(CogGraph):
         # 环境替换
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
+        # 混合策略控制：guided 的比例，逐步衰减到 0
         super().__init__(rl_agent, device=device, env=env)
         # —— 初始化 cleared_positions —— #
         for u in self.units:
@@ -73,6 +74,10 @@ class ImmuneCogGraph(CogGraph):
         self.replay_buffer = deque(maxlen=10000)
         self.last_report_stage = None
         self.hack_kill_stats = {"self_direct": 0, "guided": 0}
+        # 追踪各黑客类型的击杀数
+        self.hack_kill_stats_by_type = {}
+        # 追踪各病毒类型的击杀数（如果只有一种病毒，可统一用 'virus' 作为 key）
+        self.virus_kill_stats_by_type = {}
         self.env.resources = {}  # 空字典，保证 .resources 存在
         self.env.hazards = {}  # handle_energy_overflow 里可能也用到 .hazards
         self.punished_map = torch.zeros_like(self.env.infected_duration_map, dtype=torch.bool)
@@ -81,7 +86,8 @@ class ImmuneCogGraph(CogGraph):
         self.prev_vuln = torch.zeros_like(self.env.vulnerability)
         self.prev_fail = torch.zeros_like(self.env.login_failures)
         self.kill_stats = {"self_direct": 0, "guided": 0, "last_reset": 0}
-
+        self.guided_prob = 1.0
+        self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
         seq_len = self.env.size * self.env.size
         self.transformer = TransformerPolicyNetwork(
             input_dim=N_STATE_CHANNELS,
@@ -111,8 +117,13 @@ class ImmuneCogGraph(CogGraph):
         self.immune_processor = ImmuneProcessor(
             memory_pool=self.memory,
             feature_extractor=self.transformer,
-            similarity_threshold=0.7
+            similarity_threshold=0.5
         )
+        # —— 抗体分类头 & 优化器 —— #
+        feat_dim = self.transformer.fc_out.in_features
+        self.immune_clf = nn.Linear(feat_dim, 1).to(self.device)
+        self.immune_opt = optim.Adam(self.immune_clf.parameters(), lr=1e-4)
+
 
         # 特攻单元
         for atk in self.env.attack_types:
@@ -127,13 +138,18 @@ class ImmuneCogGraph(CogGraph):
             sp.cleared_positions = set()
             self.add_unit(sp)
         # —— 优化 Transformer —— #
-        import torch.optim as optim
         self.optimizer = optim.Adam(
             list(self.transformer.parameters()) +
             list(self.replay_head.parameters()),
             lr=2e-4
         )
-
+        # —— **新增**：把全局 MLP 主干也加入训练 —— #
+        self.policy_optimizer = optim.Adam(
+            list(self.sensor_net.parameters()) +
+            list(self.processor_net.parameters()) +
+            list(self.emitter_net.parameters()),
+            lr=1e-4
+        )
 
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,  # 作用对象
@@ -1082,6 +1098,7 @@ class ImmuneCogGraph(CogGraph):
         # === 定期修剪 Memory ===
         if self.current_step % 2000 == 0:
             self.memory.trim(keep_last=800)
+        self.guided_prob = max(0.0, self.guided_prob - self.guided_decay)
 
     def _sample_meta_tasks(self, num_tasks=5, k_support=4, k_query=4):
         """
@@ -1123,6 +1140,7 @@ class ImmuneCogGraph(CogGraph):
         # 1) before
         if action["type"] == ACTION_HACK_DEFENSE:
             before = self.env.privilege_level[y, x].item()
+            stealth_before = self.env.hack_strength[y, x].item()
         else:
             before = self.env.infected_map[y, x].item()
 
@@ -1135,7 +1153,6 @@ class ImmuneCogGraph(CogGraph):
             hit = (before > 0.05 and after == 0.0)
             # === 新增：隐蔽黑客清除奖励 ===
             # 把执行 perform 之前的 hack_strength 记录下来
-            stealth_before = self.env.hack_strength[y, x].item()
             stealth_after = self.env.hack_strength[y, x].item()
             stealth_hit = (stealth_before > 0.05 and stealth_after == 0.0)
             if stealth_hit:
@@ -1153,10 +1170,12 @@ class ImmuneCogGraph(CogGraph):
             bonus = HIT_BONUS * factor
             unit.energy += bonus
             unit.meta.record(action="hit_bonus", reward=bonus)
+            step_reward = bonus
             logger.debug("恭喜你打中啦")
         else:
             unit.energy = max(0.0, unit.energy - MISS_PENALTY)
             unit.meta.record(action="miss_penalty", reward=-MISS_PENALTY)
+            step_reward = -MISS_PENALTY
         # === 新增：把 hack_defense 的成功/失败都存回放池 ===
         if action["type"] == ACTION_HACK_DEFENSE:
             # state_vec 可用 unit.get_output() 或者从外层传入
@@ -1166,6 +1185,11 @@ class ImmuneCogGraph(CogGraph):
                        (stealth_before > 0.05 and stealth_after == 0.0))
             self.replay_buffer.append((state_vec, action, int(success)))
 
+        # —— 同步策略网络学习 —— #
+        # 用当前 env_state + last_flat_idx + 这一步 reward 直接更新
+        # 先拿到最新的 env_state tensor
+        state = self.env.get_state_tensor().view(1, -1).to(self.device)
+        self.policy_update(state, self.last_flat_idx, step_reward)
 
         return hit
 
@@ -1190,6 +1214,15 @@ class ImmuneCogGraph(CogGraph):
         state_vec = feat.detach().view(-1).cpu()
         success = (infected_before > 0.5 and infected_after == 0.0)
         self.replay_buffer.append((state_vec, action, success))
+
+        # —— 2) 对抗体分类头做一次微调 —— #
+        logits = self.immune_clf(feat.view(1, -1))          # [1,1]
+        label  = torch.tensor([[float(success)]], device=self.device)
+        loss   = F.binary_cross_entropy_with_logits(logits, label)
+        self.immune_opt.zero_grad()
+        loss.backward()
+        self.immune_opt.step()
+
 
 
     def _get_virus_stage(self) -> str:
@@ -1502,25 +1535,31 @@ class ImmuneCogGraph(CogGraph):
                 unit.cleared_hack = getattr(unit, "cleared_hack", set())
                 unit.cleared_hack.add((x, y))
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
+                # 全局累计
                 self.hack_kill_stats[src] += 1
+                # —— 新增：按黑客类型分类统计 —— #
+                hack_type = self.env.hacks.get((x, y), {}).get("type", "unknown")
+                bucket = self.hack_kill_stats_by_type.setdefault(
+                    hack_type, {"self_direct": 0, "guided": 0}
+                )
+                bucket[src] += 1
+
 
             # 记录 virus 清理
             if action["type"] == ACTION_BLOCK and hit:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
+                # 全局累计
                 self.kill_stats[src] += 1
+                # —— 新增：按病毒类型分类统计 —— #
+                virus_type = "virus"  # 如有多种，可从环境或 action 中提取
+                bucket_v = self.virus_kill_stats_by_type.setdefault(
+                    virus_type, {"self_direct": 0, "guided": 0}
+                )
+                bucket_v[src] += 1
                 unit.cleared_positions.add((x, y))
                 logger.debug(f"[清除记录] emitter {unit.id} 在 {(x, y)} 清除了一个病毒 ({src})")
 
     def _decode_action_from_output(self, unit, output_vec):
-        flat_idx = torch.argmax(output_vec).item()
-        size = self.env.size
-        y, x = divmod(flat_idx, size)
-
-        # ★FIX: 先裁剪一次，保证后面第一次索引安全
-        H, W = self.env.infected_map.shape  # 用 infected_map 的真实尺寸
-        y = min(y, H - 1)
-        x = min(x, W - 1)
-
         # === hacker 类型优先级（越大越危险） ===
         risk_weight = {
             "privilege_escalation": 3.0,
@@ -1528,20 +1567,62 @@ class ImmuneCogGraph(CogGraph):
             "bruteforce":          2.0,
             "phishing":            1.5
         }
-        # 如果黑客存在，把“最近的高风险”拍到最高优先级
-        if self.env.hacks:
-            # 1) 生成 [(risk, dist, (hx,hy))] 列表
-            cx, cy = unit.position
-            cand = []
-            for (hx, hy), info in self.env.hacks.items():
-                risk = risk_weight.get(info['type'], 1.0)
-                dist = abs(cx - hx) + abs(cy - hy)
-                cand.append(( -risk, dist, (hx, hy) ))   # 负号=越危险越小
-            # 2) 选 “危险最高 & 最近” 的
-            _, _, (hy_sel, hx_sel) = min(cand)
-            # 3) 将 output 强行指向它（≅ 系统指引）
-            y, x = hy_sel, hx_sel
+        # 1) 网络给出的 raw index
+        raw_idx = int(torch.argmax(output_vec).item())
+        size    = self.env.size
+        ry, rx  = divmod(raw_idx, size)
+
+        # 2) 在 guided_prob 范围内尝试硬编码覆盖
+        guided_choice = None
+        if random.random() < self.guided_prob:
+            # —— 高风险黑客覆盖 —— #
+            if self.env.hacks:
+                cx, cy = unit.position
+                items = list(self.env.hacks.items())
+                items.sort(key=lambda it: (
+                    -risk_weight.get(it[1]['type'], 1.0),
+                    abs(cx - it[0][0]) + abs(cy - it[0][1])
+                ))
+                (gx, gy), _ = random.choice(items[:3])
+                guided_choice = (gy, gx)
+            # —— 病毒覆盖 (40% 概率) —— #
+            if guided_choice is None and self.env.infected_map.sum() > 0 and random.random() < 0.4:
+                cx, cy = unit.position
+                virus_coords = torch.nonzero(self.env.infected_map).tolist()
+                if virus_coords:
+                    gy, gx = min(virus_coords, key=lambda c: abs(c[1] - cx) + abs(c[0] - cy))
+                    guided_choice = (gy, gx)
+
+        # 3) 最终坐标：guided 优先，否则用网络
+        if guided_choice is not None:
+            y, x = guided_choice
+            flat_idx = y * size + x
             unit.guided_this_round = True
+        else:
+            y, x = ry, rx
+            flat_idx = raw_idx
+            unit.guided_this_round = False
+
+
+        # ★FIX: 先裁剪一次，保证后面第一次索引安全
+        H, W = self.env.infected_map.shape  # 用 infected_map 的真实尺寸
+        y = min(y, H - 1)
+        x = min(x, W - 1)
+
+        # 如果黑客存在，从“Top-3 高风险”中随机选一个，而不是永远第1
+        if self.env.hacks:
+            cx, cy = unit.position
+            items = list(self.env.hacks.items())
+            # 先按 (risk, -distance) 排序，risk 越大排越前
+            items.sort(key=lambda it: (
+                -risk_weight.get(it[1]['type'], 1.0),
+                abs(cx - it[0][0]) + abs(cy - it[0][1])
+            ))
+            top_k = items[:min(3, len(items))]
+            (x_sel, y_sel), _ = random.choice(top_k)
+            y, x = y_sel, x_sel
+            unit.guided_this_round = True
+
 
         # ★PATCH 3-A: 若网络选的格子没病毒…
         if self.env.infected_map.sum() > 0 and self.env.infected_map[y, x] == 0:
@@ -1586,6 +1667,7 @@ class ImmuneCogGraph(CogGraph):
         cx, cy = unit.position
         if abs(cx - x) + abs(cy - y) > 1:
             nx, ny = self._step_toward((cx, cy), (x, y))
+            self.last_flat_idx = flat_idx
             return {"type": "move", "target": (nx, ny)}
         # ------------------------------------
 
@@ -1595,6 +1677,7 @@ class ImmuneCogGraph(CogGraph):
             a_type = ACTION_BLOCK
         else:
             a_type = ACTION_QUARANTINE
+        self.last_flat_idx = flat_idx
         return {"type": a_type, "target": (x, y)}
 
     def _argmax_position(self, output_vec):
@@ -1638,3 +1721,37 @@ class ImmuneCogGraph(CogGraph):
         self.merge_redundant_units()
         self.restructure_common_subgraphs()
         self.prune_connections()
+
+    def policy_update(self, env_state: torch.Tensor, flat_idx: int, reward: float):
+        # 1) 扁平化环境状态到 [1, D_env]
+        if env_state.dim() > 2:
+            env_flat = env_state.flatten().unsqueeze(0)
+        elif env_state.dim() == 1:
+            env_flat = env_state.unsqueeze(0)
+        else:
+            env_flat = env_state
+
+        # 2) 扁平化目标向量到 [1, D_goal]
+        goal_flat = self.tv_cached.reshape(1, -1)
+
+        # 3) 拼接
+        full_state = torch.cat([env_flat, goal_flat], dim=1)
+
+        # 4) 前向算 logits
+        sensor_out = self.sensor_forward(full_state)
+        proc_out = self.processor_forward(sensor_out)
+        logits = self.emitter_net(proc_out)  # [1, seq_len]
+        probs = torch.softmax(logits, dim=-1)
+
+        # —— 新增：保证索引合法 —— #
+        seq_len = probs.size(1)
+        flat_idx = flat_idx % seq_len  # 或者用 min(flat_idx, seq_len-1)
+
+        # 5) REINFORCE 更新
+        log_p = torch.log(probs[0, flat_idx] + 1e-8)
+        loss = - log_p * reward
+
+        self.policy_optimizer.zero_grad()
+        loss.backward()
+        self.policy_optimizer.step()
+

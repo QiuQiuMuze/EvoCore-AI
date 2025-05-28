@@ -88,9 +88,11 @@ class GridSecurityEnv:
 
         total_priv = float(self.privilege_level.sum().item())
         threat     = float(self.hack_strength.sum().item())
+        total_events = int((self.hack_strength > 0).sum().item())
         return {'per_type': per_type,
                 'total_priv': total_priv,
-                'threat_score': threat}
+                'threat_score': threat,
+                'total_events': total_events}
 
 
     def _spawn_attack(self, initial=False):

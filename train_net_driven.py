@@ -148,14 +148,31 @@ def main(cfg):
             # --- 统计黑客 ---
             hack_stats = env.get_hack_stats()
             hack_msg = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
+            # 从 graph 拿到分类型统计
+            hkbt = graph.hack_kill_stats_by_type
+            hack_kill_msg = ", ".join(
+                f"{htype}[self_direct={cnts['self_direct']},guided={cnts['guided']}]"
+                for htype, cnts in hkbt.items()
+            ) or "None"
+
+            vkbt = graph.virus_kill_stats_by_type
+            virus_kill_msg = ", ".join(
+                f"{vtype}[self_direct={cnts['self_direct']},guided={cnts['guided']}]"
+                for vtype, cnts in vkbt.items()
+            ) or "None"
 
             total_reward += reward
+            # policy_update(state, flat_action_index, reward)
+            graph.policy_update(state_tensor, graph.last_flat_idx, reward)
+
             if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
                     f"病毒数 = {curr_inf_total:.0f}，黑客数 = {curr_hack_total:.0f}\n"
                     f"黑客类型统计 [{hack_msg}]\n"
                     f"累计清除病毒 = {virus_cleared_roll:.0f}，累计清除黑客 = {hack_cleared_roll:.0f}\n"
+                    f"消灭的病毒分类 = [{virus_kill_msg}]\n"
+                    f"消灭的黑客分类 = [{hack_kill_msg}]\n"
                     f"step 奖励 = {reward:.2f}，总奖励 = {total_reward:.2f}\n"
                     f"权限总和 = {hack_stats['total_priv']:.1f}，威胁度 = {hack_stats['threat_score']:.2f}"
                 )
