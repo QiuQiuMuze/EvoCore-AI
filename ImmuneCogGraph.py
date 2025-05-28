@@ -1134,15 +1134,15 @@ class ImmuneCogGraph(CogGraph):
                 samples, indices, is_weights = self.rl_buffer.sample(batch_size, beta=0.4)
 
                 # --- 先 pad / truncate 保证同样长度 ---
-                max_len = max(tr["state"].shape[0] for tr in samples)
+                feat_dim = self.replay_head.in_features
                 padded = []
                 for tr in samples:
                     st = tr["state"]
-                    if st.shape[0] < max_len:
-                        pad = torch.zeros(max_len - st.shape[0], dtype=st.dtype, device=st.device)
+                    if st.shape[0] < feat_dim:
+                        pad = torch.zeros(feat_dim - st.shape[0], dtype=st.dtype, device=st.device)
                         st = torch.cat([st, pad], dim=0)
-                    elif st.shape[0] > max_len:
-                        st = st[:max_len]
+                    elif st.shape[0] > feat_dim:
+                        st = st[:feat_dim]
                     padded.append(st)
                 states = torch.stack(padded, dim=0).to(self.device)
 
