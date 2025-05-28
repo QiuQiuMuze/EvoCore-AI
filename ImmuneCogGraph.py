@@ -86,8 +86,8 @@ class ImmuneCogGraph(CogGraph):
         self.prev_vuln = torch.zeros_like(self.env.vulnerability)
         self.prev_fail = torch.zeros_like(self.env.login_failures)
         self.kill_stats = {"self_direct": 0, "guided": 0, "last_reset": 0}
-        self.guided_prob = 1.0
-        self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
+        self.guided_prob = 0.4
+        self.guided_decay = 0.0002  # 每 step 衰减量，可按需调整
         seq_len = self.env.size * self.env.size
         self.transformer = TransformerPolicyNetwork(
             input_dim=N_STATE_CHANNELS,
@@ -1626,7 +1626,7 @@ class ImmuneCogGraph(CogGraph):
 
         # ★PATCH 3-A: 若网络选的格子没病毒…
         if self.env.infected_map.sum() > 0 and self.env.infected_map[y, x] == 0:
-            if random.random() < 0.4:
+            if random.random() < self.guided_prob:
                 cx, cy = unit.position
                 virus_coords = torch.nonzero(self.env.infected_map).tolist()
                 if virus_coords:
@@ -1648,7 +1648,7 @@ class ImmuneCogGraph(CogGraph):
                     unit.guided_this_round = True
 
         if not unit.guided_this_round and self.env.privilege_level.sum() > 0:
-            if random.random() < 0.4:
+            if random.random() < self.guided_prob:
                 cx, cy = unit.position
                 hack_coords = torch.nonzero(self.env.privilege_level > 0.05).tolist()
                 if hack_coords:
