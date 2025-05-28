@@ -26,29 +26,39 @@ class MetaTrainer:
         meta_loss = torch.tensor(0., device=self.device)
 
         for task in tasks_batch:
-            support = task['support']
+            support = task['support']  # List of (state_tensor[C,H,W], action, label)
             query   = task['query']
 
-            # inner‐loop 优化器实例化
             inner_opt = optim.SGD(self.processor.parameters(), lr=self.lr_inner)
-
-            # higher 上下文
             with innerloop_ctx(self.processor, inner_opt, device=self.device) as (fmodel, diffopt):
-                # —— inner‐loop on support ——
-                s_states = torch.stack([t[0] for t in support]).to(self.device)        # (K, D)
-                s_labels = torch.tensor([t[2] for t in support], dtype=torch.long, device=self.device)  # (K,)
-                # —— inner‐loop on support ——
-                logits_s = fmodel.classifier(s_states)
-                loss_s = F.cross_entropy(logits_s, s_labels)
+                # —— inner‐loop on support —— #
+                # 1) 把原始状态列表载到 device 上
+                s_states = [t[0].to(self.device) for t in support]  # each: (C,H,W)
+                s_labels = torch.tensor([t[2] for t in support],
+                                        dtype=torch.long, device=self.device)  # (K,)
 
+                # 2) 逐样本抽特征，再拼 batch
+                feat_s_list = [fmodel._extract_features(s) for s in s_states]
+                # 如果你的 _extract_features 恰好返回 (d_model,)，那上面列表项就是一维向量。
+                # 如果它返回 (L,d_model)，你可以在这里做 flatten：
+                # feat_s_list = [feat.view(-1) for feat in feat_s_list]
+                feat_s = torch.stack(feat_s_list, dim=0)  # → (K, d_model)
+
+                logits_s = fmodel.classifier(feat_s)  # → (K, num_classes)
+                loss_s = F.cross_entropy(logits_s, s_labels)
                 diffopt.step(loss_s)
 
+                # —— query phase —— #
+                q_states = [t[0].to(self.device) for t in query]  # each: (C,H,W)
+                q_labels = torch.tensor([t[2] for t in query],
+                                        dtype=torch.long, device=self.device)  # (K',)
 
-                q_states = torch.stack([t[0] for t in query]).to(self.device)        # (K', D)
-                q_labels = torch.tensor([t[2] for t in query], dtype=torch.long, device=self.device)  # (K',)
+                feat_q_list = [fmodel._extract_features(q) for q in q_states]
+                # 同样如有需要 flatten：
+                # feat_q_list = [fq.view(-1) for fq in feat_q_list]
+                feat_q = torch.stack(feat_q_list, dim=0)  # → (K', d_model)
 
-
-                logits_q = fmodel.classifier(q_states)
+                logits_q = fmodel.classifier(feat_q)  # → (K', num_classes)
                 loss_q = F.cross_entropy(logits_q, q_labels)
                 meta_loss = meta_loss + loss_q
 
@@ -57,3 +67,4 @@ class MetaTrainer:
         self.meta_opt.zero_grad()
         meta_loss.backward()
         self.meta_opt.step()
+

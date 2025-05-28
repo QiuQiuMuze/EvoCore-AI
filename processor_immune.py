@@ -56,25 +56,50 @@ class ImmuneProcessor(nn.Module):
 
     def _extract_features(self, state: torch.Tensor) -> torch.Tensor:
         """
-        用 TransformerPolicyNetwork.encode 提取扁平化后池化的向量
+        支持：
+        - state: [C, H, W]
+        - state: [B, C, H, W]
         """
-        # state: [C, H, W]
-        # 1) 如果 feature_extractor 是 TransformerPolicyNetwork，就走它
         if isinstance(self.feature_extractor, TransformerPolicyNetwork):
-            C, H, W = state.shape
-            # 把 (C,H,W) 转成 token 序列 (1, L, C)，L=H*W
-            x = state.permute(1, 2, 0).reshape(1, H * W, C)
-            with torch.no_grad():
+            # ---- 批量 ----
+            if state.dim() == 4:
+                B, C, H, W = state.shape
+                # (B, C, H, W) -> (B, L, C), L=H*W
+                x = state.permute(0, 2, 3, 1).reshape(B, H * W, C)
+                # 这里不加 no_grad，以便 MAML 内部能够对 feature_extractor 传播梯度
+                h = self.feature_extractor.encode(x)  # (B, L, d_model)
+                vecs = h.mean(dim=1)  # (B, d_model)
+                return vecs
+
+            # ---- 单样本 ----
+            elif state.dim() == 3:
+                C, H, W = state.shape
+                x = state.permute(1, 2, 0).reshape(1, H * W, C)
                 h = self.feature_extractor.encode(x)  # (1, L, d_model)
-            # 池化成单个向量
-            vec = h.mean(dim=1).squeeze(0)  # (d_model,)
-            return vec
-        # 2) 否则回退到最简单的 flat
-        vec = state.flatten()
-        if self.feature_extractor is not None:
-            with torch.no_grad():
-                vec = self.feature_extractor(vec.unsqueeze(0)).squeeze(0)
-        return vec
+                vec = h.mean(dim=1).squeeze(0)  # (d_model,)
+                return vec
+
+            else:
+                raise ValueError(f"Unsupported state.dim()={state.dim()} for TransformerFeature")
+        else:
+            # 回退：把每个样本 flatten，再用可选的 feature_extractor
+            if state.dim() == 2:
+                # state is already [B, D_flat]
+                flat = state
+            elif state.dim() == 3:
+                # single sample [C, H, W]
+                flat = state.flatten().unsqueeze(0)
+            else:
+                raise ValueError(f"Unsupported state.dim()={state.dim()} for flat path")
+
+            if self.feature_extractor is not None:
+                # 允许梯度流动
+                feats = self.feature_extractor(flat)  # -> [B, feat_dim]
+            else:
+                feats = flat
+            # 如果只有一条样本，就 squeeze 批量维度
+            return feats if feats.dim() == 2 else feats.squeeze(0)
+
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """

@@ -1196,26 +1196,32 @@ class ImmuneCogGraph(CogGraph):
 
     def _sample_meta_tasks(self, num_tasks=5, k_support=4, k_query=4):
         """
-        从 replay_buffer 中采样元学习任务（support + query）
-        每个任务是一个字典：{ 'support': List[(x, y)], 'query': List[(x, y)] }
+        从 replay_buffer 中采样元学习任务（support + query），
+        只挑那些已经带 raw_state 的 transition。
         """
-        tasks = []
-        if len(self.rl_buffer) < (num_tasks * (k_support + k_query)):
+        # 只考虑含 raw_state 的 entries
+        entries = [e for e in self.rl_buffer if "raw_state" in e]
+        # 条件不足就返回空
+        if len(entries) < num_tasks * (k_support + k_query):
             return []
 
-        entries = list(self.rl_buffer)
-        # 提取优先级列表（若全零则退化为均匀采样）
+        # 按 priority 计算采样概率
         prios = [e["priority"] for e in entries]
-        s = sum(prios)
-        probs = [p/s for p in prios] if s > 0 else None
+        total = sum(prios)
+        probs = [p/total for p in prios] if total > 0 else None
 
+        tasks = []
         for _ in range(num_tasks):
             sampled = random.choices(entries, weights=probs, k=(k_support + k_query))
-            # 拆包成 (state, action, label) 三元组
-            support = [(e["state"], e["action"], e["label"]) for e in sampled[:k_support]]
-            query   = [(e["state"], e["action"], e["label"]) for e in sampled[k_support:]]
+            # 用 e["state"]（flat vector）作为 MAML 的输入
+            support = [(e["state"], e["action"], e["label"])
+                       for e in sampled[:k_support]]
+            query = [(e["state"], e["action"], e["label"])
+                     for e in sampled[k_support:]]
+
             tasks.append({"support": support, "query": query})
         return tasks
+
 
 
     def _maybe_report_by_stage(self):
@@ -1227,18 +1233,25 @@ class ImmuneCogGraph(CogGraph):
 
     def _apply_and_reward(self, unit, action):
         x, y = action["target"]
-        # --- 1) before & label_info ---
+
+        # --- 1) 记录 before 状态 ---
         if action["type"] == ACTION_HACK_DEFENSE:
             before_priv = self.env.privilege_level[y, x].item()
             before_stealth = self.env.hack_strength[y, x].item()
         else:
             before_inf = self.env.infected_map[y, x].item()
 
-        # --- 2) 先抓 V(s) 和 state_vec ---
-        state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
+        # --- 2) 获取状态（用于 A2C 和 meta） ---
+        # --- 2) 获取状态（用于 A2C critic 以及后面的 meta‐learning） ---
+        # 先拿三维的原始观测，形状 [C, H, W]，后面 meta 会用到
+        raw_state = self.env.get_state_tensor().cpu()  # ← 新增
+        # 再把它 flatten 用于 critic
+        state_tensor = raw_state.view(1, -1).to(self.device)  # ← 修改
+
+        state_vec = unit.get_output().detach().view(-1).cpu()  # 单元内部 state 输出（actor）
         goal_flat = self.tv_cached.view(1, -1)
 
-        # —— 新增 hack 通道拼接 —— #
+        # 生成 hack 通道 (same for s, s')
         hack_maps = []
         for t in self.env.attack_types:
             mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
@@ -1248,17 +1261,26 @@ class ImmuneCogGraph(CogGraph):
             hack_maps.append(mask)
         hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
 
-        # 最终全量状态
+        # 拼接完整状态 (用于 critic)
         full_state = torch.cat([state_tensor, hack_flat, goal_flat], dim=1)
+
+        # --- auto-resize critic ---
+        D_in = full_state.size(1)
+        if self.value_head.in_features != D_in:
+            logger.warning(f"[自动重建 value_head] 重建 Critic from "
+                           f"{self.value_head.in_features} → {D_in}")
+            self.value_head = nn.Linear(D_in, 1).to(self.device)
+            self.value_optimizer = optim.Adam(
+                self.value_head.parameters(), lr=1e-4
+            )
 
         with torch.no_grad():
             value_s = self.value_head(full_state).squeeze(0)
-        state_vec = unit.get_output().detach().view(-1).cpu()
 
-        # --- 3) 执行动作一次 ---
+        # --- 3) 执行动作 ---
         self.emitter_actions.perform(action)
 
-        # --- 4) after & hit/step_reward ---
+        # --- 4) 判断击中与否，给予 step 奖励 ---
         if action["type"] == ACTION_HACK_DEFENSE:
             after_priv = self.env.privilege_level[y, x].item()
             after_stealth = self.env.hack_strength[y, x].item()
@@ -1278,48 +1300,44 @@ class ImmuneCogGraph(CogGraph):
             unit.energy = max(0.0, unit.energy - MISS_PENALTY)
             unit.meta.record(action="miss_penalty", reward=step_reward)
 
-        # --- 5) 再抓 V(s') 和 next_state_vec ---
-        next_state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
+        # --- 5) 获取 s' 状态 ---
+        next_raw_state = self.env.get_state_tensor().to(self.device)
+        next_state_tensor = next_raw_state.view(1, -1)
+        goal_flat = self.tv_cached.view(1, -1)  # refresh once more
+        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)  # hack 通道不变
 
-        # 1) 重新拿目标向量
-        goal_flat = self.tv_cached.view(1, -1)
-
-        # 2) 重建 hack 通道
-        hack_maps = []
-        for t in self.env.attack_types:
-            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
-            for (hx, hy), info in self.env.hacks.items():
-                if info.get('type') == t:
-                    mask[hy, hx] = 1.0
-            hack_maps.append(mask)
-        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
-
-        # 3) 三部分一起拼
         full_next_state = torch.cat([next_state_tensor, hack_flat, goal_flat], dim=1)
-
         with torch.no_grad():
+            if self.value_head.in_features != D_in:
+                logger.warning(f"[自动重建 value_head] 重建 Critic from "
+                               f"{self.value_head.in_features} → {D_in}")
+                self.value_head = nn.Linear(D_in, 1).to(self.device)
+                self.value_optimizer = optim.Adam(
+                    self.value_head.parameters(), lr=1e-4
+                )
             value_s_next = self.value_head(full_next_state).squeeze(0)
+
         next_state_vec = next_state_tensor.view(-1).cpu()
 
-        # --- 6) 计算 priority & 存 PER ---
+        # --- 6) 存入 PER ---
         delta = step_reward + self.gamma * value_s_next - value_s
         priority = (delta.abs() + 1e-6).pow(self.rl_buffer.alpha).item()
         transition = {
             "state": state_vec,
+            "raw_state": raw_state,
             "action": action,
             "reward": step_reward,
             "next_state": next_state_vec,
             "done": False,
-            "label": int(hit),  # 必须有 label！
+            "label": int(hit),
         }
         if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
             self.rl_buffer.append(transition, priority)
 
-        # --- 7) A2C 同步更新（不动） ---
+        # --- 7) A2C 更新 ---
         self.policy_update(state_tensor, self.last_flat_idx, step_reward)
+
         return hit
-
-
 
     def _record_antibody_effectiveness(self, action: dict, feat: torch.Tensor):
         """判断抗体动作是否成功清除感染，并更新计数器"""
