@@ -9,6 +9,7 @@ train_net_driven.py
 import argparse
 import os
 import time
+from collections import Counter
 import torch
 import random
 from collections import deque
@@ -39,6 +40,26 @@ def get_args():
     parser.add_argument("--save-every",  type=int,   default=50,    help="每 N episodes 保存一次模型 (0=不保存)")
     parser.add_argument("--save-dir",    type=str,   default="checkpoints", help="模型保存目录")
     return parser.parse_args()
+
+def get_virus_type_stats(attacks: dict) -> str:
+    """
+    统计每类病毒的当前活跃数量
+    """
+    virus_counter = Counter()
+    for (_, _), info in attacks.items():
+        vtype = info.get("type", "unknown")
+        virus_counter[vtype] += 1
+    return ", ".join(f"{k}:{v}" for k, v in virus_counter.items())
+
+def summarize_kills_by_type(kill_stats_by_type: dict) -> str:
+    """
+    将 {"worm": {"self_direct": 3, "guided": 1}, ...} → "worm:4, trojan:1, ..."
+    """
+    return ", ".join(
+        f"{k}:{v['self_direct'] + v['guided']}"
+        for k, v in kill_stats_by_type.items()
+        if v["self_direct"] + v["guided"] > 0
+    ) or "None"
 
 def main(cfg):
     global_step = 0
@@ -148,27 +169,22 @@ def main(cfg):
             # --- 统计黑客 ---
             hack_stats = env.get_hack_stats()
             hack_msg = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
-            # 从 graph 拿到分类型统计
-            hkbt = graph.hack_kill_stats_by_type
-            hack_kill_msg = ", ".join(
-                f"{htype}[self_direct={cnts['self_direct']},guided={cnts['guided']}]"
-                for htype, cnts in hkbt.items()
-            ) or "None"
 
-            vkbt = graph.virus_kill_stats_by_type
-            virus_kill_msg = ", ".join(
-                f"{vtype}[self_direct={cnts['self_direct']},guided={cnts['guided']}]"
-                for vtype, cnts in vkbt.items()
-            ) or "None"
+            # 从 graph 拿到分类型统计
+
+            hack_kill_msg = summarize_kills_by_type(graph.hack_kill_stats_by_type)
+            virus_kill_msg = summarize_kills_by_type(graph.virus_kill_stats_by_type)
 
             total_reward += reward
             # policy_update(state, flat_action_index, reward)
             graph.policy_update(state_tensor, graph.last_flat_idx, reward)
+            virus_msg = get_virus_type_stats(env.attacks)
 
             if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
                     f"病毒数 = {curr_inf_total:.0f}，黑客数 = {curr_hack_total:.0f}\n"
+                    f"病毒类型统计 [{virus_msg}]\n"
                     f"黑客类型统计 [{hack_msg}]\n"
                     f"累计清除病毒 = {virus_cleared_roll:.0f}，累计清除黑客 = {hack_cleared_roll:.0f}\n"
                     f"消灭的病毒分类 = [{virus_kill_msg}]\n"

@@ -868,9 +868,9 @@ class ImmuneCogGraph(CogGraph):
                 f"病毒-自主={self.kill_stats['self_direct']}, 病毒-指引={self.kill_stats['guided']} | "
                 f"Hack-自主={self.hack_kill_stats['self_direct']}, Hack-指引={self.hack_kill_stats['guided']}"
             )
-        # if self.current_step - self.kill_stats["last_reset"] >= 1000:
-        #     self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
-        #     self.hack_kill_stats.update(self_direct=0, guided=0)
+        if self.current_step - self.kill_stats["last_reset"] >= 1000:
+            self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
+            self.hack_kill_stats.update(self_direct=0, guided=0)
 
 
         self._update_target_vector()
