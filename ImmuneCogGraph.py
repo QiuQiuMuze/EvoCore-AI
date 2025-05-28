@@ -80,6 +80,13 @@ class ImmuneCogGraph(CogGraph):
         self.hack_kill_stats = {"self_direct": 0, "guided": 0}
         # 追踪各黑客类型的击杀数
         self.hack_kill_stats_by_type = {}
+        # --- 可学习的黑客类型权重 embedding ---
+        # 利用 env.attack_types 列表初始化 mapping
+        self.hack_types = list(self.env.attack_types)
+        self.hack_type_to_idx = {t: i for i, t in enumerate(self.hack_types)}
+        # 每个类型一个可训练的标量 weight
+        self.hack_type_embedding = nn.Embedding(len(self.hack_types), 1).to(self.device)
+
         # 追踪各病毒类型的击杀数（如果只有一种病毒，可统一用 'virus' 作为 key）
         self.virus_kill_stats_by_type = {}
         self.env.resources = {}  # 空字典，保证 .resources 存在
@@ -148,13 +155,16 @@ class ImmuneCogGraph(CogGraph):
             lr=2e-4
         )
         # —— **1) 全局 policy (actor) —— #
+        # 包含 hack_type_embedding 参数，使其可被 policy 更新
         self.policy_optimizer = AdamW(
             list(self.sensor_net.parameters()) +
             list(self.processor_net.parameters()) +
-            list(self.emitter_net.parameters()),
-            lr=3e-4,            # 提升到 3e-4，加快学习
-            weight_decay=1e-2   # 轻度正则
+            list(self.emitter_net.parameters()) +
+            list(self.hack_type_embedding.parameters()),
+            lr=3e-4,
+            weight_decay=1e-2
         )
+
 
         # —— **2) 新增 baseline / critic —— #
         # full_state_dim = (env_state_channels + goal_channels) * grid_area
@@ -1067,8 +1077,8 @@ class ImmuneCogGraph(CogGraph):
         if self.current_step % 500 == 0 and len(self.replay_buffer) >= 100:
             # 1) 随机采 64 条经验
             # ---- 按成功 / 失败拆分 ---------------------------------
-            successes = [s for s in self.replay_buffer if s[2] == 1]
-            fails = [s for s in self.replay_buffer if s[2] == 0]
+            successes = [entry for entry in self.replay_buffer if entry["label"] == 1]
+            fails = [entry for entry in self.replay_buffer if entry["label"] == 0]
 
             # ---- 至多 1/4 为正样本 --------------------------------
             k_succ = min(len(successes), 16)  # 上限 16
@@ -1077,7 +1087,9 @@ class ImmuneCogGraph(CogGraph):
             random.shuffle(batch)  # 打乱次序
             # --------------------------------------------------------
 
-            states, actions, labels = zip(*batch)
+            states = [d["state"] for d in batch]
+            actions = [d["action"] for d in batch]
+            labels = [d["label"] for d in batch]
 
             # 强制扁平化
             states = [s.view(-1) for s in states]
@@ -1616,12 +1628,10 @@ class ImmuneCogGraph(CogGraph):
 
     def _decode_action_from_output(self, unit, output_vec):
         # === hacker 类型优先级（越大越危险） ===
-        risk_weight = {
-            "privilege_escalation": 3.0,
-            "lateral_move":        2.5,
-            "bruteforce":          2.0,
-            "phishing":            1.5
-        }
+        # === learnable hack-type 权重（embedding 输出标量） ===
+        # weight tensor 形状 [num_hack_types]
+        risk_weights = self.hack_type_embedding.weight.squeeze(1)
+
         # 1) 网络给出的 raw index
         raw_idx = int(torch.argmax(output_vec).item())
         size    = self.env.size
@@ -1635,7 +1645,7 @@ class ImmuneCogGraph(CogGraph):
                 cx, cy = unit.position
                 items = list(self.env.hacks.items())
                 items.sort(key=lambda it: (
-                    -risk_weight.get(it[1]['type'], 1.0),
+                    -risk_weights[self.hack_type_to_idx.get(it[1]['type'], 0)].item(),
                     abs(cx - it[0][0]) + abs(cy - it[0][1])
                 ))
                 (gx, gy), _ = random.choice(items[:3])
@@ -1670,7 +1680,7 @@ class ImmuneCogGraph(CogGraph):
             items = list(self.env.hacks.items())
             # 先按 (risk, -distance) 排序，risk 越大排越前
             items.sort(key=lambda it: (
-                -risk_weight.get(it[1]['type'], 1.0),
+                -risk_weights[self.hack_type_to_idx.get(it[1]['type'], 0)].item(),
                 abs(cx - it[0][0]) + abs(cy - it[0][1])
             ))
             top_k = items[:min(3, len(items))]
@@ -1806,6 +1816,19 @@ class ImmuneCogGraph(CogGraph):
         # 5.1) 计算 log π(a|s)
         log_p = torch.log(probs[0, flat_idx] + 1e-8)
 
+        D_in = full_state.size(1)
+        if self.value_head.in_features != D_in:
+            logger.warning(
+                f"[自动重建 value_head] 重建 Critic from "
+                f"{self.value_head.in_features} → {D_in}"
+            )
+            # 重建 value_head
+            self.value_head = nn.Linear(D_in, 1).to(self.device)
+            # 重新构造优化器，保持 lr=1e-4
+            self.value_optimizer = optim.Adam(
+                self.value_head.parameters(), lr=1e-4
+            )
+
         # 5.2) 估计 V(s) 并计算优势 A = R − V(s)
         # full_state 在前面已经拼接过：[1, full_state_dim]
         value = self.value_head(full_state).squeeze(0)       # shape=[1] → scalar
@@ -1831,6 +1854,5 @@ class ImmuneCogGraph(CogGraph):
         total_loss.backward()
         self.policy_optimizer.step()
         self.value_optimizer.step()
-
 
 
