@@ -21,6 +21,7 @@ import types, torch
 import torch.nn as nn
 from models.transformer_policy import TransformerPolicyNetwork
 from env import logger
+from torch.optim import AdamW
 from CogUnit import CogUnit
 
 HIT_THRESH = 0.15          # 越大越宽松
@@ -45,6 +46,9 @@ class ImmuneCogGraph(CogGraph):
     """
 
     def __init__(self, rl_agent, device="cpu", env=None):
+        self.device = device
+        self.target_weights = torch.tensor([1.0, 1.0, 1.0], device=self.device)  # [探索, 感染, 提权]
+
         # 环境替换
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
@@ -87,7 +91,7 @@ class ImmuneCogGraph(CogGraph):
         self.prev_fail = torch.zeros_like(self.env.login_failures)
         self.kill_stats = {"self_direct": 0, "guided": 0, "last_reset": 0}
         self.guided_prob = 0.4
-        self.guided_decay = 0.0002  # 每 step 衰减量，可按需调整
+        self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
         seq_len = self.env.size * self.env.size
         self.transformer = TransformerPolicyNetwork(
             input_dim=N_STATE_CHANNELS,
@@ -143,13 +147,24 @@ class ImmuneCogGraph(CogGraph):
             list(self.replay_head.parameters()),
             lr=2e-4
         )
-        # —— **新增**：把全局 MLP 主干也加入训练 —— #
-        self.policy_optimizer = optim.Adam(
+        # —— **1) 全局 policy (actor) —— #
+        self.policy_optimizer = AdamW(
             list(self.sensor_net.parameters()) +
             list(self.processor_net.parameters()) +
             list(self.emitter_net.parameters()),
-            lr=1e-4
+            lr=3e-4,            # 提升到 3e-4，加快学习
+            weight_decay=1e-2   # 轻度正则
         )
+
+        # —— **2) 新增 baseline / critic —— #
+        # full_state_dim = (env_state_channels + goal_channels) * grid_area
+        size2 = self.env.size * self.env.size
+        full_state_dim = (N_STATE_CHANNELS + 3) * size2
+        self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+        self.value_optimizer = optim.Adam(
+            self.value_head.parameters(), lr=1e-4
+        )
+
 
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,  # 作用对象
@@ -174,6 +189,9 @@ class ImmuneCogGraph(CogGraph):
         self._full_state_buf = torch.empty(1, D_env + D_goal, device=self.device)
         self._D_env = D_env
         self._S2 = size2
+
+        # 熵正则系数，用于 entropy bonus
+        self.entropy_coef = max(0.01, 1.0 / (1 + self.current_step / 2000))
 
         self.meta_trainer = MetaTrainer(self.immune_processor, device=self.device)
         def _safe_compute(self, inp, out):
@@ -222,7 +240,7 @@ class ImmuneCogGraph(CogGraph):
         base = 50  # 最低间隔
         scale_factor = max(1, self.env.size / 10)
         pressure = (self.env.infected_map > 0).float().mean().item()  # 0~1
-        interval = int(base * scale_factor / max(0.3, pressure))  # 压力越大，间隔越短
+        interval = int(base * scale_factor / max(0.5, pressure))  # 压力越大，间隔越短
         return self.current_step % interval == 0
 
     def _build_global_nets(self, seq_len: int):
@@ -344,11 +362,8 @@ class ImmuneCogGraph(CogGraph):
             privileged = torch.zeros_like(unvisited)
 
         # —— 拼接为目标向量 —— #
-        self.target_vector = torch.cat([
-            unvisited,  # 通道 0：好奇探索点
-            infected,  # 通道 1：病毒热点
-            privileged  # 通道 2：黑客提权目标
-        ], dim=0)
+        tv = torch.cat([unvisited, infected, privileged], dim=0)
+        self.target_vector = self.target_weights.view(3, 1) * tv
 
     def _prepare_unit_before_update(self, unit, full_state, expected_input):
         # —— 1) 扩张输入维度，跟父类保持一致 —— #
@@ -976,6 +991,7 @@ class ImmuneCogGraph(CogGraph):
             self.rebalance_cell_types()
 
 
+
         # --- 4) 免疫识别 & 抗体响应 ---
         tensor_state = self.env.get_state_tensor()
         action = self.immune_processor.classify_and_match(tensor_state)
@@ -1038,8 +1054,10 @@ class ImmuneCogGraph(CogGraph):
         self.select_elites()
         self.run_subsystem_competition()
         self.assign_subsystems()
+
         if not self.static_mode and self._should_evolve():
             self._perform_structural_evolution()
+
         if self.current_step % 50 == 0:
             logger.warning(f"[病毒阶段] 当前为 {self._get_virus_stage()} 阶段")
             self.report_antibody_stats()
@@ -1100,6 +1118,16 @@ class ImmuneCogGraph(CogGraph):
             self.memory.trim(keep_last=800)
         self.guided_prob = max(0.0, self.guided_prob - self.guided_decay)
 
+        if self.current_step % 100 == 0:
+            infected_count = self.env.infected_map.sum().item()
+            hack_count = sum(1 for v in self.env.hacks.values() if v['type'])
+            total_area = self.env.size ** 2
+            w0 = 1.0
+            w1 = min(2.0, infected_count / total_area * 10)  # 感染密度
+            w2 = min(2.0, hack_count / 5.0)  # 黑客数量稀疏
+            self.target_weights = torch.tensor([w0, w1, w2], device=self.device)
+
+
     def _sample_meta_tasks(self, num_tasks=5, k_support=4, k_query=4):
         """
         从 replay_buffer 中采样元学习任务（support + query）
@@ -1109,16 +1137,20 @@ class ImmuneCogGraph(CogGraph):
         if len(self.replay_buffer) < (num_tasks * (k_support + k_query)):
             return []
 
-        for _ in range(num_tasks):
-            batch = random.sample(self.replay_buffer, k_support + k_query)
-            support = batch[:k_support]
-            query = batch[k_support:]
-            tasks.append({
-                "support": support,
-                "query": query
-            })
+        entries = list(self.replay_buffer)
+        # 提取优先级列表（若全零则退化为均匀采样）
+        prios = [e["priority"] for e in entries]
+        s = sum(prios)
+        probs = [p/s for p in prios] if s > 0 else None
 
+        for _ in range(num_tasks):
+            sampled = random.choices(entries, weights=probs, k=(k_support + k_query))
+            # 拆包成 (state, action, label) 三元组
+            support = [(e["state"], e["action"], e["label"]) for e in sampled[:k_support]]
+            query   = [(e["state"], e["action"], e["label"]) for e in sampled[k_support:]]
+            tasks.append({"support": support, "query": query})
         return tasks
+
 
     def _maybe_report_by_stage(self):
         stage = self._get_virus_stage()
@@ -1178,12 +1210,28 @@ class ImmuneCogGraph(CogGraph):
             step_reward = -MISS_PENALTY
         # === 新增：把 hack_defense 的成功/失败都存回放池 ===
         if action["type"] == ACTION_HACK_DEFENSE:
-            # state_vec 可用 unit.get_output() 或者从外层传入
             state_vec = unit.get_output().detach().view(-1).cpu()
             # 成功的定义：privilege_level 由 >0.05 变为 0 OR hack_strength 由 >0.05 变为 0
             success = ((before > 0.05 and after == 0.0) or
                        (stealth_before > 0.05 and stealth_after == 0.0))
-            self.replay_buffer.append((state_vec, action, int(success)))
+            # 用本步 reward 绝对值作为优先级
+
+            # === TD-error 作为优先级 ===
+            state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
+            goal_flat = self.tv_cached.view(1, -1)
+            full_state = torch.cat([state_tensor, goal_flat], dim=1)
+
+            with torch.no_grad():
+                value = self.value_head(full_state).squeeze(0)
+            td_error = abs(step_reward - value.item())
+            prio = td_error
+
+            self.replay_buffer.append({
+                "state": state_vec,
+                "action": action,
+                "label": int(success),
+                "priority": prio,
+            })
 
         # —— 同步策略网络学习 —— #
         # 用当前 env_state + last_flat_idx + 这一步 reward 直接更新
@@ -1213,7 +1261,14 @@ class ImmuneCogGraph(CogGraph):
         # 把本次防御经验加入回放池
         state_vec = feat.detach().view(-1).cpu()
         success = (infected_before > 0.5 and infected_after == 0.0)
-        self.replay_buffer.append((state_vec, action, success))
+        # 给抗体经验一个固定优先级
+        prio = 1.0 if success else 1.0
+        self.replay_buffer.append({
+            "state": state_vec,
+            "action": action,
+            "label": int(success),
+            "priority": prio,
+        })
 
         # —— 2) 对抗体分类头做一次微调 —— #
         logits = self.immune_clf(feat.view(1, -1))          # [1,1]
@@ -1747,11 +1802,35 @@ class ImmuneCogGraph(CogGraph):
         seq_len = probs.size(1)
         flat_idx = flat_idx % seq_len  # 或者用 min(flat_idx, seq_len-1)
 
-        # 5) REINFORCE 更新
+        # —— 5) A2C 更新 —— #
+        # 5.1) 计算 log π(a|s)
         log_p = torch.log(probs[0, flat_idx] + 1e-8)
-        loss = - log_p * reward
 
+        # 5.2) 估计 V(s) 并计算优势 A = R − V(s)
+        # full_state 在前面已经拼接过：[1, full_state_dim]
+        value = self.value_head(full_state).squeeze(0)       # shape=[1] → scalar
+        advantage = reward - value.detach()
+
+        # 5.3) Actor loss 与 Critic loss
+        actor_loss  = -log_p * advantage
+        critic_loss = F.mse_loss(value, torch.tensor([reward], device=self.device))
+
+        # —— 新增 entropy bonus —— #
+        # 这里我们需要重新构造分布，以便计算熵
+        dist = torch.distributions.Categorical(logits=logits)
+        entropy = dist.entropy().mean()  # 标量
+
+        # 合成总 loss
+        total_loss = actor_loss \
+                     + 0.5 * critic_loss \
+                     - self.entropy_coef * entropy
+
+        # 5.4) 联合反向、更新
         self.policy_optimizer.zero_grad()
-        loss.backward()
+        self.value_optimizer.zero_grad()
+        total_loss.backward()
         self.policy_optimizer.step()
+        self.value_optimizer.step()
+
+
 

@@ -531,7 +531,7 @@ class CogUnit:
         # 3) 网络参数加小噪声
         for p in self.function.parameters():
             p.data += torch.randn_like(p) * 0.01
-        logger.warning(f"[Meta-升级] {self.id}, {self.role} 因“{reason}”触发自我进化，开始思考赛博人生，觉得自己又行了。新gene={self.gene}")
+        logger.info(f"[Meta-升级] {self.id}, {self.role} 因“{reason}”触发自我进化，开始思考赛博人生，觉得自己又行了。新gene={self.gene}")
 
 
     def is_worthy_of_memory(self):

@@ -136,8 +136,17 @@ def main(cfg):
             delta_inf_cleared = max(0, prev_inf_total - curr_inf_total)
             delta_hack_cleared = max(0, prev_hack_total - curr_hack_total)
 
-            virus_cleared_roll += delta_inf_cleared
-            hack_cleared_roll += delta_hack_cleared
+            # 累加真正击杀病毒的数量（按类型统计总和）
+            true_virus_kills = sum(
+                v["self_direct"] + v["guided"]
+                for v in graph.virus_kill_stats_by_type.values()
+            )
+
+            virus_cleared_roll = true_virus_kills
+            hack_cleared_roll = sum(
+                v["self_direct"] + v["guided"]
+                for v in graph.hack_kill_stats_by_type.values()
+            )
 
             # 1000 步清零一次
             if global_step - last_reset_step >= 1000:
