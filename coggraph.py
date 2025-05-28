@@ -124,7 +124,7 @@ class CogGraph:
                          n_emitter: int = 16,
                          device: str = "cpu"):
 
-        expected_input = self.env_size * self.env_size * INPUT_CHANNELS
+        expected_input = self.env.size * self.env.size * INPUT_CHANNELS
 
         # 1) 创建
         sensors = [CogUnit(input_size=expected_input, role="sensor", env_size=self.env_size) for _ in range(n_sensor)]

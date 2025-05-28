@@ -4,6 +4,7 @@ import math
 from contextlib import nullcontext
 from collections import deque, Counter
 from coggraph import CogGraph
+import copy
 from env_net import GridSecurityEnv
 from emitter_actions import EmitterActions
 from memory_net_unit import MemoryNetUnit
@@ -13,6 +14,7 @@ from emitter_actions import ACTION_BLOCK, ACTION_QUARANTINE, ACTION_HACK_DEFENSE
 from config_runtime import RF
 from typing import List
 import random
+from per_memory import PrioritizedReplayBuffer
 from meta_trainer import MetaTrainer
 from types import MethodType
 import torch.nn.functional as F
@@ -52,8 +54,15 @@ class ImmuneCogGraph(CogGraph):
         # 环境替换
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
+
         # 混合策略控制：guided 的比例，逐步衰减到 0
         super().__init__(rl_agent, device=device, env=env)
+
+        # --- 1) 定义 hack channels 数量 & 总输入通道数 ---
+        self._HACK_CHANNELS = len(self.env.attack_types)      # T 个 hack 类型
+        self._INPUT_CHANNELS = (N_STATE_CHANNELS
+                                + self._HACK_CHANNELS
+                                + N_GOAL_CHANNELS)          # 原始+hack+目标
         # —— 初始化 cleared_positions —— #
         for u in self.units:
             if u.role == "emitter":
@@ -69,13 +78,13 @@ class ImmuneCogGraph(CogGraph):
         # 用当前 env.size 构造一次全局网络
         seq_len = self.env.size * self.env.size
         self._build_global_nets(seq_len)
+        self._last_seq_len = seq_len
         self.antibody_failure_count = 0
         self.env.bind_units_reference(self.units)
         self.visit_age_map = torch.zeros_like(
             self.env.infected_map, dtype=torch.float16, device=self.device
         )
         self._update_target_vector()
-        self.replay_buffer = deque(maxlen=10000)
         self.last_report_stage = None
         self.hack_kill_stats = {"self_direct": 0, "guided": 0}
         # 追踪各黑客类型的击杀数
@@ -100,6 +109,14 @@ class ImmuneCogGraph(CogGraph):
         self.guided_prob = 0.4
         self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
         seq_len = self.env.size * self.env.size
+
+        # —— 使用带 n_step 的 PER ——（n=3, γ=0.99）
+        self.gamma = 0.99
+        # 专门给 RL 用
+        self.rl_buffer = PrioritizedReplayBuffer(capacity=10000, alpha=0.6, n_step=3, gamma=self.gamma)
+        # 专门给 antibody 用（如果你也想用 PER）
+        self.anti_buffer = PrioritizedReplayBuffer(capacity=10000, alpha=0.6, n_step=1, gamma=1.0)
+
         self.transformer = TransformerPolicyNetwork(
             input_dim=N_STATE_CHANNELS,
             num_actions=seq_len,
@@ -109,8 +126,9 @@ class ImmuneCogGraph(CogGraph):
             use_flash_attn=FLASH_ATTN_AVAILABLE
         ).to(self.device)
 
-        # —— 2) 用 Transformer 的输出维度初始化 replay_head —— #
-        self.replay_head = nn.Linear(self.transformer.fc_out.in_features, 2)
+        # —— 2) replay_head 接收 emitter 输出的 flat logits（seq_len 维）—— #
+        seq_len = self.env.size * self.env.size
+        self.replay_head = nn.Linear(seq_len, 2).to(self.device)
 
         # 防御接口
         self.emitter_actions = EmitterActions(self.env)
@@ -169,7 +187,10 @@ class ImmuneCogGraph(CogGraph):
         # —— **2) 新增 baseline / critic —— #
         # full_state_dim = (env_state_channels + goal_channels) * grid_area
         size2 = self.env.size * self.env.size
-        full_state_dim = (N_STATE_CHANNELS + 3) * size2
+        D_env = size2 * N_STATE_CHANNELS
+        D_hack = size2 * self._HACK_CHANNELS
+        D_goal = size2 * N_GOAL_CHANNELS
+        full_state_dim = D_env + D_hack + D_goal
         self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
         self.value_optimizer = optim.Adam(
             self.value_head.parameters(), lr=1e-4
@@ -178,7 +199,7 @@ class ImmuneCogGraph(CogGraph):
 
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,  # 作用对象
-            step_size=5_000,  # 每 5 k 步衰减一次
+            step_size=500,
             gamma=0.8  # 学习率乘 0.8
         )
         # ===================================================================
@@ -192,13 +213,21 @@ class ImmuneCogGraph(CogGraph):
                 u.output_positions = deque(maxlen=20)   # 轨迹用于惩罚
         # --------------------------------------------------------------
         # --- 元学习 trainer
-        # ---------- 预分配一次 full_state 缓冲 ----------
+
+        # --- 2) 预分配 full_state 缓冲（包含 hack channels） ---
         size2 = self.env.size * self.env.size
-        D_env = size2 * N_STATE_CHANNELS
-        D_goal = size2 * 3  # 3 个目标通道
-        self._full_state_buf = torch.empty(1, D_env + D_goal, device=self.device)
-        self._D_env = D_env
-        self._S2 = size2
+        D_env   = size2 * N_STATE_CHANNELS
+        D_hack  = size2 * self._HACK_CHANNELS
+        D_goal  = size2 * N_GOAL_CHANNELS
+        total_D = D_env + D_hack + D_goal
+        self._full_state_buf = torch.empty(1, total_D, device=self.device)
+
+        # 存下各段长度，供 step() / sensor_forward 等处使用
+        self._D_env   = D_env
+        self._D_hack  = D_hack
+        self._D_goal  = D_goal
+        self._S2      = size2
+
 
         # 熵正则系数，用于 entropy bonus
         self.entropy_coef = max(0.01, 1.0 / (1 + self.current_step / 2000))
@@ -257,7 +286,8 @@ class ImmuneCogGraph(CogGraph):
         """
         构建（或重建）CogGraph 的三条主干网络，并自动同步 hidden_size。
         """
-        D_in = seq_len * INPUT_CHANNELS
+        # 新：用实例属性中计算好的总输入通道数
+        D_in = seq_len * self._INPUT_CHANNELS
 
         # 1) sensor_net：D_in → processor_hidden_size
         self.sensor_net = nn.Sequential(
@@ -444,105 +474,81 @@ class ImmuneCogGraph(CogGraph):
         ys, xs = torch.nonzero(free, as_tuple=True)
         self.free_positions = [(int(x), int(y)) for x, y in zip(xs, ys)]
 
-    def _static_step(self, input_tensor: torch.Tensor):
+    def _static_step(self, full_state: torch.Tensor):
         """
-        静息模式下的单步，只对 active emitter 执行：
-          - 感知目标向量
-          - 运行动作（quarantine 等）
-          - 保持年龄 & 状态冻结
+        静息模式下的一步：只对 active emitter 走一次 sense→act→update 流程，
+        其它单元完全冻结，并执行奖励/惩罚 & 系统维护。
         """
-        # —— 解包状态 —— #
-        env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
-        env_state = input_tensor[:, :env_dim]
-        unvisited = self.target_vector[0].unsqueeze(0)  # [1, size²]
-        infected = self.target_vector[1].unsqueeze(0)  # [1, size²]
-        privileged = self.target_vector[2].unsqueeze(0)  # 新增
-        self.tv_cached = self.target_vector.detach()
-        goal_map = torch.cat([unvisited, infected, privileged], dim=0).unsqueeze(0)
-        full_state = torch.cat([env_state, goal_map], dim=1)
-
-        # —— 设置 goal_vec（和正常模式保持一致）—— #
+        # —— 1) 更新所有 emitter 的 goal_vec —— #
         for u in self.units:
             if u.role == "emitter":
-                u.goal_vec = self.target_vector.clone()
+                # tv_cached 在 step() 里已设为最新 target_vector
+                u.goal_vec = self.tv_cached
                 u.current_hazard_xy = getattr(self, "current_hazard_xy", None)
 
-        state_snapshot = full_state.detach().squeeze(0).to(self.device)
-        prev_energies = {u.id: u.energy for u in self.units}
-        self._update_target_vector()
-        #  正式执行动作（静息中的探索者 emitter）
+        # —— 2) 发射动作 —— #
         self._run_emitter_actions()
 
-        #  更新 active 单元（静息者不动）
-        active_ids = {u.id for u in self.units if not getattr(u, "resting", False)}
-        expected_in = self.env_size * self.env_size * INPUT_CHANNELS
+        # —— 3) 让所有未 resting 的 emitter 真正跑一次 update —— #
+        active_ids = {u.id for u in self.units if u.role == "emitter" and not getattr(u, "resting", False)}
+        expected_in = full_state.shape[1]
         for u in self.units:
-            if u.id not in active_ids:
-                continue
-            inp = self._prepare_unit_before_update(u, full_state, expected_in)
-            self._apply_unit_metabolism(u, inp)
-            u.update(inp)
-            u.age = self._orig_age.get(u.id, u.age)
+            if u.id in active_ids:
+                inp = self._prepare_unit_before_update(u, full_state, expected_in)
+                self._apply_unit_metabolism(u, inp)
+                u.update(inp)
+                # 恢复 age（让‘静息’之外的 emitter 也能正确地冻结/唤醒）
+                u.age = self._orig_age.get(u.id, u.age)
 
-        #  奖励 / 惩罚（是否触发退出静息）
+        # 奖励 / 惩罚（是否触发退出静息）
         self._handle_reward_and_penalty()
 
-        #  所有 resting 单元的 age 冻结
+        # 所有 resting 单元的 age 冻结
         for u in self.units:
             if getattr(u, "resting", False):
                 u.age = self._orig_age.get(u.id, u.age)
 
+        # 最后做一次全局维护
         self._perform_system_maintenance()
+
 
     def sensor_forward(self, flat_state: torch.Tensor):
         """
         子类完全接管：不再调用父类的 patch 逻辑，而是把整幅
         (env_state + goal_map) 展平后送入自定义 sensor_net。
         """
-        # ---------- GUARD: 主干自动对齐 ----------
-        cur_D_in = flat_state.numel() if flat_state.dim() == 1 else flat_state.shape[1]
-        # --------- JIT compile 缓存 ---------
+        # ——— 0) JIT 编译缓存 ———
         if not hasattr(self, "_compiled_sensor_net"):
             try:
-                self._compiled_sensor_net = torch.compile(
-                    self.sensor_net, fullgraph=False, dynamic=True
-                )
-            except Exception:
-                self._compiled_sensor_net = self.sensor_net  # 回退
+                self._compiled_sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
+            except:
+                self._compiled_sensor_net = self.sensor_net
         net_use = self._compiled_sensor_net
-        # -----------------------------------
 
-        if cur_D_in != self.sensor_net[0].in_features:
-            # env.size 已经变了 / 或 INPUT_CHANNELS 被调整
-            logger.warning(
-                f"[自动重建主干] detected D_in={cur_D_in} "
-                f"(old={self.sensor_net[0].in_features}); "
-                f"re-building global nets …"
-            )
-            seq_len = self.env.size * self.env.size  # ← 最新的格子数
-            self._build_global_nets(seq_len)  # ← 重新生成三条 MLP
-            # 重新 JIT 编译一次，并覆盖 net_use
-            try:
-                self._compiled_sensor_net = torch.compile(
-                    self.sensor_net, fullgraph=False, dynamic=True
-                )
-            except Exception:
-                self._compiled_sensor_net = self.sensor_net  # 回退 CPU Interpreter
-            net_use = self._compiled_sensor_net  #  新 Callable OK
-
-        # ----------------------------------------
-        # 1) 保证形状 [B, D_in]
+        # ——— 1) 确保 [B, D_in] 并 pad/trunc ———
         if flat_state.dim() == 1:
             flat_state = flat_state.unsqueeze(0)
-
-        D_in = self.env_size * self.env_size * INPUT_CHANNELS
-        # 2) Pad / 截断到 D_in
+        D_in = self.env.size * self.env.size * self._INPUT_CHANNELS
         if flat_state.shape[1] < D_in:
             flat_state = F.pad(flat_state, (0, D_in - flat_state.shape[1]))
         elif flat_state.shape[1] > D_in:
             flat_state = flat_state[:, :D_in]
 
+        # ——— 2) 只有在格子数变化时才重建三大主干网络 ———
+        seq_len = self.env.size * self.env.size
+        if getattr(self, "_last_seq_len", None) != seq_len:
+            logger.warning(f"[自动重建主干] env.size={self.env.size} changed, rebuilding nets…")
+            self._build_global_nets(seq_len)
+            try:
+                self._compiled_sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
+            except:
+                self._compiled_sensor_net = self.sensor_net
+            net_use = self._compiled_sensor_net
+            self._last_seq_len = seq_len
+
+        # ——— 3) 前向 ———
         out = net_use(flat_state)
+
 
         # === 生成协助请求 ===
         # 仅第 0 个 batch（本实现 1×B），检查 5×5 区域病毒计数
@@ -875,9 +881,13 @@ class ImmuneCogGraph(CogGraph):
         curr_D_env = curr_size2 * N_STATE_CHANNELS  # 状态通道
         if curr_D_env != getattr(self, "_D_env", -1):
             D_goal = curr_size2 * 3  # 目标向量 3 通道
-            self._full_state_buf = torch.empty(1, curr_D_env + D_goal,
-                                               device=self.device)
+            # 新：也要加上 hack channels
+            D_hack = curr_size2 * self._HACK_CHANNELS
+            total_D = curr_D_env + D_hack + D_goal
+            self._full_state_buf = torch.empty(1, total_D, device=self.device)
             self._D_env = curr_D_env
+            self._D_hack = D_hack
+            self._D_goal = D_goal
             self._S2 = curr_size2
             logger.warning(
                 f"[full_state_buf] 环境尺寸变为 {self.env.size}×{self.env.size}，"
@@ -919,7 +929,7 @@ class ImmuneCogGraph(CogGraph):
         self._sync_environment_dimensions()
 
         # 解包环境状态 + 目标（当前设计中：未访问区域 + 感染热图）
-        env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
+        env_dim = self.env.size * self.env.size * N_STATE_CHANNELS
         env_state = input_tensor[:, :env_dim]  # 通道 0~3：感染、强度、历史、评分
 
         # 从 target_vector 中提取：未访问图 + 感染图（每个是 [1, size²]）
@@ -928,12 +938,34 @@ class ImmuneCogGraph(CogGraph):
 
         # 拼接为 [B, 状态 + 目标]：最终 full_state 送入前向
         privileged_map = self.target_vector[2].unsqueeze(0)
+
+        # --- 新：构造 hack type channels 的 one-hot map ---
+        hack_maps = []
+        # env.hacks: dict[(x,y)] → {'type': t, ...}
+        for t in self.env.attack_types:
+            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32)
+            for (hx, hy), info in self.env.hacks.items():
+                if info.get('type') == t:
+                    mask[hy, hx] = 1.0
+            hack_maps.append(mask)
+        # 拼成 [1, D_hack]
+        hack_tensor = torch.stack(hack_maps, dim=0).view(1, -1)
+
         # -------- 填充缓冲区，比 cat 省一次内存分配 --------
         fs = self._full_state_buf  # 本地 alias
+        # 1) 环境状态
         fs[:, :self._D_env] = env_state
-        fs[:, self._D_env: self._D_env + self._S2] = unvisited_map
-        fs[:, self._D_env + self._S2: self._D_env + 2 * self._S2] = infected_map
-        fs[:, self._D_env + 2 * self._S2:] = privileged_map
+        # 2) hack type channels
+        fs[:, self._D_env: self._D_env + self._D_hack] = hack_tensor
+        # 偏移量
+        offset = self._D_env + self._D_hack
+        # 3) 未访问
+        fs[:, offset: offset + self._S2] = unvisited_map
+        # 4) 感染
+        fs[:, offset + self._S2: offset + 2 * self._S2] = infected_map
+        # 5) 提权
+        fs[:, offset + 2 * self._S2: offset + 3 * self._S2] = privileged_map
+
         full_state = fs
 
         # --- 3) 好奇点奖励（emitter 达到个人目标） ---
@@ -949,7 +981,7 @@ class ImmuneCogGraph(CogGraph):
         if self.current_step % 1000 == 0 and self.env.size < 20:
             # --- 新增：同步巡逻计时表尺寸 --------------------------
             self.visit_age_map = torch.zeros_like(
-                self.env.infected_map, dtype=torch.int16
+                self.env.infected_map, dtype=torch.float16
             )
             # -------------------------------------------------------
             super()._expand_environment_curriculum()
@@ -957,7 +989,7 @@ class ImmuneCogGraph(CogGraph):
             super().trim_weak_memories()
             # 目标向量已在 _expand 中更新，无需再手动调用
             if self.visit_age_map.shape != self.env.infected_map.shape:
-                new_map = torch.zeros_like(self.env.infected_map, dtype=torch.int16)
+                new_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
                 h, w = self.visit_age_map.shape
                 new_map[:h, :w] = self.visit_age_map  # 迁移旧计时
                 self.visit_age_map = new_map
@@ -965,25 +997,45 @@ class ImmuneCogGraph(CogGraph):
             self._update_target_vector()
 
             new_seq_len = self.env.size * self.env.size
-            # (1) 重建三大 MLP 主干
+
+            # 1) 重建三大 MLP 主干 & 同步 _last_seq_len，避免 sensor_forward 重复 rebuild
             self._build_global_nets(new_seq_len)
+            self._last_seq_len = new_seq_len
 
-            # (2) 只替换 transformer 的输出头
+            # 2) 只替换 transformer head 和 replay_head，然后**重置**optimizer
             self.transformer.resize_head(new_seq_len)
-            self.optimizer.add_param_group(
-                {"params": self.transformer.fc_out.parameters()}
+            # replay_head 也要跟着新尺寸走：in_features = new_seq_len
+            self.replay_head = nn.Linear(new_seq_len, 2, device=self.device)
+
+            # —— 新增：重建 Critic (value_head) ——
+            #    full_state_dim = seq_len * (状态通道 + hack通道 + 目标通道)
+            full_state_dim = new_seq_len * (N_STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
+            self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+            self.value_optimizer = optim.Adam(self.value_head.parameters(), lr=1e-4)
+
+            # —— 下面这段替换原来的 add_param_group ——
+            self.optimizer = optim.Adam(
+                list(self.transformer.parameters()) +
+                list(self.replay_head.parameters()),
+                lr=2e-4
+            )
+            # 别忘了同步重建 scheduler
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=5000, gamma=0.8
             )
 
-            # (3) 重建 replay_head 对齐新 in_features
-            self.replay_head = nn.Linear(
-                self.transformer.fc_out.in_features, 2, device=self.device
+            # —— 同步重建 Critic ——
+            # full_state_dim 也随之变化，等于 D_env + D_hack + D_goal
+            full_state_dim = self._D_env + self._D_hack + self._D_goal
+            self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+            self.value_optimizer = optim.Adam(
+                self.value_head.parameters(), lr=1e-4
             )
-            self.optimizer.add_param_group({"params": self.replay_head.parameters()})
 
         self._expand_energy_cap_if_needed()
 
         if self.static_mode:
-            return self._static_step(input_tensor)
+            return self._static_step(full_state)
 
         self._run_emitter_actions()
         self._rebuild_free_positions()
@@ -1073,46 +1125,48 @@ class ImmuneCogGraph(CogGraph):
             self.report_antibody_stats()
         self._maybe_report_by_stage()
 
-        # === replay Training ===
-        if self.current_step % 500 == 0 and len(self.replay_buffer) >= 100:
-            # 1) 随机采 64 条经验
-            # ---- 按成功 / 失败拆分 ---------------------------------
-            successes = [entry for entry in self.replay_buffer if entry["label"] == 1]
-            fails = [entry for entry in self.replay_buffer if entry["label"] == 0]
+        if self.current_step % 500 == 0:
+            batch_size = 64
+            # buffer 不够就跳过
+            if len(self.rl_buffer) < batch_size:
+                logger.warning(f"[PER 跳过] RL buffer 大小 {len(self.rl_buffer)} < {batch_size}")
+            else:
+                samples, indices, is_weights = self.rl_buffer.sample(batch_size, beta=0.4)
 
-            # ---- 至多 1/4 为正样本 --------------------------------
-            k_succ = min(len(successes), 16)  # 上限 16
-            k_fail = 64 - k_succ
-            batch = random.sample(successes, k_succ) + random.sample(fails, k_fail)
-            random.shuffle(batch)  # 打乱次序
-            # --------------------------------------------------------
+                # --- 先 pad / truncate 保证同样长度 ---
+                max_len = max(tr["state"].shape[0] for tr in samples)
+                padded = []
+                for tr in samples:
+                    st = tr["state"]
+                    if st.shape[0] < max_len:
+                        pad = torch.zeros(max_len - st.shape[0], dtype=st.dtype, device=st.device)
+                        st = torch.cat([st, pad], dim=0)
+                    elif st.shape[0] > max_len:
+                        st = st[:max_len]
+                    padded.append(st)
+                states = torch.stack(padded, dim=0).to(self.device)
 
-            states = [d["state"] for d in batch]
-            actions = [d["action"] for d in batch]
-            labels = [d["label"] for d in batch]
+                # 同 label 一起推到 GPU
+                labels = torch.tensor([s["label"] for s in samples], device=self.device)
 
-            # 强制扁平化
-            states = [s.view(-1) for s in states]
+                is_weights = is_weights.to(self.device)
 
-            # 裁剪为最短长度（避免 stack 报错）
-            min_len = min(s.shape[0] for s in states)
-            states = [s[:min_len] for s in states]
+                self.optimizer.zero_grad()
+                logits = self.replay_head(states)  # (B,2)
+                # per‐sample loss
+                per_loss = F.cross_entropy(logits, labels, reduction='none')
+                loss = (per_loss * is_weights).mean()  # 加权平均
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
 
-            # 统一 stack
-            states = torch.stack(states, dim=0).to(self.device)
-
-            # labels: List[int] -> (B,)
-            labels = torch.tensor(labels, dtype=torch.long, device=self.device)
-
-            # 2) 前置清梯度
-            self.optimizer.zero_grad()
-            # 3) 前向 + 反向
-            logits = self.replay_head(states)  # (B, 2)
-            loss = F.cross_entropy(logits, labels)  # 两类: 0=fail,1=success
-            loss.backward()
-            # 4) 更新参数
-            self.optimizer.step()
-            self.scheduler.step()
+                # 计算新的 TD‐error 作为 priority
+                with torch.no_grad():
+                    # 取 logits 对应 action idx
+                    probs = torch.softmax(logits, dim=-1)
+                    logp = torch.log(probs[range(batch_size), labels] + 1e-6)
+                    td_errors = (per_loss.detach().cpu() + 1e-6).tolist()
+                self.rl_buffer.update_priorities(indices, td_errors)
 
         # 保持探索型 emitter 始终占据 10% 比例（否则自动补充）
         if self.current_step % 50 == 0:
@@ -1146,10 +1200,10 @@ class ImmuneCogGraph(CogGraph):
         每个任务是一个字典：{ 'support': List[(x, y)], 'query': List[(x, y)] }
         """
         tasks = []
-        if len(self.replay_buffer) < (num_tasks * (k_support + k_query)):
+        if len(self.rl_buffer) < (num_tasks * (k_support + k_query)):
             return []
 
-        entries = list(self.replay_buffer)
+        entries = list(self.rl_buffer)
         # 提取优先级列表（若全零则退化为均匀采样）
         prios = [e["priority"] for e in entries]
         s = sum(prios)
@@ -1172,125 +1226,144 @@ class ImmuneCogGraph(CogGraph):
             self.last_report_stage = stage
 
     def _apply_and_reward(self, unit, action):
-        """
-        对单个 emitter 动作：
-          1. 读 before
-          2. perform(action)
-          3. 读 after
-          4. 根据 hit 给 energy + / -
-        返回 hit(bool)
-        """
         x, y = action["target"]
-        # 1) before
+        # --- 1) before & label_info ---
         if action["type"] == ACTION_HACK_DEFENSE:
-            before = self.env.privilege_level[y, x].item()
-            stealth_before = self.env.hack_strength[y, x].item()
+            before_priv = self.env.privilege_level[y, x].item()
+            before_stealth = self.env.hack_strength[y, x].item()
         else:
-            before = self.env.infected_map[y, x].item()
+            before_inf = self.env.infected_map[y, x].item()
 
-        # 2) 真正执行一次 perform
+        # --- 2) 先抓 V(s) 和 state_vec ---
+        state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
+        goal_flat = self.tv_cached.view(1, -1)
+
+        # —— 新增 hack 通道拼接 —— #
+        hack_maps = []
+        for t in self.env.attack_types:
+            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
+            for (hx, hy), info in self.env.hacks.items():
+                if info.get('type') == t:
+                    mask[hy, hx] = 1.0
+            hack_maps.append(mask)
+        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
+
+        # 最终全量状态
+        full_state = torch.cat([state_tensor, hack_flat, goal_flat], dim=1)
+
+        with torch.no_grad():
+            value_s = self.value_head(full_state).squeeze(0)
+        state_vec = unit.get_output().detach().view(-1).cpu()
+
+        # --- 3) 执行动作一次 ---
         self.emitter_actions.perform(action)
 
-        # 3) after + hit 判定
+        # --- 4) after & hit/step_reward ---
         if action["type"] == ACTION_HACK_DEFENSE:
-            after = self.env.privilege_level[y, x].item()
-            hit = (before > 0.05 and after == 0.0)
-            # === 新增：隐蔽黑客清除奖励 ===
-            # 把执行 perform 之前的 hack_strength 记录下来
-            stealth_after = self.env.hack_strength[y, x].item()
-            stealth_hit = (stealth_before > 0.05 and stealth_after == 0.0)
-            if stealth_hit:
-                bonus = 1.5  # 隐蔽清除奖励，可根据情况调整
-                unit.energy += bonus
-                unit.meta.record(action="stealth_kill", reward=bonus)
-
+            after_priv = self.env.privilege_level[y, x].item()
+            after_stealth = self.env.hack_strength[y, x].item()
+            hit = ((before_priv > 0.05 and after_priv == 0.0) or
+                   (before_stealth > 0.05 and after_stealth == 0.0))
         else:
-            after = self.env.infected_map[y, x].item()
-            hit = (before > 0.5 and after == 0.0)
+            after_inf = self.env.infected_map[y, x].item()
+            hit = (before_inf > 0.5 and after_inf == 0.0)
 
-        # 4) 奖励 / 惩罚
         factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 1.0
         if hit:
-            bonus = HIT_BONUS * factor
-            unit.energy += bonus
-            unit.meta.record(action="hit_bonus", reward=bonus)
-            step_reward = bonus
-            logger.debug("恭喜你打中啦")
+            step_reward = HIT_BONUS * factor
+            unit.energy += step_reward
+            unit.meta.record(action="hit_bonus", reward=step_reward)
         else:
-            unit.energy = max(0.0, unit.energy - MISS_PENALTY)
-            unit.meta.record(action="miss_penalty", reward=-MISS_PENALTY)
             step_reward = -MISS_PENALTY
-        # === 新增：把 hack_defense 的成功/失败都存回放池 ===
-        if action["type"] == ACTION_HACK_DEFENSE:
-            state_vec = unit.get_output().detach().view(-1).cpu()
-            # 成功的定义：privilege_level 由 >0.05 变为 0 OR hack_strength 由 >0.05 变为 0
-            success = ((before > 0.05 and after == 0.0) or
-                       (stealth_before > 0.05 and stealth_after == 0.0))
-            # 用本步 reward 绝对值作为优先级
+            unit.energy = max(0.0, unit.energy - MISS_PENALTY)
+            unit.meta.record(action="miss_penalty", reward=step_reward)
 
-            # === TD-error 作为优先级 ===
-            state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
-            goal_flat = self.tv_cached.view(1, -1)
-            full_state = torch.cat([state_tensor, goal_flat], dim=1)
+        # --- 5) 再抓 V(s') 和 next_state_vec ---
+        next_state_tensor = self.env.get_state_tensor().view(1, -1).to(self.device)
 
-            with torch.no_grad():
-                value = self.value_head(full_state).squeeze(0)
-            td_error = abs(step_reward - value.item())
-            prio = td_error
+        # 1) 重新拿目标向量
+        goal_flat = self.tv_cached.view(1, -1)
 
-            self.replay_buffer.append({
-                "state": state_vec,
-                "action": action,
-                "label": int(success),
-                "priority": prio,
-            })
+        # 2) 重建 hack 通道
+        hack_maps = []
+        for t in self.env.attack_types:
+            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
+            for (hx, hy), info in self.env.hacks.items():
+                if info.get('type') == t:
+                    mask[hy, hx] = 1.0
+            hack_maps.append(mask)
+        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
 
-        # —— 同步策略网络学习 —— #
-        # 用当前 env_state + last_flat_idx + 这一步 reward 直接更新
-        # 先拿到最新的 env_state tensor
-        state = self.env.get_state_tensor().view(1, -1).to(self.device)
-        self.policy_update(state, self.last_flat_idx, step_reward)
+        # 3) 三部分一起拼
+        full_next_state = torch.cat([next_state_tensor, hack_flat, goal_flat], dim=1)
 
+        with torch.no_grad():
+            value_s_next = self.value_head(full_next_state).squeeze(0)
+        next_state_vec = next_state_tensor.view(-1).cpu()
+
+        # --- 6) 计算 priority & 存 PER ---
+        delta = step_reward + self.gamma * value_s_next - value_s
+        priority = (delta.abs() + 1e-6).pow(self.rl_buffer.alpha).item()
+        transition = {
+            "state": state_vec,
+            "action": action,
+            "reward": step_reward,
+            "next_state": next_state_vec,
+            "done": False,
+            "label": int(hit),  # 必须有 label！
+        }
+        if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
+            self.rl_buffer.append(transition, priority)
+
+        # --- 7) A2C 同步更新（不动） ---
+        self.policy_update(state_tensor, self.last_flat_idx, step_reward)
         return hit
+
+
 
     def _record_antibody_effectiveness(self, action: dict, feat: torch.Tensor):
         """判断抗体动作是否成功清除感染，并更新计数器"""
-        if not action or "target" not in action:
-            return
 
+        # --- 1) 拷贝一份环境 ---
+        env_clone = self.env.clone()
+
+        # --- 2) 读 before ---
         x, y = action["target"]
-        if not (0 <= x < self.env.size and 0 <= y < self.env.size):
-            return
+        infected_before = env_clone.infected_map[y, x].item()
 
-        infected_before = self.env.infected_map[y, x].item()
-        self.emitter_actions.perform(action)
-        infected_after = self.env.infected_map[y, x].item()
+        # --- 3) 在 clone 上执行动作（注意：EmitterActions.perform 需要
+        #     接受一个 env 参数；如果你没写，要改它支持传 env_clone）---
+        self.emitter_actions.perform(action, env=env_clone)
 
-        if infected_before > 0.5 and self.env.infected_map[y, x].item() == 0.0:
+        # --- 4) 读 after ---
+        infected_after = env_clone.infected_map[y, x].item()
+
+        # --- 5) 根据 before/after 判定 success ---
+        success = (infected_before > 0.5 and infected_after == 0.0)
+        if success:
             self.antibody_success_count += 1
         else:
             self.antibody_failure_count += 1
-        # 把本次防御经验加入回放池
-        state_vec = feat.detach().view(-1).cpu()
-        success = (infected_before > 0.5 and infected_after == 0.0)
-        # 给抗体经验一个固定优先级
-        prio = 1.0 if success else 1.0
-        self.replay_buffer.append({
-            "state": state_vec,
-            "action": action,
-            "label": int(success),
-            "priority": prio,
-        })
 
-        # —— 2) 对抗体分类头做一次微调 —— #
-        logits = self.immune_clf(feat.view(1, -1))          # [1,1]
-        label  = torch.tensor([[float(success)]], device=self.device)
-        loss   = F.binary_cross_entropy_with_logits(logits, label)
+        # --- 6) 构造 transition，一定要带上 label 字段 ---
+        next_state_vec = env_clone.get_state_tensor().view(-1).cpu()
+        transition = {
+            "state": feat.detach().view(-1).cpu(),
+            "action": action,
+            "reward": float(success),
+            "next_state": next_state_vec,
+            "done": False,
+            "label": int(success),
+        }
+        self.anti_buffer.append(transition, priority=1.0)
+
+        # --- 7) 对抗体分类头微调（保持不变） ---
+        logits = self.immune_clf(feat.view(1, -1))
+        label = torch.tensor([[float(success)]], device=self.device)
+        loss = F.binary_cross_entropy_with_logits(logits, label)
         self.immune_opt.zero_grad()
         loss.backward()
         self.immune_opt.step()
-
-
 
     def _get_virus_stage(self) -> str:
         """根据感染演化进度判断阶段：early / middle / outbreak"""
@@ -1761,7 +1834,7 @@ class ImmuneCogGraph(CogGraph):
         pending={"sensor":[], "processor":[], "emitter":[]}
         for u in list(self.units):
             if u.role == "sensor":
-                expected_in = self.env_size * self.env_size * INPUT_CHANNELS
+                expected_in = self.env.size * self.env.size * self._INPUT_CHANNELS
             else:
                 expected_in = self.processor_hidden_size
 
@@ -1799,8 +1872,17 @@ class ImmuneCogGraph(CogGraph):
         # 2) 扁平化目标向量到 [1, D_goal]
         goal_flat = self.tv_cached.reshape(1, -1)
 
+        hack_maps = []
+        for t in self.env.attack_types:
+            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
+            for (hx, hy), info in self.env.hacks.items():
+                if info.get('type') == t:
+                    mask[hy, hx] = 1.0
+            hack_maps.append(mask)
+        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
+
         # 3) 拼接
-        full_state = torch.cat([env_flat, goal_flat], dim=1)
+        full_state = torch.cat([env_flat, hack_flat, goal_flat], dim=1)
 
         # 4) 前向算 logits
         sensor_out = self.sensor_forward(full_state)

@@ -418,6 +418,38 @@ class GridSecurityEnv:
         # 这里用随机噪声做示例
         return torch.randn((self.size, self.size), device=self.device) * 0.01
 
+    def clone(self):
+        # 1) 新建一个空白 env
+        new = GridSecurityEnv(
+            size=self.size,
+            device=self.device,
+            difficulty_ramp=self.difficulty_ramp,
+            spawn_interval=self.spawn_interval
+        )
+        # 2) 把所有“运行时”张量都一一 clone
+        for name in (
+            "infected_map", "infected_duration_map", "infection_strength",
+            "attack_history", "behavior_score", "is_quarantined",
+            "visited_map", "net_traffic", "perm_level",
+            "hack_history", "hack_strength", "vulnerability",
+            "privilege_level", "login_failures"
+        ):
+            setattr(new, name, getattr(self, name).clone())
+
+        # 3) 深拷贝 deque 里的历史帧
+        from collections import deque
+        new.syscall_history = deque(
+            (t.clone() for t in self.syscall_history),
+            maxlen=self.syscall_history.maxlen
+        )
+
+        # 4) 普通字典也一并拷贝
+        new.attacks = dict(self.attacks)
+        new.hacks   = dict(self.hacks)
+
+        return new
+
+
 
 # 安全包装器：屏蔽旧接口
 class SecureGridEnv(GridSecurityEnv):
