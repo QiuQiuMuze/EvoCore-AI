@@ -2437,7 +2437,7 @@ class CogGraph:
             self.task = TaskInjector(target_position=new_target)
             self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
 
-            logger.info(
+            logger.warning(
                 f"[Curriculum升级] 第 {self.current_step} 步：环境大小 {old_size}x{old_size} → {self.env_size}x{self.env_size}，新目标 {new_target}")
 
             for u in self.units:

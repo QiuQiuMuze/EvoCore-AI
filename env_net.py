@@ -52,11 +52,11 @@ class GridSecurityEnv:
 
         # 支持的攻击类型及参数
         self.attack_types = {
-            'worm':    {'spread_prob': 0.4, 'stealth': 0.0, 'burst': False},
-            'trojan':  {'spread_prob': 0.1, 'stealth': 0.6, 'burst': False},
+            'worm':    {'spread_prob': 0.1, 'stealth': 0.0, 'burst': False},
+            'trojan':  {'spread_prob': 0.025, 'stealth': 0.6, 'burst': False},
             'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'ransom':  {'spread_prob': 0.2, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.1, 'burst_area': 1},
-            'apt':     {'spread_prob': 0.3, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.1, 'burst_area': 3},
+            'ransom':  {'spread_prob': 0.05, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.1, 'burst_area': 1},
+            'apt':     {'spread_prob': 0.075, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.1, 'burst_area': 3},
         }
 
         self.attacks = {}
@@ -120,7 +120,7 @@ class GridSecurityEnv:
     def _expand_environment(self, growth=2):
         old_size = self.size
         new_size = old_size + growth
-        new_size = min(25, new_size)
+        new_size = min(40, new_size)
         self.size = new_size
 
         def expand(tensor, fill=0.0):
@@ -192,10 +192,10 @@ class GridSecurityEnv:
         - 自动更新攻击强度、感染图、历史攻击记录
         - 每 N 步生成一个新攻击
         """
-        if self.step_count % 1000 == 0 and len(self.attacks) > 10:
+        if self.step_count % 1 == 0:
             self._expand_environment()
 
-        if self.step_count % 1000 == 0:
+        if self.step_count % 1 == 0:
             decay_mask = torch.rand_like(self.visited_map, dtype=torch.float32) < 0.1  # 10% decay
             self.visited_map[decay_mask] = False
         # 更新感染持续时间：+1 或清零
@@ -301,7 +301,7 @@ class GridSecurityEnv:
         self.attack_history.clamp_(0, 10)
 
         # 代替固定间隔触发入侵
-        spawn_chance = 20.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
+        spawn_chance = 4.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
         if random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 
