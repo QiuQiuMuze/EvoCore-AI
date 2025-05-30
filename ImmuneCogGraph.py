@@ -393,43 +393,88 @@ class ImmuneCogGraph(CogGraph):
         return (sx, sy)
 
     def _on_env_resize(self):
-        """只在 grid size 变更时调用：rebuild 全局 net + 单元子网 + buffer"""
         seq_len = self.env.size * self.env.size
         if seq_len == self._last_seq_len:
             return
 
-        # 1) 全局 MLP 主干 rebuild
-        self._build_global_nets(seq_len)
+        # 1) 全局 MLP 主干增量扩张（而不是重建）
+        # —— sensor_net 第一层 Linear from D_in_old → hidden
+        old_linear = self.sensor_net[0]
+        old_in, old_out = old_linear.in_features, old_linear.out_features
+        new_in = seq_len * self._INPUT_CHANNELS
+        if new_in > old_in:
+            # 构造 expanded layer
+            new_linear = nn.Linear(new_in, old_out, bias=(old_linear.bias is not None)).to(self.device)
+            with torch.no_grad():
+                new_linear.weight[:, :old_in].copy_(old_linear.weight)
+                if old_linear.bias is not None:
+                    new_linear.bias.copy_(old_linear.bias)
+            self.sensor_net[0] = new_linear
 
-        # 2) replay_head / value_head / transformer head 重建
-        self.replay_head = nn.Linear(seq_len, 2, device=self.device)
-        full_state_dim = seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
-        self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+        # —— processor_net 同理，如果 hidden size 没变只需在输入端 pad
+        proc_linear = self.processor_net[0]
+        # （假设 hidden→hidden，不需要改）
+
+        # —— emitter_net 最后一层需要扩张为 hidden→seq_len
+        emit_linear = self.emitter_net[0]
+        old_in_e, old_out_e = emit_linear.in_features, emit_linear.out_features
+        if seq_len > old_out_e:
+            new_emit = nn.Linear(old_in_e, seq_len, bias=(emit_linear.bias is not None)).to(self.device)
+            with torch.no_grad():
+                new_emit.weight[:old_out_e, :].copy_(emit_linear.weight)
+                if emit_linear.bias is not None:
+                    new_emit.bias[:old_out_e].copy_(emit_linear.bias)
+            self.emitter_net[0] = new_emit
+
+        # 2) replay_head 和 value_head 同理做增量扩张，不要 new 完全新的
+        # replay_head: old_in→2，old_in = old seq_len
+        old_r = self.replay_head
+        old_in_r, out_r = old_r.in_features, old_r.out_features  # out_r == 2
+        if seq_len > old_in_r:
+            new_r = nn.Linear(seq_len, out_r, bias=(old_r.bias is not None)).to(self.device)
+            with torch.no_grad():
+                new_r.weight[:, :old_in_r].copy_(old_r.weight)
+                if old_r.bias is not None:
+                    new_r.bias.copy_(old_r.bias)
+            self.replay_head = new_r
+
+        # value_head: old_full→1
+        old_v = self.value_head
+        old_in_v, out_v = old_v.in_features, old_v.out_features  # out_v == 1
+        new_full = seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
+        if new_full > old_in_v:
+            new_v = nn.Linear(new_full, out_v, bias=(old_v.bias is not None)).to(self.device)
+            with torch.no_grad():
+                new_v.weight[:, :old_in_v].copy_(old_v.weight)
+                if old_v.bias is not None:
+                    new_v.bias.copy_(old_v.bias)
+            self.value_head = new_v
+
+        # 3) Transformer head: resize_head 本身会保留旧权重
         self.transformer.resize_head(seq_len)
 
-        # 3) 如果私有子网模式，给每个 processor/emitter 拷贝一份新网
+        # 4) 私有子网：按 _build_global_nets 时的逻辑也做扩张——
         if not self.use_shared_unit_nets:
             for u in self.units:
                 if u.role == "processor":
                     u.processor_net = copy.deepcopy(self.processor_net)
                 elif u.role == "emitter":
-                    u.emitter_net  = copy.deepcopy(self.emitter_net)
+                    # 先 pad 或者 expand u.emitter_net[0] 同样的方法
+                    u.emitter_net = copy.deepcopy(self.emitter_net)
 
-        # 4) buffer 重分配
-        D_env  = seq_len * self._STATE_CHANNELS
+        # 5) buffer 重分配、记录更新
+        D_env = seq_len * self._STATE_CHANNELS
         D_hack = seq_len * self._HACK_CHANNELS
         D_goal = seq_len * N_GOAL_CHANNELS
-        total  = D_env + D_hack + D_goal
+        total = D_env + D_hack + D_goal
         self._full_state_buf = torch.empty(1, total, device=self.device)
-        self._hack_onehot    = torch.zeros(1, D_hack, device=self.device)
+        self._hack_onehot = torch.zeros(1, D_hack, device=self.device)
 
-        # 5) 更新记录
-        self._D_env        = D_env
-        self._D_hack       = D_hack
-        self._D_goal       = D_goal
-        self._S2           = seq_len
+        self._D_env = D_env
+        self._D_hack = D_hack
+        self._D_goal = D_goal
+        self._S2 = seq_len
         self._last_seq_len = seq_len
-
 
     def _update_hack_channels(self):
         """每 step 调用：检查 hack 点变化，更新 self._hack_onehot"""
@@ -906,49 +951,90 @@ class ImmuneCogGraph(CogGraph):
     def _expand_environment_curriculum(self):
         """
         只做内部网络、head、buffer 的维度扩容，
-        不再变更 env.size、target_vector、内存等。
+        保留已有权重和优化器状态，不重建整条网络。
         """
-        # ---- 1) 全局 MLP 主干 rebuild ----
         seq_len = self.env.size * self.env.size
-        self._build_global_nets(seq_len)
-        self._last_seq_len = seq_len
 
-        # ---- 2) replay_head / value_head / transformer head 重建 ----
-        self.replay_head = nn.Linear(seq_len, 2, device=self.device)
-        full_state_dim = seq_len * (
-                self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS
-        )
-        self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+        # 1) Transformer head 只做 resize (它自身会保留 trunk 权重)
         self.transformer.resize_head(seq_len)
 
-        # ---- 3) buffer 重分配 ----
-        # 更新内部 D_env, D_hack, D_goal, S2
-        self._D_env = seq_len * self._STATE_CHANNELS
-        self._D_hack = seq_len * self._HACK_CHANNELS
-        self._D_goal = seq_len * N_GOAL_CHANNELS
+        # 2) 扩容 replay_head (in_features -> seq_len)
+        old = self.replay_head
+        new = nn.Linear(seq_len, old.out_features, bias=(old.bias is not None)).to(self.device)
+        with torch.no_grad():
+            new.weight[:, :old.in_features].copy_(old.weight)
+            if old.bias is not None:
+                new.bias.copy_(old.bias)
+        self.replay_head = new
+        # 更新 optimizer param_groups（假设 replay_head 在 policy_optimizer 或 optimizer 里）
+        for g in self.optimizer.param_groups:
+            g['params'] = [p for p in list(self.optimizer.param_groups[0]['params'])
+                           if p is not old.weight and p is not old.bias] + list(new.parameters())
+
+        # 3) 扩容 value_head (in_features -> D_env+D_hack+D_goal)
+        D_env = seq_len * self._STATE_CHANNELS
+        D_hack = seq_len * self._HACK_CHANNELS
+        D_goal = seq_len * N_GOAL_CHANNELS
+        full_state_dim = D_env + D_hack + D_goal
+
+        old = self.value_head
+        new = nn.Linear(full_state_dim, old.out_features, bias=(old.bias is not None)).to(self.device)
+        with torch.no_grad():
+            new.weight[:, :old.in_features].copy_(old.weight)
+            if old.bias is not None:
+                new.bias.copy_(old.bias)
+        self.value_head = new
+        for g in self.value_optimizer.param_groups:
+            g['params'] = list(self.value_head.parameters())
+
+        # 4) 按需扩容主干网络的 Linear 层（sensor, processor, emitter）
+        def expand_linear(layer, new_in=None, new_out=None):
+            old_w, old_b = layer.weight.data, layer.bias.data if layer.bias is not None else None
+            in_f, out_f = layer.in_features, layer.out_features
+            target_in = new_in if new_in is not None else in_f
+            target_out = new_out if new_out is not None else out_f
+            new_layer = nn.Linear(target_in, target_out, bias=(layer.bias is not None)).to(self.device)
+            with torch.no_grad():
+                new_layer.weight[:out_f, :in_f].copy_(old_w)
+                if old_b is not None:
+                    new_layer.bias[:out_f].copy_(old_b)
+            return new_layer
+
+        # sensor_net: 扩 input
+        C = self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS
+        new_in = C * seq_len
+        self.sensor_net[0] = expand_linear(self.sensor_net[0], new_in=new_in)
+
+        # processor_net: 第一层 in_features 扩 to sensor_net.out, 保持 out
+        first_proc = next(m for m in self.processor_net.modules() if isinstance(m, nn.Linear))
+        self.processor_net[0] = expand_linear(first_proc, new_in=self.sensor_net[0].out_features)
+
+        # emitter_net: 第一层 in_features 扩 to processor_net.out
+        first_emit = next(m for m in self.emitter_net.modules() if isinstance(m, nn.Linear))
+        self.emitter_net[0] = expand_linear(first_emit, new_in=self.processor_net[0].out_features)
+
+        # 5) buffer 重分配
+        self._D_env = D_env
+        self._D_hack = D_hack
+        self._D_goal = D_goal
         self._S2 = seq_len
+        total = D_env + D_hack + D_goal
 
-        # 重建 full_state_buf 和 hack_onehot
-        self._full_state_buf = torch.empty(
-            1, self._D_env + self._D_hack + self._D_goal,
-            device=self.device
-        )
-        self._hack_onehot = torch.zeros(1, self._D_hack, device=self.device)
+        self._full_state_buf = torch.empty(1, total, device=self.device)
+        self._hack_onehot = torch.zeros(1, D_hack, device=self.device)
 
-        # ---- 4) 可选：重建 scheduler（保持原有 lr 策略） ----
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=500, gamma=0.8
-        )
+        # 6) 保持原有 scheduler 策略 不重建，只 reset last_epoch
+        try:
+            self.scheduler.last_epoch = 0
+        except Exception:
+            pass
 
-        # ---- 5) 重新生成目标向量，保证三通道完整 ----
+        # 7) 更新目标向量
         self._update_target_vector()
 
-        # —— 自定义扩容日志 —— #
-        # 取旧尺寸（如果你用的是 self.env_size，改为那条；否则用 self.env.size）
-        old_size = getattr(self, 'env_size', self.env.size)
         logger.warning(
             f"[Curriculum升级] 第 {self.current_step} 步："
-            f"环境大小 {old_size}x{old_size} → {self.env.size}x{self.env.size}，"
+            f"环境大小 → {self.env.size}x{self.env.size} ({seq_len} cells)"
         )
 
     def step(self, input_tensor: torch.Tensor):
@@ -1061,64 +1147,6 @@ class ImmuneCogGraph(CogGraph):
         state_snapshot = full_state.detach().squeeze(0).to(self.device)
         prev_energies = {u.id: u.energy for u in self.units}
 
-
-        # 替换掉原来的无条件扩容：
-        # self.env._expand_environment()
-
-        #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
-        # if self.current_step % 1 == 0 and self.env.size <= 40:
-        if self.current_step % 1000 == 0 and self.env.size <= 40 and self.current_step > 1000:
-            # --- 新增：同步巡逻计时表尺寸 --------------------------
-            self.visit_age_map = torch.zeros_like(
-                self.env.infected_map, dtype=torch.float16
-            )
-            # -------------------------------------------------------
-            self._expand_environment_curriculum()
-            # 同步清理 local_memory_pool 中最弱 50%
-            super().trim_weak_memories()
-            # 目标向量已在 _expand 中更新，无需再手动调用
-            if self.visit_age_map.shape != self.env.infected_map.shape:
-                new_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
-                h, w = self.visit_age_map.shape
-                new_map[:h, :w] = self.visit_age_map  # 迁移旧计时
-                self.visit_age_map = new_map
-
-            new_seq_len = self.env.size * self.env.size
-
-            # 1) 重建三大 MLP 主干 & 同步 _last_seq_len，避免 sensor_forward 重复 rebuild
-            self._build_global_nets(new_seq_len)
-            self._last_seq_len = new_seq_len
-
-            # 2) 只替换 transformer head 和 replay_head，然后**重置**optimizer
-            self.transformer.resize_head(new_seq_len)
-            # replay_head 也要跟着新尺寸走：in_features = new_seq_len
-            self.replay_head = nn.Linear(new_seq_len, 2, device=self.device)
-
-            # —— 新增：重建 Critic (value_head) ——
-            #    full_state_dim = seq_len * (状态通道 + hack通道 + 目标通道)
-            full_state_dim = new_seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
-            self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
-            self.value_optimizer = optim.Adam(self.value_head.parameters(), lr=1e-4)
-
-            # —— 下面这段替换原来的 add_param_group ——
-            self.optimizer = optim.Adam(
-                list(self.transformer.parameters()) +
-                list(self.replay_head.parameters()),
-                lr=2e-4
-            )
-            # 别忘了同步重建 scheduler
-            self.scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=5000, gamma=0.8
-            )
-
-            # —— 同步重建 Critic ——
-            # full_state_dim 也随之变化，等于 D_env + D_hack + D_goal
-            full_state_dim = self._D_env + self._D_hack + self._D_goal
-            self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
-            self.value_optimizer = optim.Adam(
-                self.value_head.parameters(), lr=1e-4
-            )
-
         self._expand_energy_cap_if_needed()
 
         if self.static_mode:
@@ -1179,6 +1207,63 @@ class ImmuneCogGraph(CogGraph):
         # —— 环境状态更新完毕后，再刷新一次目标向量 ——
         self._update_target_vector()
         self.tv_cached = self.target_vector.detach()
+
+        # 替换掉原来的无条件扩容：
+        # self.env._expand_environment()
+
+        #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
+        # if self.current_step % 1 == 0 and self.env.size <= 40:
+        if self.current_step % 1000 == 0 and self.env.size <= 40 and self.current_step > 1000:
+            # --- 新增：同步巡逻计时表尺寸 --------------------------
+            self.visit_age_map = torch.zeros_like(
+                self.env.infected_map, dtype=torch.float16
+            )
+            # -------------------------------------------------------
+            self._expand_environment_curriculum()
+            # 同步清理 local_memory_pool 中最弱 50%
+            super().trim_weak_memories()
+            # 目标向量已在 _expand 中更新，无需再手动调用
+            if self.visit_age_map.shape != self.env.infected_map.shape:
+                new_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
+                h, w = self.visit_age_map.shape
+                new_map[:h, :w] = self.visit_age_map  # 迁移旧计时
+                self.visit_age_map = new_map
+            #
+            # new_seq_len = self.env.size * self.env.size
+            #
+            # # 1) 重建三大 MLP 主干 & 同步 _last_seq_len，避免 sensor_forward 重复 rebuild
+            # self._build_global_nets(new_seq_len)
+            # self._last_seq_len = new_seq_len
+            #
+            # # 2) 只替换 transformer head 和 replay_head，然后**重置**optimizer
+            # self.transformer.resize_head(new_seq_len)
+            # # replay_head 也要跟着新尺寸走：in_features = new_seq_len
+            # self.replay_head = nn.Linear(new_seq_len, 2, device=self.device)
+            #
+            # # —— 新增：重建 Critic (value_head) ——
+            # #    full_state_dim = seq_len * (状态通道 + hack通道 + 目标通道)
+            # full_state_dim = new_seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
+            # self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+            # self.value_optimizer = optim.Adam(self.value_head.parameters(), lr=1e-4)
+            #
+            # # —— 下面这段替换原来的 add_param_group ——
+            # self.optimizer = optim.Adam(
+            #     list(self.transformer.parameters()) +
+            #     list(self.replay_head.parameters()),
+            #     lr=2e-4
+            # )
+            # # 别忘了同步重建 scheduler
+            # self.scheduler = optim.lr_scheduler.StepLR(
+            #     self.optimizer, step_size=5000, gamma=0.8
+            # )
+            #
+            # # —— 同步重建 Critic ——
+            # # full_state_dim 也随之变化，等于 D_env + D_hack + D_goal
+            # full_state_dim = self._D_env + self._D_hack + self._D_goal
+            # self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
+            # self.value_optimizer = optim.Adam(
+            #     self.value_head.parameters(), lr=1e-4
+            # )
 
         for u in self.units:
             if u.role == "emitter":
@@ -1386,13 +1471,23 @@ class ImmuneCogGraph(CogGraph):
 
         # --- auto-resize critic ---
         D_in = full_state.size(1)
-        if self.value_head.in_features != D_in:
-            logger.warning(f"[自动重建 value_head] 重建 Critic from "
-                           f"{self.value_head.in_features} → {D_in}")
-            self.value_head = nn.Linear(D_in, 1).to(self.device)
-            self.value_optimizer = optim.Adam(
-                self.value_head.parameters(), lr=1e-4
-            )
+        # --- auto-resize critic （迁移版） ---
+        D_in = full_state.size(1)
+        old_v = self.value_head
+        old_in = old_v.in_features
+        if D_in != old_in:
+            # 新建更大输入维度的 layer
+            new_v = nn.Linear(D_in, 1, bias=(old_v.bias is not None)).to(self.device)
+            # 把旧权重和偏置拷过去
+            with torch.no_grad():
+                new_v.weight[:, :old_in].copy_(old_v.weight)
+                if old_v.bias is not None:
+                    new_v.bias.copy_(old_v.bias)
+            # 替换 head
+            self.value_head = new_v
+            # 重新把 optimizer 指向新的参数，保留动量等状态
+            for g in self.value_optimizer.param_groups:
+                g['params'] = [self.value_head.weight, self.value_head.bias]
 
         with torch.no_grad():
             value_s = self.value_head(full_state).squeeze(0)
@@ -1428,13 +1523,24 @@ class ImmuneCogGraph(CogGraph):
 
         full_next_state = torch.cat([next_state_tensor, hack_flat, goal_flat], dim=1)
         with torch.no_grad():
-            if self.value_head.in_features != D_in:
-                logger.warning(f"[自动重建 value_head] 重建 Critic from "
-                               f"{self.value_head.in_features} → {D_in}")
-                self.value_head = nn.Linear(D_in, 1).to(self.device)
-                self.value_optimizer = optim.Adam(
-                    self.value_head.parameters(), lr=1e-4
-                )
+            # --- auto-resize critic （迁移版） ---
+            D_in = full_state.size(1)
+            old_v = self.value_head
+            old_in = old_v.in_features
+            if D_in != old_in:
+                # 新建更大输入维度的 layer
+                new_v = nn.Linear(D_in, 1, bias=(old_v.bias is not None)).to(self.device)
+                # 把旧权重和偏置拷过去
+                with torch.no_grad():
+                    new_v.weight[:, :old_in].copy_(old_v.weight)
+                    if old_v.bias is not None:
+                        new_v.bias.copy_(old_v.bias)
+                # 替换 head
+                self.value_head = new_v
+                # 重新把 optimizer 指向新的参数，保留动量等状态
+                for g in self.value_optimizer.param_groups:
+                    g['params'] = [self.value_head.weight, self.value_head.bias]
+
             value_s_next = self.value_head(full_next_state).squeeze(0)
 
         next_state_vec = next_state_tensor.view(-1).cpu()
@@ -1970,17 +2076,23 @@ class ImmuneCogGraph(CogGraph):
         log_p = torch.log(probs[0, flat_idx] + 1e-8)
 
         D_in = full_state.size(1)
-        if self.value_head.in_features != D_in:
-            logger.warning(
-                f"[自动重建 value_head] 重建 Critic from "
-                f"{self.value_head.in_features} → {D_in}"
-            )
-            # 重建 value_head
-            self.value_head = nn.Linear(D_in, 1).to(self.device)
-            # 重新构造优化器，保持 lr=1e-4
-            self.value_optimizer = optim.Adam(
-                self.value_head.parameters(), lr=1e-4
-            )
+        # 先拿到旧的层
+        old_v = self.value_head
+        old_in, _ = old_v.in_features, old_v.out_features
+        new_in = D_in
+        if new_in > old_in:
+            # 构造新的更大输入维度层
+            new_v = nn.Linear(new_in, 1, bias=(old_v.bias is not None)).to(self.device)
+            # 把旧权重和偏置拷过去
+            with torch.no_grad():
+                new_v.weight[:, :old_in].copy_(old_v.weight)
+                if old_v.bias is not None:
+                    new_v.bias.copy_(old_v.bias)
+            self.value_head = new_v
+
+            # 把 optimizer 的参数列表替换成新的 layer，保留 state（动量等）
+            for group in self.value_optimizer.param_groups:
+                group['params'] = [self.value_head.weight, self.value_head.bias]
 
         # 5.2) 估计 V(s) 并计算优势 A = R − V(s)
         # full_state 在前面已经拼接过：[1, full_state_dim]

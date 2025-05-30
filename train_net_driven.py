@@ -186,10 +186,9 @@ def main(cfg):
 
             total_reward += reward
             # policy_update(state, flat_action_index, reward)
-            graph.policy_update(state_tensor, graph.last_flat_idx, reward)
             virus_msg = get_virus_type_stats(env.attacks)
 
-            if step % 1 == 0:
+            if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
                     f"病毒数 = {curr_inf_total:.0f}，黑客数 = {curr_hack_total:.0f}\n"
