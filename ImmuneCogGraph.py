@@ -621,8 +621,16 @@ class ImmuneCogGraph(CogGraph):
         elif L > D_full:
             flat_state = flat_state[:, :D_full]
 
-        # 直接调用已编译好的网络
-        return self._sensor_net(flat_state)
+        # 按需编译，保证 _compiled_sensor_net 一直是和 self.sensor_net 对应的版本
+        if not hasattr(self, "_compiled_sensor_net"):
+            try:
+                self._compiled_sensor_net = torch.compile(
+                    self.sensor_net, fullgraph=False, dynamic=True
+                )
+            except:
+                self._compiled_sensor_net = self.sensor_net
+
+        return self._compiled_sensor_net(flat_state)
 
     def _finalize_unit_update(
         self, unit, full_state, extra_dict, pending_dict, allow_clone=True
@@ -1065,7 +1073,7 @@ class ImmuneCogGraph(CogGraph):
         # self.env._expand_environment()
 
         #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
-        if self.current_step % 1 == 0 and self.env.size < 40:
+        if self.current_step % 1000 == 0 and self.env.size <= 40 and self.current_step > 1000:
             # --- 新增：同步巡逻计时表尺寸 --------------------------
             self.visit_age_map = torch.zeros_like(
                 self.env.infected_map, dtype=torch.float16
@@ -1290,7 +1298,7 @@ class ImmuneCogGraph(CogGraph):
             self._maintain_explorer_emitter_ratio()
 
         # === meta-learning ===
-        if self.current_step % 1 == 0:
+        if self.current_step % 1000 == 0 and self.current_step > 1000:
             tasks = self._sample_meta_tasks()  # 从 replay_buffer 中采 support/query
             if tasks:  #  非空才更新
                 self.meta_trainer.meta_update(tasks)
@@ -1836,30 +1844,30 @@ class ImmuneCogGraph(CogGraph):
         flat_idx = raw_idx
         unit.guided_this_round = False
 
-        # 向量化 guided 判断（只在 self._hack_coords 预先缓存了所有 hack 点时生效）
-        # MAX_GUIDED_DIST 在方法外或类属性里定义，比如： MAX_GUIDED_DIST = 5
-        if random.random() < self.guided_prob and hasattr(self, "_hack_coords"):
-            cx, cy = unit.position
-            pos = torch.tensor([[cx, cy]], device=self.device, dtype=torch.float32)  # [1,2]
-            dists = torch.cdist(pos, self._hack_coords.float(), p=1).view(-1)  # [K]
-
-            # score = 距离 - guided_prob * 风险权重
-            score = dists - self.guided_prob * self._hack_risks  # [K]
-
-            # 取 top-3 候选
-            k = min(3, score.size(0))
-            topk = torch.topk(score, k=k, largest=False)
-            if topk.indices.numel() > 0:
-                # 随机挑一个
-                idx = torch.randint(0, topk.indices.numel(), (), device=self.device)
-                pick = topk.indices[idx].item()
-                gx, gy = self._hack_coords[pick].tolist()
-                # 距离限制判断
-                if dists[pick] <= MAX_GUIDED_DIST:
-                    y, x = gy, gx
-                    flat_idx = y * size + x
-                    unit.guided_this_round = True
-            # else: 没有候选，还是用网络原生 y,x
+        # # 向量化 guided 判断（只在 self._hack_coords 预先缓存了所有 hack 点时生效）
+        # # MAX_GUIDED_DIST 在方法外或类属性里定义，比如： MAX_GUIDED_DIST = 5
+        # if random.random() < self.guided_prob and hasattr(self, "_hack_coords"):
+        #     cx, cy = unit.position
+        #     pos = torch.tensor([[cx, cy]], device=self.device, dtype=torch.float32)  # [1,2]
+        #     dists = torch.cdist(pos, self._hack_coords.float(), p=1).view(-1)  # [K]
+        #
+        #     # score = 距离 - guided_prob * 风险权重
+        #     score = dists - self.guided_prob * self._hack_risks  # [K]
+        #
+        #     # 取 top-3 候选
+        #     k = min(3, score.size(0))
+        #     topk = torch.topk(score, k=k, largest=False)
+        #     if topk.indices.numel() > 0:
+        #         # 随机挑一个
+        #         idx = torch.randint(0, topk.indices.numel(), (), device=self.device)
+        #         pick = topk.indices[idx].item()
+        #         gx, gy = self._hack_coords[pick].tolist()
+        #         # 距离限制判断
+        #         if dists[pick] <= MAX_GUIDED_DIST:
+        #             y, x = gy, gx
+        #             flat_idx = y * size + x
+        #             unit.guided_this_round = True
+        #     # else: 没有候选，还是用网络原生 y,x
 
 
         # 裁剪

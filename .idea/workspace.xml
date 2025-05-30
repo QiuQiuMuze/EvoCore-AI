@@ -6,15 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CogUnit.py" beforeDir="false" afterPath="$PROJECT_DIR$/CogUnit.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ImmuneCogGraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/ImmuneCogGraph.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h0.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h0.pth" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/env_net.py" beforeDir="false" afterPath="$PROJECT_DIR$/env_net.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/memory_net_unit.py" beforeDir="false" afterPath="$PROJECT_DIR$/memory_net_unit.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/meta_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/meta_trainer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/train_net_driven.py" beforeDir="false" afterPath="$PROJECT_DIR$/train_net_driven.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/train_self_driven.py" beforeDir="false" afterPath="$PROJECT_DIR$/train_self_driven.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -173,6 +165,8 @@
       <workItem from="1748138221948" duration="30062000" />
       <workItem from="1748170413193" duration="58452000" />
       <workItem from="1748318369940" duration="7307000" />
+      <workItem from="1748478262043" duration="43437000" />
+      <workItem from="1748600437463" duration="7232000" />
     </task>
     <servers />
   </component>

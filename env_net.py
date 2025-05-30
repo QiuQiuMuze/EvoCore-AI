@@ -192,10 +192,10 @@ class GridSecurityEnv:
         - 自动更新攻击强度、感染图、历史攻击记录
         - 每 N 步生成一个新攻击
         """
-        if self.step_count % 1 == 0:
+        if self.step_count % 1000 == 0 and self.step_count >= 1000:
             self._expand_environment()
 
-        if self.step_count % 1 == 0:
+        if self.step_count % 1000 == 0 and self.step_count >= 1000:
             decay_mask = torch.rand_like(self.visited_map, dtype=torch.float32) < 0.1  # 10% decay
             self.visited_map[decay_mask] = False
         # 更新感染持续时间：+1 或清零
