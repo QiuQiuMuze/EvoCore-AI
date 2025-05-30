@@ -198,7 +198,7 @@ class ImmuneCogGraph(CogGraph):
         self.optimizer = optim.Adam(
             list(self.transformer.parameters()) +
             list(self.replay_head.parameters()),
-            lr=2e-4
+            lr=5e-4
         )
         # —— **1) 全局 policy (actor) —— #
         # 包含 hack_type_embedding 参数，使其可被 policy 更新
@@ -207,7 +207,7 @@ class ImmuneCogGraph(CogGraph):
             list(self.processor_net.parameters()) +
             list(self.emitter_net.parameters()) +
             list(self.hack_type_embedding.parameters()),
-            lr=3e-4,
+            lr=5e-4,
             weight_decay=1e-2
         )
 
@@ -221,14 +221,14 @@ class ImmuneCogGraph(CogGraph):
         full_state_dim = D_env + D_hack + D_goal
         self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
         self.value_optimizer = optim.Adam(
-            self.value_head.parameters(), lr=1e-4
+            self.value_head.parameters(), lr=2e-4
         )
 
 
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,  # 作用对象
-            step_size=500,
-            gamma=0.8  # 学习率乘 0.8
+            step_size=200,
+            gamma=0.9  # 学习率乘 0.8
         )
         # ===================================================================
         self._rebuild_free_positions()            # 保证有 free_positions
