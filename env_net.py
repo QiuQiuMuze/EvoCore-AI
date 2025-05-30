@@ -301,7 +301,10 @@ class GridSecurityEnv:
         self.attack_history.clamp_(0, 10)
 
         # 代替固定间隔触发入侵
-        spawn_chance = 20.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
+        if self.step_count < 2000:
+            spawn_chance = 40.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
+        else:
+            spawn_chance = 4.0 / self.spawn_interval
         if random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 

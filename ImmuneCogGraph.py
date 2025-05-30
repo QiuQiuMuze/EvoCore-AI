@@ -921,7 +921,7 @@ class ImmuneCogGraph(CogGraph):
         # self.env._expand_environment()
 
         #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
-        if self.current_step % 1000 == 0 and self.env.size < 20:
+        if self.current_step % 1000 == 0 and self.env.size < 40:
             # --- 新增：同步巡逻计时表尺寸 --------------------------
             self.visit_age_map = torch.zeros_like(
                 self.env.infected_map, dtype=torch.int16
