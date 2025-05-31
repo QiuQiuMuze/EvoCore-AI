@@ -191,7 +191,7 @@ def main(cfg):
             if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
-                    f"病毒数 = {curr_inf_total:.0f}，黑客数 = {curr_hack_total:.0f}\n"
+                    f"感染点数 = {curr_inf_total:.0f}，黑客点数 = {curr_hack_total:.0f}\n"
                     f"病毒类型统计 [{virus_msg}]\n"
                     f"黑客类型统计 [{hack_msg}]\n"
                     f"累计清除病毒 = {virus_cleared_roll:.0f}，累计清除黑客 = {hack_cleared_roll:.0f}\n"

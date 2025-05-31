@@ -192,9 +192,6 @@ class GridSecurityEnv:
         - 自动更新攻击强度、感染图、历史攻击记录
         - 每 N 步生成一个新攻击
         """
-        # if self.step_count % 1 == 0:
-        if self.step_count % 1000 == 0 and self.step_count >= 1000:
-            self._expand_environment()
 
         # if self.step_count % 1 == 0:
         if self.step_count % 1000 == 0 and self.step_count >= 1000:

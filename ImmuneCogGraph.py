@@ -393,55 +393,62 @@ class ImmuneCogGraph(CogGraph):
         return (sx, sy)
 
     def _on_env_resize(self):
-        seq_len = self.env.size * self.env.size
-        if seq_len == self._last_seq_len:
+        """
+        只要 env.size 改变，就调用此函数。它会：
+          1) 把 sensor_net、emitter_net、replay_head、value_head、transformer.head 等
+             所有跟 grid_size * grid_size 相关的层都做「增量扩张／拷贝旧权重」；
+          2) 重建 full_state_buf、hack_onehot、visit_age_map 这些 buffer；
+          3) 刷新一次 target_vector (未访问图 / 感染图 / 提权图)；
+        调用完毕之后，所有部件都已经是「新尺寸」了，后续 step() 里再也不需要检查任何维度。
+        """
+        new_seq = self.env.size * self.env.size
+        if new_seq == self._last_seq_len:
             return
 
-        # 1) 全局 MLP 主干增量扩张（而不是重建）
-        # —— sensor_net 第一层 Linear from D_in_old → hidden
-        old_linear = self.sensor_net[0]
-        old_in, old_out = old_linear.in_features, old_linear.out_features
-        new_in = seq_len * self._INPUT_CHANNELS
+        ############################
+        #（1）sensor_net 第一层 (Linear: old_in → hidden) 要扩到 new_in → hidden
+        old_layer = self.sensor_net[0]  # 假设 sensor_net[0] = nn.Linear(old_in, old_out)
+        old_in, old_out = old_layer.in_features, old_layer.out_features
+        new_in = new_seq * self._INPUT_CHANNELS  # _INPUT_CHANNELS = STATE_CHANNELS + HACK_CHANNELS + N_GOAL_CHANNELS
         if new_in > old_in:
-            # 构造 expanded layer
-            new_linear = nn.Linear(new_in, old_out, bias=(old_linear.bias is not None)).to(self.device)
+            new_sensor = nn.Linear(new_in, old_out, bias=(old_layer.bias is not None)).to(self.device)
             with torch.no_grad():
-                new_linear.weight[:, :old_in].copy_(old_linear.weight)
-                if old_linear.bias is not None:
-                    new_linear.bias.copy_(old_linear.bias)
-            self.sensor_net[0] = new_linear
+                # 先把旧权重前 old_in 列拷过去
+                new_sensor.weight[:, :old_in].copy_(old_layer.weight)
+                if old_layer.bias is not None:
+                    new_sensor.bias.copy_(old_layer.bias)
+            self.sensor_net[0] = new_sensor
 
-        # —— processor_net 同理，如果 hidden size 没变只需在输入端 pad
-        proc_linear = self.processor_net[0]
-        # （假设 hidden→hidden，不需要改）
-
-        # —— emitter_net 最后一层需要扩张为 hidden→seq_len
-        emit_linear = self.emitter_net[0]
-        old_in_e, old_out_e = emit_linear.in_features, emit_linear.out_features
-        if seq_len > old_out_e:
-            new_emit = nn.Linear(old_in_e, seq_len, bias=(emit_linear.bias is not None)).to(self.device)
+        ############################
+        #（2）emitter_net 第一层 (Linear: hidden → old_seq) 要扩到 hidden → new_seq
+        emit_layer = self.emitter_net[0]
+        old_in_e, old_out_e = emit_layer.in_features, emit_layer.out_features
+        if new_seq > old_out_e:
+            new_emit = nn.Linear(old_in_e, new_seq, bias=(emit_layer.bias is not None)).to(self.device)
             with torch.no_grad():
-                new_emit.weight[:old_out_e, :].copy_(emit_linear.weight)
-                if emit_linear.bias is not None:
-                    new_emit.bias[:old_out_e].copy_(emit_linear.bias)
+                # 把旧权重前 old_out_e 行拷过去
+                new_emit.weight[:old_out_e, :].copy_(emit_layer.weight)
+                if emit_layer.bias is not None:
+                    new_emit.bias[:old_out_e].copy_(emit_layer.bias)
             self.emitter_net[0] = new_emit
 
-        # 2) replay_head 和 value_head 同理做增量扩张，不要 new 完全新的
-        # replay_head: old_in→2，old_in = old seq_len
+        ############################
+        #（3）replay_head (Linear: old_seq → 2) 扩到 new_seq → 2
         old_r = self.replay_head
         old_in_r, out_r = old_r.in_features, old_r.out_features  # out_r == 2
-        if seq_len > old_in_r:
-            new_r = nn.Linear(seq_len, out_r, bias=(old_r.bias is not None)).to(self.device)
+        if new_seq > old_in_r:
+            new_r = nn.Linear(new_seq, out_r, bias=(old_r.bias is not None)).to(self.device)
             with torch.no_grad():
                 new_r.weight[:, :old_in_r].copy_(old_r.weight)
                 if old_r.bias is not None:
                     new_r.bias.copy_(old_r.bias)
             self.replay_head = new_r
 
-        # value_head: old_full→1
+        ############################
+        #（4）value_head (Linear: old_full → 1) 扩到 new_full → 1
         old_v = self.value_head
-        old_in_v, out_v = old_v.in_features, old_v.out_features  # out_v == 1
-        new_full = seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
+        old_in_v, out_v = old_v.in_features, old_v.out_features  # out_v = 1
+        new_full = new_seq * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
         if new_full > old_in_v:
             new_v = nn.Linear(new_full, out_v, bias=(old_v.bias is not None)).to(self.device)
             with torch.no_grad():
@@ -450,31 +457,111 @@ class ImmuneCogGraph(CogGraph):
                     new_v.bias.copy_(old_v.bias)
             self.value_head = new_v
 
-        # 3) Transformer head: resize_head 本身会保留旧权重
-        self.transformer.resize_head(seq_len)
+        ############################
+        #（5）TransformerPolicyNetwork 自带的 "resize_head"，把内部最后一层 (d_model→old_seq) 扩到 (d_model→new_seq)
+        self.transformer.resize_head(new_seq)
 
-        # 4) 私有子网：按 _build_global_nets 时的逻辑也做扩张——
+        ############################
+        #（6）如果不使用“共享子网”的话，还要把每个子单元的 processor_net / emitter_net 也用 deepcopy 扩一下
         if not self.use_shared_unit_nets:
             for u in self.units:
                 if u.role == "processor":
                     u.processor_net = copy.deepcopy(self.processor_net)
                 elif u.role == "emitter":
-                    # 先 pad 或者 expand u.emitter_net[0] 同样的方法
                     u.emitter_net = copy.deepcopy(self.emitter_net)
 
-        # 5) buffer 重分配、记录更新
-        D_env = seq_len * self._STATE_CHANNELS
-        D_hack = seq_len * self._HACK_CHANNELS
-        D_goal = seq_len * N_GOAL_CHANNELS
-        total = D_env + D_hack + D_goal
-        self._full_state_buf = torch.empty(1, total, device=self.device)
-        self._hack_onehot = torch.zeros(1, D_hack, device=self.device)
+        ############################
+        #（7）重建 buffer：_full_state_buf、_hack_onehot、visit_age_map
+        D_env  = new_seq * self._STATE_CHANNELS
+        D_hack = new_seq * self._HACK_CHANNELS
+        D_goal = new_seq * N_GOAL_CHANNELS
+        total  = D_env + D_hack + D_goal
 
-        self._D_env = D_env
-        self._D_hack = D_hack
-        self._D_goal = D_goal
-        self._S2 = seq_len
-        self._last_seq_len = seq_len
+        self._full_state_buf = torch.empty(1, total, device=self.device)
+        self._hack_onehot    = torch.zeros(1, D_hack, device=self.device)
+        # 同步 visit_age_map 至新的方格大小
+        self.visit_age_map   = torch.zeros_like(self.env.infected_map, dtype=torch.float16, device=self.device)
+
+        # 记录这些新值，供 step() 里的填表使用
+        self._D_env       = D_env
+        self._D_hack      = D_hack
+        self._D_goal      = D_goal
+        self._S2          = new_seq
+        self._last_seq_len= new_seq
+
+        ############################
+        #（8）刷新一次目标向量，保证 target_vector 也是“新尺寸”的
+        self._update_target_vector()
+        self.tv_cached = self.target_vector.detach()
+
+        ############################
+        #（9）—— 新增 —— 把历史张量也扩成“新尺寸” —— #
+        #      这样一来，prev_dur、punished_map、prev_infected_map、prev_priv、prev_vuln、
+        #      prev_fail 全都能立刻和扩容后的环境同步，避免越界。
+        #
+        new_h, new_w = self.env.infected_duration_map.shape  # 例如 (12, 12)
+
+        # 1) prev_dur
+        if hasattr(self, "prev_dur"):
+            old = self.prev_dur
+            h0, w0 = old.shape
+            # 重新创建一个全 0 的张量，并把 old copy 到左上角
+            new_prev_dur = torch.zeros((new_h, new_w), device=old.device, dtype=old.dtype)
+            new_prev_dur[:h0, :w0] = old
+            self.prev_dur = new_prev_dur
+
+        # 2) punished_map
+        if hasattr(self, "punished_map"):
+            old_pm = self.punished_map
+            h0, w0 = old_pm.shape
+            new_pm  = torch.zeros((new_h, new_w), device=old_pm.device, dtype=torch.bool)
+            new_pm[:h0, :w0] = old_pm
+            self.punished_map = new_pm
+
+        # 3) prev_infected_map
+        if hasattr(self, "prev_infected_map"):
+            old_inf = self.prev_infected_map
+            h0, w0 = old_inf.shape
+            new_inf = torch.zeros((new_h, new_w), device=old_inf.device, dtype=old_inf.dtype)
+            new_inf[:h0, :w0] = old_inf
+            self.prev_infected_map = new_inf
+
+        # 4) prev_priv
+        if hasattr(self, "prev_priv"):
+            old_priv = self.prev_priv
+            h0, w0 = old_priv.shape
+            new_priv = torch.zeros((new_h, new_w), device=old_priv.device, dtype=old_priv.dtype)
+            new_priv[:h0, :w0] = old_priv
+            self.prev_priv = new_priv
+
+        # 5) prev_vuln
+        if hasattr(self, "prev_vuln"):
+            old_vuln = self.prev_vuln
+            h0, w0 = old_vuln.shape
+            new_vuln = torch.zeros((new_h, new_w), device=old_vuln.device, dtype=old_vuln.dtype)
+            new_vuln[:h0, :w0] = old_vuln
+            self.prev_vuln = new_vuln
+
+        # 6) prev_fail
+        if hasattr(self, "prev_fail"):
+            old_fail = self.prev_fail
+            h0, w0 = old_fail.shape
+            new_fail = torch.zeros((new_h, new_w), device=old_fail.device, dtype=old_fail.dtype)
+            new_fail[:h0, :w0] = old_fail
+            self.prev_fail = new_fail
+
+        ############################
+        #（7）—— 新增 —— 把 long_virus_tracker 同步扩到新尺寸 —— #
+        new_h, new_w = self.env.infected_duration_map.shape  # e.g. (12, 12)
+
+        if hasattr(self, "long_virus_tracker"):
+            old_lvt = self.long_virus_tracker
+            h0, w0 = old_lvt.shape
+            new_lvt = torch.zeros((new_h, new_w), device=old_lvt.device, dtype=old_lvt.dtype)
+            new_lvt[:h0, :w0] = old_lvt
+            self.long_virus_tracker = new_lvt
+        ############################
+
 
     def _update_hack_channels(self):
         """每 step 调用：检查 hack 点变化，更新 self._hack_onehot"""
@@ -1038,49 +1125,46 @@ class ImmuneCogGraph(CogGraph):
         )
 
     def step(self, input_tensor: torch.Tensor):
-        # —— 首先处理 grid resize ——
-        if self.current_step % 500 == 0:
+        self.current_step += 1
+
+        if self.current_step % 1000 == 0 and self.current_step >= 1000 and self.env.size <= 40:
+            # 扩张环境，每1000步扩展2
+            self.env._expand_environment()
             self._on_env_resize()
+            # 同步清理 local_memory_pool 中最弱 50%
+            super().trim_weak_memories()
+            # —— 环境、buffer 已扩容完毕，input_tensor 已过时 —— #
+            #    重新从新环境拿一次最新的状态张量并展平
+            input_tensor = self.env.get_state_tensor().view(1, -1)
 
         # —— 然后是每步都要的 hack 通道更新 ——
         self._update_hack_channels()
 
-        # --- 巡逻计时器递增，必要时自动扩张 -------------------
-        if self.visit_age_map.shape != self.env.infected_map.shape:
-            # 地图扩容后同步 shape
-            self.visit_age_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
+        # # --- 巡逻计时器递增，必要时自动扩张 -------------------
+        # if self.visit_age_map.shape != self.env.infected_map.shape:
+        #     # 地图扩容后同步 shape
+        #     self.visit_age_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
+
         # 每格 +1 计时
         self.visit_age_map += 1
 
-        # —— 保证 buffer 维度与当前 env.size 同步 ——
-        curr_size2 = self.env.size * self.env.size  # H*W
-        # 重新计算各通道长度
-        self._D_env = curr_size2 * self._STATE_CHANNELS
-        self._D_hack = curr_size2 * self._HACK_CHANNELS
-        self._D_goal = curr_size2 * N_GOAL_CHANNELS
-        self._S2 = curr_size2
-        # 如果 buffer 尺寸不对，就重建
-        total_dim = self._D_env + self._D_hack + self._D_goal
-        if self._full_state_buf.shape[1] != total_dim:
-            self._full_state_buf = torch.empty(1, total_dim, device=self.device)
-        if self._hack_onehot.shape[1] != self._D_hack:
-            self._hack_onehot = torch.zeros(1, self._D_hack, device=self.device)
-
-        # 下面再拿 env_state 填充 fs，就不会维度错乱了
-
-        # ------------------------------------------------------------
-
-        if self.current_step % 50 == 0:
-            span = self.current_step - self.kill_stats["last_reset"]
-            logger.warning(
-                f"[击杀统计] 过去 {span} 步："
-                f"病毒-自主={self.kill_stats['self_direct']}, 病毒-指引={self.kill_stats['guided']} | "
-                f"Hack-自主={self.hack_kill_stats['self_direct']}, Hack-指引={self.hack_kill_stats['guided']}"
-            )
-        if self.current_step - self.kill_stats["last_reset"] >= 1000:
-            self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
-            self.hack_kill_stats.update(self_direct=0, guided=0)
-
+        # # —— 保证 buffer 维度与当前 env.size 同步 ——
+        # curr_size2 = self.env.size * self.env.size  # H*W
+        # # 重新计算各通道长度
+        # self._D_env = curr_size2 * self._STATE_CHANNELS
+        # self._D_hack = curr_size2 * self._HACK_CHANNELS
+        # self._D_goal = curr_size2 * N_GOAL_CHANNELS
+        # self._S2 = curr_size2
+        # # 如果 buffer 尺寸不对，就重建
+        # total_dim = self._D_env + self._D_hack + self._D_goal
+        # if self._full_state_buf.shape[1] != total_dim:
+        #     self._full_state_buf = torch.empty(1, total_dim, device=self.device)
+        # if self._hack_onehot.shape[1] != self._D_hack:
+        #     self._hack_onehot = torch.zeros(1, self._D_hack, device=self.device)
+        #
+        # # 下面再拿 env_state 填充 fs，就不会维度错乱了
+        #
+        # # ------------------------------------------------------------
 
         # —— 缓存 hack 点 & 它们的 learnable 风险权重 ——
         if self.env.hacks.keys() != self._last_hack_keys:
@@ -1093,20 +1177,13 @@ class ImmuneCogGraph(CogGraph):
             self._hack_flat_indices = torch.tensor(flat_idxs, dtype=torch.long, device=self.device)
             self._last_hack_keys = set(self.env.hacks.keys())
 
-
-        if self.current_step % 50 == 0:
-            logger.warning(f"Sensor 数量：{self.sensor_count},Processor 数量：{self.processor_count}Emitter 数量：{self.emitter_count}总单元数：{len(self.units)}")
-
         # --- 1) 前置计数器 & 同步 ---
         if self.current_step % 200 == 0:
             self.active_units.clear()
 
-        self.current_step += 1
-
         self._update_global_counts()
 
-        if RF.use_shared_tx and self.current_step % RF.shared_tx_interval == 0:
-            self._run_shared_transformer()
+        self._expand_energy_cap_if_needed()
 
         # 解包环境状态 + 目标（当前设计中：未访问区域 + 感染热图）
         env_dim = self.env.size * self.env.size * self._STATE_CHANNELS
@@ -1142,20 +1219,32 @@ class ImmuneCogGraph(CogGraph):
 
         full_state = fs
 
+        # --- 2) 病毒环境推进 ---
+        prev_infected = self.env.infected_map.clone()
+        prev_dur = self.prev_dur if hasattr(self, "prev_dur") else torch.zeros_like(self.env.infected_duration_map)
+        prev_priv = self.env.privilege_level.clone()
+        prev_vuln = self.env.vulnerability.clone()
+        prev_fail = self.env.login_failures.clone()
+
+        self.env.step()
+
+        if RF.use_shared_tx and self.current_step % RF.shared_tx_interval == 0:
+            self._run_shared_transformer()
+
         # --- 3) 好奇点奖励（emitter 达到个人目标） ---
         self._reward_curiosity()
         state_snapshot = full_state.detach().squeeze(0).to(self.device)
         prev_energies = {u.id: u.energy for u in self.units}
 
-        self._expand_energy_cap_if_needed()
-
         if self.static_mode:
             return self._static_step(full_state)
 
         self.tv_cached = self.target_vector.detach()
-        self._run_emitter_actions()
         self._rebuild_free_positions()
         self._apply_warmup_and_energy_tax()
+
+        if self.current_step % 40 == 0:
+            self.rebalance_cell_types()
 
 
         # —— 统一遍历所有单元，一次完成下列任务 ——
@@ -1187,91 +1276,11 @@ class ImmuneCogGraph(CogGraph):
                     self.env.visited_map[y, x] = True
                     self.visit_age_map[y, x] = 0
 
-        # --- 2) 病毒环境推进 ---
-        prev_infected = self.env.infected_map.clone()
-        prev_dur = self.prev_dur if hasattr(self, "prev_dur") else torch.zeros_like(self.env.infected_duration_map)
-        prev_priv = self.env.privilege_level.clone()
-        prev_vuln = self.env.vulnerability.clone()
-        prev_fail = self.env.login_failures.clone()
-
-        self.env.step()
-
-        # —— 环境状态更新完毕后，如果 env 动态扩容，则同步 visit_age_map 的维度 ——
-        if self.visit_age_map.shape != self.env.infected_map.shape:
-            self.visit_age_map = torch.zeros_like(
-                self.env.infected_map,
-                dtype=self.visit_age_map.dtype,
-                device=self.device
-            )
-
-        # —— 环境状态更新完毕后，再刷新一次目标向量 ——
-        self._update_target_vector()
-        self.tv_cached = self.target_vector.detach()
-
-        # 替换掉原来的无条件扩容：
-        # self.env._expand_environment()
-
-        #  改为：仅当 size 小于阈值，且间隔一定步数再扩一次
-        # if self.current_step % 1 == 0 and self.env.size <= 40:
-        if self.current_step % 1000 == 0 and self.env.size <= 40 and self.current_step > 1000:
-            # --- 新增：同步巡逻计时表尺寸 --------------------------
-            self.visit_age_map = torch.zeros_like(
-                self.env.infected_map, dtype=torch.float16
-            )
-            # -------------------------------------------------------
-            self._expand_environment_curriculum()
-            # 同步清理 local_memory_pool 中最弱 50%
-            super().trim_weak_memories()
-            # 目标向量已在 _expand 中更新，无需再手动调用
-            if self.visit_age_map.shape != self.env.infected_map.shape:
-                new_map = torch.zeros_like(self.env.infected_map, dtype=torch.float16)
-                h, w = self.visit_age_map.shape
-                new_map[:h, :w] = self.visit_age_map  # 迁移旧计时
-                self.visit_age_map = new_map
-            #
-            # new_seq_len = self.env.size * self.env.size
-            #
-            # # 1) 重建三大 MLP 主干 & 同步 _last_seq_len，避免 sensor_forward 重复 rebuild
-            # self._build_global_nets(new_seq_len)
-            # self._last_seq_len = new_seq_len
-            #
-            # # 2) 只替换 transformer head 和 replay_head，然后**重置**optimizer
-            # self.transformer.resize_head(new_seq_len)
-            # # replay_head 也要跟着新尺寸走：in_features = new_seq_len
-            # self.replay_head = nn.Linear(new_seq_len, 2, device=self.device)
-            #
-            # # —— 新增：重建 Critic (value_head) ——
-            # #    full_state_dim = seq_len * (状态通道 + hack通道 + 目标通道)
-            # full_state_dim = new_seq_len * (self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS)
-            # self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
-            # self.value_optimizer = optim.Adam(self.value_head.parameters(), lr=1e-4)
-            #
-            # # —— 下面这段替换原来的 add_param_group ——
-            # self.optimizer = optim.Adam(
-            #     list(self.transformer.parameters()) +
-            #     list(self.replay_head.parameters()),
-            #     lr=2e-4
-            # )
-            # # 别忘了同步重建 scheduler
-            # self.scheduler = optim.lr_scheduler.StepLR(
-            #     self.optimizer, step_size=5000, gamma=0.8
-            # )
-            #
-            # # —— 同步重建 Critic ——
-            # # full_state_dim 也随之变化，等于 D_env + D_hack + D_goal
-            # full_state_dim = self._D_env + self._D_hack + self._D_goal
-            # self.value_head = nn.Linear(full_state_dim, 1).to(self.device)
-            # self.value_optimizer = optim.Adam(
-            #     self.value_head.parameters(), lr=1e-4
-            # )
+        self._run_emitter_actions()
 
         for u in self.units:
             if u.role == "emitter":
                 u.goal_vec = self.tv_cached
-
-        if self.current_step % 40 == 0:
-            self.rebalance_cell_types()
-
 
 
         # --- 4) 免疫识别 & 抗体响应 ---
@@ -1286,20 +1295,12 @@ class ImmuneCogGraph(CogGraph):
         outs = self.collect_emitter_outputs()
         emitter_outs = outs if outs is not None and isinstance(outs, list) and len(outs) > 0 else []
 
-        # --- 7) 丰富奖励/惩罚（带持久惩罚） ---
-        # 记录一下上一轮的持续时间，用于检测“刚跨过3回合”
-        # --- 7) 丰富奖励/惩罚（带持久惩罚）——传入前后黑客状态—
-        if self.current_step % 50 == 0: ##########
-            self._apply_defense_rewards(
-                prev_infected, prev_dur,
-                prev_priv, prev_vuln, prev_fail
-            )
 
-        self.prev_infected_map = self.env.infected_map.clone()
-        self.prev_dur = self.env.infected_duration_map.clone()
-        self.prev_priv = self.env.privilege_level.clone()
-        self.prev_vuln = self.env.vulnerability.clone()
-        self.prev_fail = self.env.login_failures.clone()
+
+        self._apply_defense_rewards(
+            prev_infected, prev_dur,
+            prev_priv, prev_vuln, prev_fail
+        )
 
         # --- 8) 记录长期记忆 ---
         if self.current_step % 100 == 0:
@@ -1324,13 +1325,17 @@ class ImmuneCogGraph(CogGraph):
         if not self.static_mode and self._should_evolve():
             self._perform_structural_evolution()
 
+        # 保持探索型 emitter 始终占据 10% 比例（否则自动补充）
+        if self.current_step % 50 == 0:
+            self._maintain_explorer_emitter_ratio()
+
         if self.current_step % 50 == 0:
             logger.warning(f"[病毒阶段] 当前为 {self._get_virus_stage()} 阶段")
             self.report_antibody_stats()
         self._maybe_report_by_stage()
 
         if self.current_step % 500 == 0:
-            batch_size = 64
+            batch_size = 32
             # buffer 不够就跳过
             if len(self.rl_buffer) < batch_size:
                 logger.warning(f"[PER 跳过] RL buffer 大小 {len(self.rl_buffer)} < {batch_size}")
@@ -1372,16 +1377,13 @@ class ImmuneCogGraph(CogGraph):
                     td_errors = (per_loss.detach().cpu() + 1e-6).tolist()
                 self.rl_buffer.update_priorities(indices, td_errors)
 
-        # 保持探索型 emitter 始终占据 10% 比例（否则自动补充）
-        if self.current_step % 50 == 0:
-            self._maintain_explorer_emitter_ratio()
-
         # === meta-learning ===
         # if self.current_step % 1 == 0:
         if self.current_step % 1000 == 0 and self.current_step > 1000:
             tasks = self._sample_meta_tasks()  # 从 replay_buffer 中采 support/query
             if tasks:  #  非空才更新
                 self.meta_trainer.meta_update(tasks)
+
         self.meta_self_evaluation()
 
         # === 定期修剪 Memory ===
@@ -1398,6 +1400,20 @@ class ImmuneCogGraph(CogGraph):
             w2 = min(2.0, hack_count / 5.0)  # 黑客数量稀疏
             self.target_weights = torch.tensor([w0, w1, w2], device=self.device)
 
+        if self.current_step % 50 == 0:
+            span = self.current_step - self.kill_stats["last_reset"]
+            logger.warning(
+                f"[击杀统计] 过去 {span} 步："
+                f"病毒-自主={self.kill_stats['self_direct']}, 病毒-指引={self.kill_stats['guided']} | "
+                f"Hack-自主={self.hack_kill_stats['self_direct']}, Hack-指引={self.hack_kill_stats['guided']}"
+            )
+
+            logger.warning(f"Sensor 数量：{self.sensor_count},Processor 数量：{self.processor_count}Emitter 数量：{self.emitter_count}总单元数：{len(self.units)}")
+
+
+        if self.current_step - self.kill_stats["last_reset"] >= 1000:
+            self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
+            self.hack_kill_stats.update(self_direct=0, guided=0)
 
     def _sample_meta_tasks(self, num_tasks=5, k_support=4, k_query=4):
         """
@@ -1722,19 +1738,19 @@ class ImmuneCogGraph(CogGraph):
         curr_dur = self.env.infected_duration_map
         # 只找那些刚跨过 3 回合，且之前没被惩罚过的
         # —— B. “3 回合滞留”惩罚 ——
-        just_stale = torch.nonzero((curr_dur >= 5) & (prev_dur < 5))  # [S,2]
+        just_stale = torch.nonzero((curr_dur >= 3) & (prev_dur < 3))  # [S,2]
         if emitters and just_stale.numel() > 0:
             stale_xy = just_stale[:, [1, 0]].to(torch.float32)  # (x,y)
             # reuse emit_pos
             d2 = torch.cdist(stale_xy, emit_pos, p=1)  # [S,E]
-            far_idxs = d2.max(dim=1).indices  # 每 stale 对应的最远 emitter idx
-            penalty = 0.1
+            far_idxs = d2.min(dim=1).indices  # 每 stale 对应的最近 emitter idx
+            penalty = 0.2
             for sid, fidx in enumerate(far_idxs):
                 u = emitters[fidx.item()]
                 if not getattr(u, "is_permanent_explorer", False):
                     u.energy = max(0.0, u.energy - penalty)
                     u.meta.record(action="persistence_penalty", reward=-penalty)
-                    logger.info(f"[滞留惩罚] emitter {u.id} 扣能量 {penalty}")
+                    logger.info(f"[滞留惩罚] emitter {u.id} 扣能量 {penalty}，让你摸鱼！")
 
             # 清零持续计数（只保留一次）
             for y, x in just_stale.tolist():
