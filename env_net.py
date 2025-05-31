@@ -54,9 +54,9 @@ class GridSecurityEnv:
         self.attack_types = {
             'worm':    {'spread_prob': 0.4, 'stealth': 0.0, 'burst': False},
             'trojan':  {'spread_prob': 0.1, 'stealth': 0.6, 'burst': False},
-            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'ransom':  {'spread_prob': 0.2, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.1, 'burst_area': 1},
-            'apt':     {'spread_prob': 0.3, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.1, 'burst_area': 3},
+            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.5, 'burst_area': 3},
+            'ransom':  {'spread_prob': 0.2, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
+            'apt':     {'spread_prob': 0.3, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
         }
 
         self.attacks = {}
