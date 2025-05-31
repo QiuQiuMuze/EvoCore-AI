@@ -2137,7 +2137,7 @@ class ImmuneCogGraph(CogGraph):
                     for dx in (-1, 0, 1):
                         cx = ux + dx
                         cy = uy + dy
-                        if 0 <= cx < W and 0 <= cy < H and self.env.privilege_level[cy, cx] > 0.005:
+                        if 0 <= cx < W and 0 <= cy < H and self.env.privilege_level[cy, cx] > 0.004:
                             found_hack = True
                             target_x, target_y = cx, cy
                             break
@@ -2150,7 +2150,7 @@ class ImmuneCogGraph(CogGraph):
                         for dx in (-1, 0, 1):
                             cx = ux + dx
                             cy = uy + dy
-                            if 0 <= cx < W and 0 <= cy < H and self.env.infected_map[cy, cx] > 0.005:
+                            if 0 <= cx < W and 0 <= cy < H and self.env.infected_map[cy, cx] > 0.004:
                                 found_infect = True
                                 target_x, target_y = cx, cy
                                 break
