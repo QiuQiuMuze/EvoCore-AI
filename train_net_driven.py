@@ -75,10 +75,13 @@ def main(cfg):
     )
     env.reset()
 
-    # 2) 构造一个 dummy RLAgent 传给 ImmuneCogGraph （它内部实际用的是 TransformerPolicyNetwork）
+    # key = (x,y) 坐标，value = global_step（第一次检测到此 hack 时的全局步数）
+    hack_spawn_times: dict[tuple[int, int], int] = {}
+
+    # 2) 构造一个 dummy RLAgent 传给 ImmuneCogGraph
     dummy_agent = RLAgent(
-        input_dim=1,           # 不真正使用，随便填
-        num_actions=1,         # 同上
+        input_dim=1,
+        num_actions=1,
         lr=cfg.lr,
         gamma=cfg.gamma,
         d_model=cfg.d_model,
@@ -91,107 +94,130 @@ def main(cfg):
         device=device,
         env=env
     )
-
-    if can_compile(device):  # 仅在 CUDA + PyTorch>=2 时启用
+    if can_compile(device):
         graph = torch.compile(graph)
 
     episode_rewards = []
 
-    # ----------- 选 autocast 上下文 ----------- #
-    from contextlib import nullcontext
-    if device.type == "cuda":
-        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    else:
-        autocast_ctx = nullcontext()
-
+    # ------------- 训练循环 -------------
     for ep in range(1, cfg.episodes + 1):
+        # 如果你希望每个 Episode 都干净开始，就在这里重置环境：
+        # env.reset()
 
-        # Episode 开始前，只 reset env，memory 保持累积
+        # （可选）如果每集都要从零开始计 hack_spawn_times，就在此处清空
+        hack_spawn_times.clear()
+
         total_reward = 0.0
 
-        # 记录前一步的感染 & 黑客统计
-        prev_inf  = env.infected_map.sum().item()
-        prev_hack = env.hack_history.sum().item()
-        # 记录前一状态
-        prev_inf_total = env.infected_map.sum().item()
-        prev_hack_total = env.hack_history.sum().item()
+        # 记录上一步环境中“已有多少感染 / 有多少活跃 hack”
+        # （这些变量只用来给打印看，真正清除数下面通过 graph.kill_stats_by_type 计算）
+        last_inf  = env.infected_map.sum().item()
+        last_hack = (env.privilege_level > 0.05).sum().item()
+
+        # 用于“每 1000 步将 累计清除计数 滚动归零”的辅助量
+        last_reset_step = global_step
+
+        # 设定“超时阈值”：只有当感染／黑客点在网格里连续存留超过下面这几步，才开始扣分
+        VIRUS_TIMEOUT  = 10       # 感染格在网格里连续存在超过 10 步，才算“超时”
+        HACK_TIMEOUT   = 8        # 黑客点在网格里连续存在超过 8 步，才算“超时”
+        VIRUS_PENALTY  = 2      # 每个超时感染格每步扣 0.5 分
+        HACK_PENALTY   = cfg.hack_penalty  # 黑客超时每步扣 cfg 里指定的分
 
         for step in range(1, cfg.max_steps + 1):
-            if step == 1:  # 本 Episode 第一次进入循环
-                virus_cleared_roll = 0  # 1000 步累计清除病毒
-                hack_cleared_roll = 0  # 1000 步累计清除黑客
-                last_reset_step = global_step
+            if step == 1:
+                virus_cleared_roll = 0
+                hack_cleared_roll  = 0
+                last_reset_step    = global_step
+
             global_step += 1
-            # 环境当前状态张量
-            with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                  if device.type == "cuda" else nullcontext()):
-                state_tensor = env.get_state_tensor().view(1, -1)  # (1, C×H×W)
-                graph.step(state_tensor)
 
-            # 当前状态
-            # --- 当前活跃威胁 ---
-            curr_inf_total = env.infected_map.sum().item()  # 仍然用感染格计数
-            curr_hack_total = (env.privilege_level > 0.05).sum().item()  # <— 只统计仍在提权的格子
-
-            delta_inf_cleared = max(0, prev_inf_total - curr_inf_total)
-            delta_hack_cleared = max(0, prev_hack_total - curr_hack_total)
-
-            # 累加真正击杀病毒的数量（按类型统计总和）
-            true_virus_kills = sum(
+            # —— 1) 先记录“前一步”累计击杀数  —— #
+            old_virus_kills = sum(
                 v["self_direct"] + v["guided"]
                 for v in graph.virus_kill_stats_by_type.values()
             )
-
-            virus_cleared_roll = true_virus_kills
-            hack_cleared_roll = sum(
+            old_hack_kills = sum(
                 v["self_direct"] + v["guided"]
                 for v in graph.hack_kill_stats_by_type.values()
             )
 
-            # 1000 步清零一次
-            if global_step - last_reset_step >= 1000:
-                virus_cleared_roll = 0
-                hack_cleared_roll = 0
-                last_reset_step = global_step
-            # <<< PATCH-END
+            # —— 2) 让 ImmuneCogGraph 跑一步（内部会先 env.step() 再 emitter 动作） —— #
+            with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                  if device.type == "cuda" else nullcontext()):
+                state_tensor = env.get_state_tensor().view(1, -1)
+                graph.step(state_tensor)
 
-            # 更新历史记录
-            prev_inf_total = curr_inf_total
-            prev_hack_total = curr_hack_total
-
-            # 计算新感染数 & 新黑客事件数
-            curr_inf  = env.infected_map.sum().item()
-            curr_hack = env.hack_history.sum().item()
-
-            delta_inf = curr_inf_total - prev_inf_total
-            delta_hack = curr_hack_total - prev_hack_total
-
-            if delta_inf < 0:
-                delta_inf *= 2
-
-            new_infections = max(0, delta_inf)  # Δinf >0 才算新增
-            reward = (
-                    delta_inf_cleared * 1.0  # +1 / 成功清除
-                    - new_infections * 1.0  # -1 / 新增感染
-                    - delta_hack * cfg.hack_penalty  # 黑客惩罚保持不变
+            # —— 3) 紧接着记录“本步后”累计击杀数  —— #
+            new_virus_kills = sum(
+                v["self_direct"] + v["guided"]
+                for v in graph.virus_kill_stats_by_type.values()
             )
-            # --- 统计黑客 ---
-            hack_stats = env.get_hack_stats()
-            hack_msg = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
+            new_hack_kills = sum(
+                v["self_direct"] + v["guided"]
+                for v in graph.hack_kill_stats_by_type.values()
+            )
 
-            # 从 graph 拿到分类型统计
+            # 本步“真正清除”的病毒+黑客数量 = 差值
+            cleared_virus = new_virus_kills - old_virus_kills
+            cleared_hack  = new_hack_kills - old_hack_kills
 
-            hack_kill_msg = summarize_kills_by_type(graph.hack_kill_stats_by_type)
-            virus_kill_msg = summarize_kills_by_type(graph.virus_kill_stats_by_type)
+            # —— 4) 更新 hack_spawn_times：记录“当前环境里哪些 hack 第一次出现”
+            current_hacks = set(env.hacks.keys())
+            for pos in current_hacks:
+                if pos not in hack_spawn_times:
+                    hack_spawn_times[pos] = global_step
+            # 把已经消失（被清除）的 hack 从字典里删掉
+            for pos in list(hack_spawn_times.keys()):
+                if pos not in current_hacks:
+                    del hack_spawn_times[pos]
+
+            # —— 5) 读当前环境里的“活跃感染数”和“活跃 hack 数” —— #
+            curr_inf  = env.infected_map.sum().item()
+            curr_hack = len(current_hacks)  # 等价于 (env.privilege_level>0.05).sum().item()
+
+            # —— 6) 计算“及时清除奖励”（只要本步清除了就 +1）
+            reward = 0.0
+            if cleared_virus > 0:
+                reward += 1.0 * cleared_virus
+            if cleared_hack > 0:
+                reward += 1.0 * cleared_hack
+
+            # —— 7) 计算“超时惩罚” —— #
+            #   7.1) 病毒：若某个感染格子在网格里连续存留超过 VIRUS_TIMEOUT 步，就扣分
+            overdue_virus_mask = (env.infected_duration_map > VIRUS_TIMEOUT)
+            num_overdue_virus = int(overdue_virus_mask.sum().item())
+            reward -= VIRUS_PENALTY * num_overdue_virus
+
+            #   7.2) 黑客：若某条 hack 在 hack_spawn_times 里记录的时间超过 HACK_TIMEOUT，就扣分
+            num_overdue_hack = 0
+            for pos, spawn_step in hack_spawn_times.items():
+                if global_step - spawn_step > HACK_TIMEOUT:
+                    num_overdue_hack += 1
+            reward -= HACK_PENALTY * num_overdue_hack
 
             total_reward += reward
-            # policy_update(state, flat_action_index, reward)
-            virus_msg = get_virus_type_stats(env.attacks)
+
+            # —— 8) 更新“累计清除数”（纯打印用） —— #
+            virus_cleared_roll = new_virus_kills
+            hack_cleared_roll  = new_hack_kills
+
+            # —— 9) 如果要“每 1000 步清一次”滚动统计，就写在这里 —— #
+            if global_step - last_reset_step >= 1000:
+                virus_cleared_roll = 0
+                hack_cleared_roll  = 0
+                last_reset_step    = global_step
+
+            # —— 10) 打印状态 —— #
+            hack_stats     = env.get_hack_stats()
+            hack_msg       = ", ".join(f"{k}:{v}" for k, v in hack_stats['per_type'].items())
+            virus_msg      = get_virus_type_stats(env.attacks)
+            hack_kill_msg  = summarize_kills_by_type(graph.hack_kill_stats_by_type)
+            virus_kill_msg = summarize_kills_by_type(graph.virus_kill_stats_by_type)
 
             if step % 50 == 0:
                 print(
                     f"[Step {global_step} | Ep {ep} Step {step}]\n"
-                    f"感染点数 = {curr_inf_total:.0f}，黑客点数 = {curr_hack_total:.0f}\n"
+                    f"当前感染格 = {curr_inf:.0f}，当前活跃黑客 = {curr_hack:.0f}\n"
                     f"病毒类型统计 [{virus_msg}]\n"
                     f"黑客类型统计 [{hack_msg}]\n"
                     f"累计清除病毒 = {virus_cleared_roll:.0f}，累计清除黑客 = {hack_cleared_roll:.0f}\n"
@@ -200,11 +226,6 @@ def main(cfg):
                     f"step 奖励 = {reward:.2f}，总奖励 = {total_reward:.2f}\n"
                     f"权限总和 = {hack_stats['total_priv']:.1f}，威胁度 = {hack_stats['threat_score']:.2f}"
                 )
-
-
-            # 更新历史
-            prev_inf  = curr_inf
-            prev_hack = curr_hack
 
         episode_rewards.append(total_reward)
         avg_last10 = sum(episode_rewards[-10:]) / min(len(episode_rewards), 10)
