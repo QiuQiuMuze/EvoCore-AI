@@ -97,6 +97,9 @@ class ImmuneCogGraph(CogGraph):
                 elif u.role == "emitter":
                     u.emitter_net  = copy.deepcopy(self.emitter_net)
 
+        self.known_infections = set()
+        self.known_hacks      = set()
+
         self._last_seq_len = seq_len
         self.antibody_failure_count = 0
         self.env.bind_units_reference(self.units)
@@ -357,6 +360,41 @@ class ImmuneCogGraph(CogGraph):
             self._sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
         except:
             self._sensor_net = self.sensor_net
+
+
+    def _run_sensor_scans(self):
+        """
+        让所有的 sensor 单元“平分”当前整张网格中的(H*W)个格子：
+        - 假设有 S 个 sensor，先把所有格子按行优先打平到一个列表 cells；
+        - 给第 i（0 ≤ i < S）个 sensor 扫 cells[i], cells[i+S], cells[i+2S], … 这些坐标。
+        扫到病毒就放进 self.known_infections；扫到黑客就放进 self.known_hacks。
+        """
+        # 先收集所有 active 的 sensor 单元
+        sensors = [u for u in self.units if u.role == "sensor" and hasattr(u, "position")]
+        S = len(sensors)
+        if S == 0:
+            return  # 没有 sensor，就不用扫描了
+
+        # 把当前网格 flatten 成一个列表
+        H, W = self.env.infected_map.shape
+        cells = [(x, y) for y in range(H) for x in range(W)]  # 长度 = H*W
+
+        # 遍历每个 sensor，给它一个“索引 i”，让它负责扫 cells[i : : S]
+        # 为了让“哪些格子分给哪个 sensor”是固定顺序，可以根据 sensors 列表的顺序来编号
+        for i, s in enumerate(sensors):
+            # i 是当前 sensor 在 sensors 列表中的“索引”
+            # 它要扫描 cells[i], cells[i+S], cells[i+2S], ... 直到越界
+            idx = i
+            while idx < len(cells):
+                x, y = cells[idx]
+                # 只要 env.infected_map[y,x] > 0.5，就认为这里是“感染格”
+                if self.env.infected_map[y, x] > 0.5:
+                    self.known_infections.add((x, y))
+                # 只要 env.privilege_level[y,x] > 0.05，就认为这里是“提权（黑客）格”
+                if self.env.privilege_level[y, x] > 0.05:
+                    self.known_hacks.add((x, y))
+                idx += S
+
     def _handle_reward_and_penalty(self):
         """
         重写版本：允许基于“病毒痕迹”直接退出静息模式，而不仅仅是 reward。
@@ -801,11 +839,12 @@ class ImmuneCogGraph(CogGraph):
 
         1. 若 emitter 当前正在追 “hack” 或 “infection” 目标，
            并且那个目标还没有被清理，就保持不变（不切换）；
-        2. 否则，若场上存在任意 “hack” 或 “infection” 点，
+           如果旧目标已经被传感器集合清除，则把它置 None 并继续选新目标；
+        2. 否则，若本轮传感器扫描中存在任意 “hack” 或 “infection” 点，
            立即打断（无论 u 之前是在追好奇点还是空闲），
-           选离自己最近的那个威胁点（virus 或 hacker）作为目标，
+           选离自己最近的那个已知威胁点（病毒或黑客）作为目标，
            并重置好奇冷却；
-        3. 如果场上没有任何威胁，又有 _hotspot_queue 则尝试支援；
+        3. 如果本轮确实没有任何已知威胁，又有 _hotspot_queue 则尝试支援；
         4. 如果（1）~（3）都没有，且 emitter 当前没有任何目标，
            才给它分配“好奇点”。
         """
@@ -818,50 +857,57 @@ class ImmuneCogGraph(CogGraph):
         old_goal = getattr(u, "personal_goal", None)   # (x,y) 或 None
         old_type = getattr(u, "goal_type", None)      # "hack"/"infection"/"curiosity"/"support"/None
 
-        # —— ① 从环境里拿当前所有感染/提权点 —— #
-        env_infected_mask = (self.env.infected_map > 0.5)
-        env_hack_mask     = (self.env.privilege_level > 0.05)
-        threat_mask       = env_infected_mask | env_hack_mask
-
-        # —— ② 如果 emitter 正在追 “hack”/“infection” 目标，且那个目标还没被清理—— #
+        # —— ① 检查旧目标是否仍在已知威胁集合中 —— #
         if old_type in ("hack", "infection") and old_goal is not None:
             gx, gy = old_goal
-            if 0 <= gx < self.env.size and 0 <= gy < self.env.size:
-                still_infect = (self.env.infected_map[gy, gx] > 0.5)
-                still_hack   = (self.env.privilege_level[gy, gx] > 0.05)
-                if still_infect or still_hack:
-                    # 旧目标依然存在，保留不动
-                    return
-            # —— 执行到这里说明 “old_goal” 已经不再是威胁（被清理掉了） —— #
-            # ← 在这里，一定要把它清空，否则后面它会一直“追”一个不存在的坐标
-            u.personal_goal = None
-            u.goal_type     = None
-            # 继续走到下面去分配新目标（如果有的话）
+            # 如果旧目标曾经在格子范围内，但现在已经不在已知集合里，就把它清空
+            if old_type == "infection":
+                if (gx, gy) not in self.known_infections:
+                    u.personal_goal = None
+                    u.goal_type     = None
+            else:  # old_type == "hack"
+                if (gx, gy) not in self.known_hacks:
+                    u.personal_goal = None
+                    u.goal_type     = None
 
-        # —— ③ 如果场上任意威胁依然存在，就给它分配最近的那个威胁点 —— #
-        if threat_mask.any():
-            all_threat_pos = torch.nonzero(threat_mask)  # [[y1,x1],[y2,x2],...]
+            # 如果清空之后 old_goal 变成 None，说明“该威胁已被清理”，接着去选新目标
+            # 如果 old_goal 依然在集合里，则保持当前目标不变
+            if getattr(u, "personal_goal", None) is not None and u.goal_type in ("hack", "infection"):
+                # 旧目标依然有效，直接返回，不重新分配
+                return
+
+        # —— ② 如果本轮已有已知威胁，就优先选最近的一个 —— #
+        # 构建一个含 (x,y, 类型) 的 list，infection 和 hack 都视为“威胁”
+        threat_list = []
+        for (x_inf, y_inf) in self.known_infections:
+            threat_list.append((x_inf, y_inf, "infection"))
+        for (x_hk, y_hk) in self.known_hacks:
+            threat_list.append((x_hk, y_hk, "hack"))
+
+        if threat_list:
             ex, ey = u.position
-            dists = (all_threat_pos[:, 0].float() - ey).abs() + \
-                    (all_threat_pos[:, 1].float() - ex).abs()
-            nearest_idx = torch.argmin(dists).item()
-            ty, tx = all_threat_pos[nearest_idx].tolist()  # 最近威胁的 (y, x)
+            best_dist = None
+            best_pt   = None
+            best_type = None
+            # 在 threat_list 中找离 (ex,ey) 最近的点
+            for (tx, ty, ttype) in threat_list:
+                d = abs(tx - ex) + abs(ty - ey)
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+                    best_pt   = (tx, ty)
+                    best_type = ttype
 
-            if env_hack_mask[ty, tx]:
-                new_type = "hack"
-            else:
-                new_type = "infection"
-
-            u.personal_goal = (tx, ty)
-            u.goal_type     = new_type
+            # 立刻把最近的威胁设为新目标
+            u.personal_goal = best_pt
+            u.goal_type     = best_type
             # 切去好奇冷却
             cooldown = getattr(u, "intrinsic_cooldown", 0)
             u._last_intrinsic_step = self.current_step - cooldown
 
-            logger.info(f"[{new_type.upper()} 目标] 给 emitter {u.id} 分配最近的 {new_type} 点：({tx},{ty})")
+            logger.info(f"[{best_type.upper()} 目标] 给 emitter {u.id} 分配最近的 {best_type} 点：{best_pt}")
             return
 
-        # —— ④ 如果没有任何威胁，再尝试“支援逻辑” —— #
+        # —— ③ 如果没有任何已知威胁，尝试“支援逻辑”（仅在当前目标为 None 或 "curiosity" 时生效） —— #
         if getattr(u, "goal_type", None) in (None, "curiosity") and hasattr(self, "_hotspot_queue"):
             if self._hotspot_queue:
                 dx, dy = self._hotspot_queue.popleft()
@@ -874,14 +920,14 @@ class ImmuneCogGraph(CogGraph):
                 logger.info(f"[支援目标] 给 emitter {u.id} 分配支援坐标：({tx},{ty})")
                 return
 
-        # —— ⑤ 如果仍旧没有个人目标（goal_type is None），再分配“好奇点” —— #
+        # —— ④ 如果依然没有目标（goal_type is None），则分配“好奇点” —— #
         if getattr(u, "goal_type", None) is None:
             visited = self.env.visited_map        # [size, size]
             age_map = self.visit_age_map          # [size, size]
 
             never_visited_mask = ~visited
             cooldown = getattr(u, "intrinsic_cooldown", 0)
-            long_time_mask = (age_map >= cooldown)
+            long_time_mask    = (age_map >= cooldown)
 
             candidate_mask = never_visited_mask | long_time_mask
             cand = torch.nonzero(candidate_mask)
@@ -890,7 +936,7 @@ class ImmuneCogGraph(CogGraph):
                 # 没有可选的好奇点
                 return
 
-            # 过滤离自己太近的格子
+            # 过滤掉离自己太近的格子（曼哈顿距离 < MIN_PATROL_DIST）
             if hasattr(u, "position"):
                 ex, ey = u.position
                 mask_far = []
@@ -906,11 +952,12 @@ class ImmuneCogGraph(CogGraph):
             sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
             ty, tx = cand[sel].tolist()
 
-            u.personal_goal = (tx, ty)
-            u.goal_type     = "curiosity"
+            u.personal_goal      = (tx, ty)
+            u.goal_type          = "curiosity"
             u._last_intrinsic_step = self.current_step
             logger.info(f"[好奇点] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
-        # 如果 u.goal_type 不是 None，则说明它已经在追其它目标，这里不覆盖
+        # 如果 u.goal_type 不是 None（比如已经在追 curiosity/support），则这里不覆盖，保持原目标
+
 
 
     def processor_forward(self, sensor_out: torch.Tensor):
@@ -1298,6 +1345,13 @@ class ImmuneCogGraph(CogGraph):
 
         if self.current_step % 40 == 0:
             self.rebalance_cell_types()
+
+        # 每一步开始时，清空已知集合，让 sensor 重新扫描
+        self.known_infections.clear()
+        self.known_hacks.clear()
+
+        # 所有 sensor 并行平分扫描整张地图
+        self._run_sensor_scans()
 
 
         # —— 统一遍历所有单元，一次完成下列任务 ——
