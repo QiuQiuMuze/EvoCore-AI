@@ -54,16 +54,36 @@ class EmitterActions:
         # 5) 清 hack_history 里最近一次记录（避免累计条目总是递增）
         env.hack_history[y, x] = max(env.hack_history[y, x] - 1.0, 0.0)
 
-    def _block(self, pos: Tuple[int,int], env: GridSecurityEnv):
-        x, y = pos
-        before = env.infected_map[y, x].item()
-        env.block_connection((x, y))
-        after = env.infected_map[y, x].item()
-        if before > 0.5 and after == 0.0:
-            for u in getattr(env, "_external_units", []):
-                if getattr(u, "role", None)=="emitter" and getattr(u, "position",None)==(x,y):
-                    u.cleared_positions = getattr(u, "cleared_positions", set())
-                    u.cleared_positions.add((x,y))
+    def _block(self, pos: Tuple[int, int], env: GridSecurityEnv):
+        """
+        原先只对 (x,y) 单个格子清理，这里扩展为对以 (x,y) 为中心的九宫格都进行清理。
+        """
+        cx, cy = pos
+        size_x, size_y = env.infected_map.shape[1], env.infected_map.shape[0]
+
+        # 遍历以 (cx, cy) 为中心的 3×3 范围
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                nx, ny = cx + dx, cy + dy
+                # 边界检查：确保 (nx, ny) 在网格内
+                if nx < 0 or nx >= size_x or ny < 0 or ny >= size_y:
+                    continue
+
+                # 先读 before 状态
+                before = env.infected_map[ny, nx].item()
+                # 调用环境自带的 block_connection 清理该点
+                env.block_connection((nx, ny))
+                # 读取 after 状态
+                after = env.infected_map[ny, nx].item()
+
+                # 如果确实从“感染”变成“无感染”，就为对应的 emitter 记录 cleared_positions
+                if before > 0.5 and after == 0.0:
+                    # env._external_units 通常是所有外部注册到环境的单元列表
+                    for u in getattr(env, "_external_units", []):
+                        if getattr(u, "role", None) == "emitter" and getattr(u, "position", None) == (nx, ny):
+                            # 确保 emitter 有 cleared_positions 集合
+                            u.cleared_positions = getattr(u, "cleared_positions", set())
+                            u.cleared_positions.add((nx, ny))
 
     def _quarantine(self, pos: Tuple[int,int], env: GridSecurityEnv):
         env.quarantine_zone(pos)

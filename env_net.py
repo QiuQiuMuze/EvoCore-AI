@@ -52,15 +52,15 @@ class GridSecurityEnv:
 
         # 支持的攻击类型及参数
         self.attack_types = {
-            'worm':    {'spread_prob': 0.1, 'stealth': 0.0, 'burst': False},
-            'trojan':  {'spread_prob': 0.025, 'stealth': 0.6, 'burst': False},
+            'worm':    {'spread_prob': 0.4, 'stealth': 0.0, 'burst': False},
+            'trojan':  {'spread_prob': 0.1, 'stealth': 0.6, 'burst': False},
             'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'ransom':  {'spread_prob': 0.05, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.1, 'burst_area': 1},
-            'apt':     {'spread_prob': 0.075, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.1, 'burst_area': 3},
+            'ransom':  {'spread_prob': 0.2, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.1, 'burst_area': 1},
+            'apt':     {'spread_prob': 0.3, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.1, 'burst_area': 3},
         }
 
         self.attacks = {}
-        self.hack_spawn_interval = 50
+        self.hack_spawn_interval = 10
         self.hack_types = {
             'bruteforce':      {'spawn_prob': 0.02, 'max_fail': 5},
             'phishing':        {'spawn_prob': 0.01, 'stealth':0.8},
@@ -68,8 +68,8 @@ class GridSecurityEnv:
             'privilege_escalation': {'spawn_prob': 0.003}
         }
         self.hacks = {}  # 当前活跃的黑客事件: dict[(x,y)]→{type,…}
-        if self.step_count >= 0:  # 比如只在后期才允许初始病毒出现
-            self._spawn_attack(initial=True)
+        # if self.step_count >= 0:  # 比如只在后期才允许初始病毒出现
+        #     self._spawn_attack(initial=True)
 
 
     # === 新增：统计当前活跃黑客 ===
@@ -215,7 +215,7 @@ class GridSecurityEnv:
         elif self.step_count < 2000: max_inf = 20
         elif self.step_count < 5000: max_inf = 40
         else:                        max_inf = float('inf')
-        if curr < max_inf:
+        if self.step_count >= 0:
             # ────────── 1) 4-邻扩散：一次卷积完成 ──────────
             infected = (self.infected_map > 0.5).float().unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
             kernel = torch.tensor([[0, 1, 0],
@@ -309,7 +309,7 @@ class GridSecurityEnv:
         curr = int((self.infected_map > 0.5).sum().item())
 
         # 代替固定间隔触发入侵
-        spawn_chance = 4.0 / self.spawn_interval  # e.g. 每步有 4/200 概率
+        spawn_chance = 20 / self.spawn_interval  # e.g. 每步有 20/200 概率
         if curr < max_inf and random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 

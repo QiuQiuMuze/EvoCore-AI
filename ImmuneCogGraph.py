@@ -31,8 +31,8 @@ MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_GOAL_CHANNELS = 3
 FLASH_ATTN_AVAILABLE = False
 MIN_PATROL_DIST = 3      # 巡逻目标与当前位置的最小曼哈顿距离
-HIT_BONUS       = 0.10     # 命中立刻奖励
-MISS_PENALTY    = 0.02     # 打空扣分
+HIT_BONUS       = 1.0     # 命中立刻奖励
+MISS_PENALTY    = 0.00    # 打空扣分
 GUIDED_FACTOR   = 0.3      # guided 奖励折扣
 MAX_GUIDED_DIST = 5
 
@@ -53,7 +53,7 @@ class ImmuneCogGraph(CogGraph):
         # 环境替换
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
-
+        self.last_flat_idx = 0
         # 混合策略控制：guided 的比例，逐步衰减到 0
         super().__init__(rl_agent, device=device, env=env)
 
@@ -110,7 +110,7 @@ class ImmuneCogGraph(CogGraph):
         self.hack_kill_stats_by_type = {}
         # --- 可学习的黑客类型权重 embedding ---
         # 利用 env.attack_types 列表初始化 mapping
-        self.hack_types = list(self.env.attack_types)
+        self.hack_types = list(self.env.hack_types)
         self.hack_type_to_idx = {t: i for i, t in enumerate(self.hack_types)}
         # 每个类型一个可训练的标量 weight
         self.hack_type_embedding = nn.Embedding(len(self.hack_types), 1).to(self.device)
@@ -795,69 +795,122 @@ class ImmuneCogGraph(CogGraph):
             unit, full_state, extra_dict, pending_dict, allow_clone=allow_clone
         )
 
-
     def _assign_emitter_goal(self, u):
         """
         为 emitter 分配个人目标 (personal_goal)
 
-        1. 若本地能看到提权/感染 → 立即锁定最近的该类坐标；
-        2. 否则若队列里有 “支援方向 (dx,dy)” 并且 emitter 目前
-           goal_type ∈ {None, 'curiosity'} → 生成支援坐标；
-        3. 若仍没有目标 → 继续好奇探索（unvisited）。
+        1. 若 emitter 当前正在追 “hack” 或 “infection” 目标，
+           并且那个目标还没有被清理，就保持不变（不切换）；
+        2. 否则，若场上存在任意 “hack” 或 “infection” 点，
+           立即打断（无论 u 之前是在追好奇点还是空闲），
+           选离自己最近的那个威胁点（virus 或 hacker）作为目标，
+           并重置好奇冷却；
+        3. 如果场上没有任何威胁，又有 _hotspot_queue 则尝试支援；
+        4. 如果（1）~（3）都没有，且 emitter 当前没有任何目标，
+           才给它分配“好奇点”。
         """
+
+        # —— 先确定网格大小 —— #
         vec_len = self.target_vector.shape[1]
-        size    = int(vec_len ** 0.5)
+        size = int(vec_len ** 0.5)
 
-        # 解析三张图
-        unvisited = self.target_vector[0].view(size, size)
-        infected  = self.target_vector[1].view(size, size)
-        hacked    = self.target_vector[2].view(size, size)
+        # —— 缓存 emitter 现在的目标和类型 —— #
+        old_goal = getattr(u, "personal_goal", None)   # (x,y) 或 None
+        old_type = getattr(u, "goal_type", None)      # "hack"/"infection"/"curiosity"/"support"/None
 
-        # --- 1) 本地可见目标 ---
-        if hacked.sum() > 0:
-            pos_list = torch.nonzero(hacked > 0.05)
-            goal_type = "hack"
-        elif infected.sum() > 0:
-            pos_list = torch.nonzero(infected > 0.5)
-            goal_type = "infection"
-        else:
-            pos_list = torch.nonzero(unvisited > 0.5)
-            goal_type = "curiosity"
-        # --- 过滤距离太近的巡逻点 -------------------------
-        if goal_type == "curiosity" and hasattr(u, "position"):
+        # —— ① 从环境里拿当前所有感染/提权点 —— #
+        env_infected_mask = (self.env.infected_map > 0.5)
+        env_hack_mask     = (self.env.privilege_level > 0.05)
+        threat_mask       = env_infected_mask | env_hack_mask
+
+        # —— ② 如果 emitter 正在追 “hack”/“infection” 目标，且那个目标还没被清理—— #
+        if old_type in ("hack", "infection") and old_goal is not None:
+            gx, gy = old_goal
+            if 0 <= gx < self.env.size and 0 <= gy < self.env.size:
+                still_infect = (self.env.infected_map[gy, gx] > 0.5)
+                still_hack   = (self.env.privilege_level[gy, gx] > 0.05)
+                if still_infect or still_hack:
+                    # 旧目标依然存在，保留不动
+                    return
+            # —— 执行到这里说明 “old_goal” 已经不再是威胁（被清理掉了） —— #
+            # ← 在这里，一定要把它清空，否则后面它会一直“追”一个不存在的坐标
+            u.personal_goal = None
+            u.goal_type     = None
+            # 继续走到下面去分配新目标（如果有的话）
+
+        # —— ③ 如果场上任意威胁依然存在，就给它分配最近的那个威胁点 —— #
+        if threat_mask.any():
+            all_threat_pos = torch.nonzero(threat_mask)  # [[y1,x1],[y2,x2],...]
             ex, ey = u.position
-            mask = [
-                (abs(x - ex) + abs(y - ey) >= MIN_PATROL_DIST)
-                for y, x in pos_list.tolist()
-            ]
-            if any(mask):  # 若还有满足距离要求的
-                pos_list = pos_list[torch.tensor(mask, dtype=torch.bool)]
-        # ---------------------------------------------------------
+            dists = (all_threat_pos[:, 0].float() - ey).abs() + \
+                    (all_threat_pos[:, 1].float() - ex).abs()
+            nearest_idx = torch.argmin(dists).item()
+            ty, tx = all_threat_pos[nearest_idx].tolist()  # 最近威胁的 (y, x)
 
-        # ---------------------- 2) 支援逻辑 ----------------------
-        if len(pos_list) == 0:
-            idle = getattr(u, "goal_type", None) in (None, "curiosity")
-            if idle and hasattr(self, "_hotspot_queue") and self._hotspot_queue:
-                dx, dy = self._hotspot_queue.popleft()        # (-1/0/1, -1/0/1)
+            if env_hack_mask[ty, tx]:
+                new_type = "hack"
+            else:
+                new_type = "infection"
+
+            u.personal_goal = (tx, ty)
+            u.goal_type     = new_type
+            # 切去好奇冷却
+            cooldown = getattr(u, "intrinsic_cooldown", 0)
+            u._last_intrinsic_step = self.current_step - cooldown
+
+            logger.info(f"[{new_type.upper()} 目标] 给 emitter {u.id} 分配最近的 {new_type} 点：({tx},{ty})")
+            return
+
+        # —— ④ 如果没有任何威胁，再尝试“支援逻辑” —— #
+        if getattr(u, "goal_type", None) in (None, "curiosity") and hasattr(self, "_hotspot_queue"):
+            if self._hotspot_queue:
+                dx, dy = self._hotspot_queue.popleft()
                 ex, ey = getattr(u, "position", (size // 2, size // 2))
-                tx = min(max(0, ex + dx * 3), size - 1)       # 向方向前进 3 格
+                tx = min(max(0, ex + dx * 3), size - 1)
                 ty = min(max(0, ey + dy * 3), size - 1)
+
                 u.personal_goal = (tx, ty)
                 u.goal_type     = "support"
-                return
-            else:
-                # 无支援且无可见目标——保持原目标或置空
-                if getattr(u, "personal_goal", None) is None:
-                    u.personal_goal = None
-                    u.goal_type     = None
+                logger.info(f"[支援目标] 给 emitter {u.id} 分配支援坐标：({tx},{ty})")
                 return
 
-        # ---------------------- 3) 正常选目标 --------------------
-        sel = torch.randint(0, pos_list.size(0), (1,), generator=self._rng, device=self.device).item()
-        y, x = pos_list[sel].tolist()
-        u.personal_goal = (x, y)
-        u.goal_type     = goal_type
+        # —— ⑤ 如果仍旧没有个人目标（goal_type is None），再分配“好奇点” —— #
+        if getattr(u, "goal_type", None) is None:
+            visited = self.env.visited_map        # [size, size]
+            age_map = self.visit_age_map          # [size, size]
 
+            never_visited_mask = ~visited
+            cooldown = getattr(u, "intrinsic_cooldown", 0)
+            long_time_mask = (age_map >= cooldown)
+
+            candidate_mask = never_visited_mask | long_time_mask
+            cand = torch.nonzero(candidate_mask)
+
+            if cand.numel() == 0:
+                # 没有可选的好奇点
+                return
+
+            # 过滤离自己太近的格子
+            if hasattr(u, "position"):
+                ex, ey = u.position
+                mask_far = []
+                for (yy, xx) in cand.tolist():
+                    if abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST:
+                        mask_far.append(True)
+                    else:
+                        mask_far.append(False)
+                mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
+                if mask_far.any():
+                    cand = cand[mask_far]
+
+            sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
+            ty, tx = cand[sel].tolist()
+
+            u.personal_goal = (tx, ty)
+            u.goal_type     = "curiosity"
+            u._last_intrinsic_step = self.current_step
+            logger.info(f"[好奇点] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
+        # 如果 u.goal_type 不是 None，则说明它已经在追其它目标，这里不覆盖
 
 
     def processor_forward(self, sensor_out: torch.Tensor):
@@ -1521,7 +1574,7 @@ class ImmuneCogGraph(CogGraph):
             after_inf = self.env.infected_map[y, x].item()
             hit = (before_inf > 0.5 and after_inf == 0.0)
 
-        factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 1.0
+        factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
         if hit:
             step_reward = HIT_BONUS * factor
             unit.energy += step_reward
@@ -1651,24 +1704,39 @@ class ImmuneCogGraph(CogGraph):
             )
 
     def _reward_curiosity(self):
-
-        """Emitter 达到 personal_goal 时的内在奖励"""
+        """
+        只有当个人目标（goal_type）确实是 'curiosity'，
+        并且到达了这个 curiosity 点后，才发放好奇奖励。
+        """
         for u in self.units:
-            if getattr(u, "goal_type", "") == "hack":
-                setattr(u, "intrinsic_reward", 0.3)
-            else:
-                setattr(u, "intrinsic_reward", 0.2)
+            # 1) 先判断：如果当前并不是“好奇目标”，直接跳过
+            if getattr(u, "goal_type", None) != "curiosity":
+                continue
 
-            if u.role=="emitter" and hasattr(u,"personal_goal") and u.personal_goal:
+            # 2) 只有在“goal_type == 'curiosity'”时，
+            #    我们才给 intrinsic_reward （你可以把数值调到想要的大小）
+            #    下面把它设为 0.2（或其他正数）
+            u.intrinsic_reward = 0.2
+
+            # 3) 如果 emitter 确实存在 personal_goal，再检查是否到达
+            if u.role == "emitter" and hasattr(u, "personal_goal") and u.personal_goal:
                 out = u.get_output().flatten()
                 pred = torch.argmax(out).item()
-                if (pred % self.env.size, pred//self.env.size)==u.personal_goal:
-                    r = getattr(u,"intrinsic_reward",0.2)
+                # 把 flat 索引转换成 (x,y)
+                goal_x, goal_y = u.personal_goal
+                px = pred % self.env.size
+                py = pred // self.env.size
+
+                # 4) 只有当网络预测的位置正好就是那“好奇点”时，才给奖励
+                if (px, py) == (goal_x, goal_y):
+                    r = getattr(u, "intrinsic_reward", 0.0)
                     u.energy += r
                     u.meta.record(action="intrinsic", reward=+r)
-                    u.visit_counts[u.personal_goal]=u.visit_counts.get(u.personal_goal,0)+1
+                    u.visit_counts[u.personal_goal] = u.visit_counts.get(u.personal_goal, 0) + 1
+                    # 清空 personal_goal 以便下次重新指派
                     u.personal_goal = None
                     u.goal_type = None
+                    logger.info("你达到了好奇点，心中充满了决心")
 
     def _apply_defense_rewards(self,
                                prev_infected, prev_dur,
@@ -1793,7 +1861,7 @@ class ImmuneCogGraph(CogGraph):
             cleared = len(getattr(u, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-                reward = 0.4 * cleared
+                reward = 1.2 * cleared
                 if getattr(u, "guided_this_round", False):
                     reward *= GUIDED_FACTOR  # ← guided 击杀折扣
                 u.energy += reward
@@ -1953,59 +2021,70 @@ class ImmuneCogGraph(CogGraph):
 
     def _decode_action_from_output(self, unit, output_vec):
         size = self.env.size
-        raw_idx = int(torch.argmax(output_vec).item())
-        ry, rx = divmod(raw_idx, size)
-
-        # 默认：网络输出
-        y, x = ry, rx
-        flat_idx = raw_idx
-        unit.guided_this_round = False
-
-        # # 向量化 guided 判断（只在 self._hack_coords 预先缓存了所有 hack 点时生效）
-        # # MAX_GUIDED_DIST 在方法外或类属性里定义，比如： MAX_GUIDED_DIST = 5
-        # if random.random() < self.guided_prob and hasattr(self, "_hack_coords"):
-        #     cx, cy = unit.position
-        #     pos = torch.tensor([[cx, cy]], device=self.device, dtype=torch.float32)  # [1,2]
-        #     dists = torch.cdist(pos, self._hack_coords.float(), p=1).view(-1)  # [K]
-        #
-        #     # score = 距离 - guided_prob * 风险权重
-        #     score = dists - self.guided_prob * self._hack_risks  # [K]
-        #
-        #     # 取 top-3 候选
-        #     k = min(3, score.size(0))
-        #     topk = torch.topk(score, k=k, largest=False)
-        #     if topk.indices.numel() > 0:
-        #         # 随机挑一个
-        #         idx = torch.randint(0, topk.indices.numel(), (), device=self.device)
-        #         pick = topk.indices[idx].item()
-        #         gx, gy = self._hack_coords[pick].tolist()
-        #         # 距离限制判断
-        #         if dists[pick] <= MAX_GUIDED_DIST:
-        #             y, x = gy, gx
-        #             flat_idx = y * size + x
-        #             unit.guided_this_round = True
-        #     # else: 没有候选，还是用网络原生 y,x
-
-
-        # 裁剪
+        ux, uy = unit.position
         H, W = self.env.infected_map.shape
-        y = min(y, H - 1)
-        x = min(x, W - 1)
 
-        # move逻辑不变…
-        if abs(unit.position[0] - x) + abs(unit.position[1] - y) > 1:
-            nx, ny = self._step_toward(unit.position, (x, y))
-            self.last_flat_idx = flat_idx
-            return {"type": "move", "target": (nx, ny)}
+        # —— 1) 先看 personal_goal —— #
+        if hasattr(unit, "personal_goal") and unit.personal_goal is not None:
+            goal_x, goal_y = unit.personal_goal
+            dist_to_goal = abs(ux - goal_x) + abs(uy - goal_y)
 
-        # attack/defense逻辑不变…
-        a_type = (
-            ACTION_HACK_DEFENSE if self.env.privilege_level[y, x] > 0.02 else
-            ACTION_BLOCK if self.env.infected_map[y, x] > 0.5 else
-            ACTION_QUARANTINE
-        )
-        self.last_flat_idx = flat_idx
-        return {"type": a_type, "target": (x, y)}
+            # 还没到达 goal，就往 goal 方向移动
+            if dist_to_goal > 1:
+                nx, ny = self._step_toward(unit.position, (goal_x, goal_y))
+                return {"type": "move", "target": (nx, ny)}
+            else:
+                # 已经到达（或非常接近）personal_goal：
+                # 如果是好奇点，就不执行清理，直接返回 None。等下一步骤 _reward_curiosity 会清掉 personal_goal。
+                if getattr(unit, "goal_type", None) == "curiosity":
+                    return None
+
+                # 如果是“infection”或“hack”目标，那么落定后一定要执行清理/隔离逻辑：
+                # 以当前 (ux,uy) 为中心，扫描周围 3×3
+                found_hack = False
+                found_infect = False
+                target_x = target_y = None
+
+                # 优先找 hack
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        cx = ux + dx
+                        cy = uy + dy
+                        if 0 <= cx < W and 0 <= cy < H and self.env.privilege_level[cy, cx] > 0.3:
+                            found_hack = True
+                            target_x, target_y = cx, cy
+                            break
+                    if found_hack:
+                        break
+
+                # 如果没找到 hack，再找 infect
+                if not found_hack:
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            cx = ux + dx
+                            cy = uy + dy
+                            if 0 <= cx < W and 0 <= cy < H and self.env.infected_map[cy, cx] > 0.3:
+                                found_infect = True
+                                target_x, target_y = cx, cy
+                                break
+                        if found_infect:
+                            break
+
+                if found_hack:
+                    print(f"[Emitter {unit.id}] 在 ({ux},{uy}) 附近检测到黑客，执行 hack_defense({target_x},{target_y})")
+                    return {"type": ACTION_HACK_DEFENSE, "target": (target_x, target_y)}
+
+                if found_infect:
+                    print(f"[Emitter {unit.id}] 在 ({ux},{uy}) 附近检测到病毒，执行 block({target_x},{target_y})")
+                    return {"type": ACTION_BLOCK, "target": (target_x, target_y)}
+
+                # 九宫格内既无 hack 也无 infect，就对自己原地隔离一次
+                return {"type": ACTION_QUARANTINE, "target": (ux, uy)}
+
+        # —— 2) 如果 personal_goal 是 None（可能还没分配，也可能刚被清理完），
+        #      那么可以让网络用 argmax(output_vec) 去随便给出一个新目标点，
+        #      或者直接返回 None 等下一轮 _assign_emitter_goal 重新分配。
+        return None
 
     def _argmax_position(self, output_vec):
         """

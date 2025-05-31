@@ -106,9 +106,9 @@ class CogUnit:
         self.meta = MetaCognition(history_len=100)
         self.personal_goal = None            # 当前内在目标 (x,y)
         self.visit_counts = {}               # {(x,y): 次数}
-        self.intrinsic_reward = 1.0         # 达到内在目标奖励能量
+        self.intrinsic_reward = 0.1        # 达到内在目标奖励能量
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
-        self.intrinsic_cooldown = 20  # 冷却步数
+        self.intrinsic_cooldown = 0  # 冷却步数
         self._last_intrinsic_step = -float("inf")
 
         self.function = torch.nn.Sequential(

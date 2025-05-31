@@ -197,7 +197,7 @@ class CogGraph:
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
         self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
-        self.max_total_energy = 1000  # 初始最大总能量
+        self.max_total_energy = 250  # 初始最大总能量
         self.removed_hazards_by_reward = 0
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
@@ -1290,8 +1290,8 @@ class CogGraph:
         # 🟡 预热补偿（前 500 步）
         if self.current_step < 500:
             for unit in self.units:
-                unit.energy += 0.05
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.05")
+                unit.energy += 0.01
+                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.01")
 
         # 🟠 能量税（每 10 步）
         if self.current_step > 200 and self.current_step % 100 == 0:
@@ -1680,11 +1680,9 @@ class CogGraph:
         decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
                 * dim_scale * bias_factor * step_factor * unit_factor
         # honor 单元自己的 metabolic_rate
-        base_factor = 0.015 if self.current_step < 1000 else 0.030
-        if unit.role == "emitter":
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0) * 0.1
-        else:
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0)
+        base_factor = 0.025 if self.current_step < 1000 else 0.035
+
+        unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0)
 
         unit.energy = max(unit.energy, 0.0)
 
