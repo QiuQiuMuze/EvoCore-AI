@@ -1915,7 +1915,7 @@ class ImmuneCogGraph(CogGraph):
             cleared = len(getattr(u, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-                reward = 1.2 * cleared
+                reward = 0.6 * cleared
                 if getattr(u, "guided_this_round", False):
                     reward *= GUIDED_FACTOR  # ← guided 击杀折扣
                 u.energy += reward
@@ -2041,6 +2041,26 @@ class ImmuneCogGraph(CogGraph):
             if not action or action["type"] == "move":
                 continue
 
+            # —— 如果是病毒清理（ACTION_BLOCK），先读取 当前格子的病毒 subtype —— #
+            virus_type_at_target = None
+            if action["type"] == ACTION_BLOCK:
+                tx, ty = action["target"]
+                # 从 env.attacks 中拿一次 "type" 字段
+                v_info = self.env.attacks.get((tx, ty))
+                if v_info is not None:
+                    # 假设 v_info["type"] 就是真正的子类型字符串，比如 "worm"/"trojan" 等
+                    virus_type_at_target = v_info.get("type", "virus")
+
+            # —— 如果是 hack 防御动作，先在环境还没变之前把 hack_type 读出来 —— #
+            hack_type_at_target = None
+            if action["type"] == ACTION_HACK_DEFENSE:
+                tx, ty = action["target"]
+                # 先从 env.hacks 中安全地拿一次类型
+                info = self.env.hacks.get((tx, ty))
+                if info is not None:
+                    hack_type_at_target = info.get("type", None)
+                # 如果这一点本身不存在在 hacks 里，就可留 None／""，到后面再处理
+
             hit = self._apply_and_reward(unit, action)
             x, y = action["target"]
 
@@ -2052,26 +2072,39 @@ class ImmuneCogGraph(CogGraph):
                 # 全局累计
                 self.hack_kill_stats[src] += 1
                 # —— 新增：按黑客类型分类统计 —— #
-                hack_type = self.env.hacks.get((x, y), {}).get("type", "unknown")
+                # —— 这里，优先使用刚才提前读到的 hack_type_at_target —— #
+                if hack_type_at_target is None:
+                    # 如果之前没读到，就兜底再从 env.hack_history 或者 env.hacks 里取一次
+                    info2 = self.env.hacks.get((x, y))
+                    hack_type_at_target = info2.get("type", "unknown") if info2 else "unknown"
+
+                # 放到分类型统计里
                 bucket = self.hack_kill_stats_by_type.setdefault(
-                    hack_type, {"self_direct": 0, "guided": 0}
+                    hack_type_at_target or "unknown",
+                    {"self_direct": 0, "guided": 0}
                 )
                 bucket[src] += 1
 
 
-            # 记录 virus 清理
+            # —— 记录“病毒清理”统计 —— #
             if action["type"] == ACTION_BLOCK and hit:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
                 # 全局累计
                 self.kill_stats[src] += 1
-                # —— 新增：按病毒类型分类统计 —— #
-                virus_type = "virus"  # 如有多种，可从环境或 action 中提取
+
+                # 如果一开始没能读到 subtype，就再兜底从 env.attacks 里查一次
+                if virus_type_at_target is None:
+                    v_info2 = self.env.attacks.get((x, y))
+                    virus_type_at_target = v_info2.get("type", "virus") if v_info2 else "virus"
+
+                # 用真实 subtype 更新分类型统计
                 bucket_v = self.virus_kill_stats_by_type.setdefault(
-                    virus_type, {"self_direct": 0, "guided": 0}
+                    virus_type_at_target, {"self_direct": 0, "guided": 0}
                 )
                 bucket_v[src] += 1
+
                 unit.cleared_positions.add((x, y))
-                logger.debug(f"[清除记录] emitter {unit.id} 在 {(x, y)} 清除了一个病毒 ({src})")
+                logger.debug(f"[清除记录] emitter {unit.id} 在 {(x, y)} 清除了一个{virus_type_at_target}型病毒 ({src})")
 
     def _decode_action_from_output(self, unit, output_vec):
         size = self.env.size
