@@ -361,6 +361,8 @@ class ImmuneCogGraph(CogGraph):
     def _build_global_nets(self, seq_len: int):
         """
         构建（或重建）CogGraph 的三条主干网络，并自动同步 hidden_size。
+        这里把 emitter_net 输出维度从 seq_len → 3*seq_len，分别对应
+        [MOVE, BLOCK, HACK_DEFENSE] × 每个格子。
         """
         # 新：用实例属性中计算好的总输入通道数
         D_in = seq_len * self._INPUT_CHANNELS
@@ -371,32 +373,32 @@ class ImmuneCogGraph(CogGraph):
             nn.ReLU(),
         ).to(self.device)
 
-        # 2) processor_net：刚从 sensor_net 拿到的 out_features → emitter_hidden_size
+        # 2) processor_net：processor_hidden_size → emitter_hidden_size
         self.processor_net = nn.Sequential(
             nn.Linear(self.sensor_net[0].out_features, self.emitter_hidden_size),
             nn.ReLU(),
         ).to(self.device)
 
-        # 3) emitter_net：processor_net 的 out_features → seq_len
+        # 3) emitter_net：emitter_hidden_size → 3 * seq_len （三种动作 × 每个格子）
         self.emitter_net = nn.Sequential(
-            nn.Linear(self.processor_net[0].out_features, seq_len),
+            nn.Linear(self.processor_net[0].out_features, 3 * seq_len),
         ).to(self.device)
 
         # —— 同步子类的 hidden_size 属性 —— #
         self.processor_hidden_size = self.sensor_net[0].out_features
-        self.emitter_hidden_size  = self.processor_net[0].out_features
+        self.emitter_hidden_size = self.processor_net[0].out_features
 
+        # 如果之前编译版存在，删掉
         if hasattr(self, "_compiled_sensor_net"):
             del self._compiled_sensor_net
         if hasattr(self, "_compiled_processor_net"):
             del self._compiled_processor_net
 
-
+        # 重新编译（可选）
         try:
             self._sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
         except:
             self._sensor_net = self.sensor_net
-
 
     def _run_sensor_scans(self):
         """
@@ -416,7 +418,7 @@ class ImmuneCogGraph(CogGraph):
         # 3) 按阈值取整 → 0/1 探测结果
         #    prob_maps[0,0] 对应“感染概率通道”；> thresh 就认为是“感染点”
         #    prob_maps[0,1] 对应“提权概率通道”；> thresh 就认为是“hack 点”
-        thresh = 0.5  # 你可以调节，或把它做成超参数
+        thresh = 0.04  # 你可以调节，或把它做成超参数
         inf_pred  = (prob_maps[0, 0] > thresh).to(torch.bool)  # [H, W] bool
         hack_pred = (prob_maps[0, 1] > thresh).to(torch.bool)  # [H, W] bool
 
@@ -499,13 +501,17 @@ class ImmuneCogGraph(CogGraph):
             self.sensor_net[0] = new_sensor
 
         ############################
-        #（2）emitter_net 第一层 (Linear: hidden → old_seq) 要扩到 hidden → new_seq
+        # —— （2）emitter_net 第一层要从 hidden → (3*old_seq) 扩到 hidden → (3*new_seq) —— #
         emit_layer = self.emitter_net[0]
         old_in_e, old_out_e = emit_layer.in_features, emit_layer.out_features
-        if new_seq > old_out_e:
-            new_emit = nn.Linear(old_in_e, new_seq, bias=(emit_layer.bias is not None)).to(self.device)
+        # 旧的 seq_len 大小 = old_out_e // 3
+        old_seq = old_out_e // 3
+        # 如果 new_seq > old_seq，说明要扩容
+        if new_seq > old_seq:
+            new_out = 3 * new_seq
+            new_emit = nn.Linear(old_in_e, new_out, bias=(emit_layer.bias is not None)).to(self.device)
             with torch.no_grad():
-                # 把旧权重前 old_out_e 行拷过去
+                # 把原先 3*old_seq 行的权重全部 copy 过去
                 new_emit.weight[:old_out_e, :].copy_(emit_layer.weight)
                 if emit_layer.bias is not None:
                     new_emit.bias[:old_out_e].copy_(emit_layer.bias)
@@ -1097,11 +1103,11 @@ class ImmuneCogGraph(CogGraph):
             p.hotspots = set()
         return proc_out
 
-
-
     def emitter_forward(self, proc_out: torch.Tensor):
         """
         支持「全局共享」或「各自网络」两种模式。
+        现在 proc_out → emitter_net → [batch, 3*seq_len]。
+        把 e.last_output 设置为长度 3*seq_len 的一维张量，供解码使用。
         """
         if proc_out.dim() == 1:
             proc_out = proc_out.unsqueeze(0)
@@ -1124,26 +1130,25 @@ class ImmuneCogGraph(CogGraph):
                 batch_in.append(vec.unsqueeze(0))
             if not batch_in:
                 return None
-            batch = torch.cat(batch_in, dim=0)
-            logits = self.emitter_net(batch)
+            batch = torch.cat(batch_in, dim=0)  # [num_emitters, H_e]
+            logits = self.emitter_net(batch)  # [num_emitters, 3*seq_len]
             for e, lg in zip(emitters, logits):
-                e.last_output = lg.detach()
+                e.last_output = lg.detach()  # 一维 [3*seq_len]
             return logits
 
         # —— 独立 emitter_net —— #
         logits_list = []
         for e in emitters:
             self.expand_unit_dim(e, H_e)
-            # 如果 e 没有 emitter_net，就降级用全局的 self.emitter_net
             net = e.emitter_net if hasattr(e, "emitter_net") else self.emitter_net
-            lg  = net(vec.unsqueeze(0))  # [1, seq_len]
-            e.last_output = lg.detach().squeeze(0)
+            lg = net(vec.unsqueeze(0))  # [1, 3*seq_len]
+            e.last_output = lg.detach().squeeze(0)  # [3*seq_len]
             logits_list.append(lg)
         if not logits_list:
             return None
-        logits = torch.cat(logits_list, dim=0)
-        return logits
 
+        logits = torch.cat(logits_list, dim=0)  # [num_emitters, 3*seq_len]
+        return logits
 
     def expand_unit_dim(self, unit, new_in: int):
         """
@@ -1287,9 +1292,15 @@ class ImmuneCogGraph(CogGraph):
         first_proc = next(m for m in self.processor_net.modules() if isinstance(m, nn.Linear))
         self.processor_net[0] = expand_linear(first_proc, new_in=self.sensor_net[0].out_features)
 
-        # emitter_net: 第一层 in_features 扩 to processor_net.out
+        # emitter_net: 第一个 Linear 从 (in→3*old_seq) 扩到 (in→3*new_seq)
         first_emit = next(m for m in self.emitter_net.modules() if isinstance(m, nn.Linear))
-        self.emitter_net[0] = expand_linear(first_emit, new_in=self.processor_net[0].out_features)
+        old_out = first_emit.out_features  # = 3 * old_seq
+        new_out = 3 * seq_len  # seq_len = new 环境的 size²
+        self.emitter_net[0] = expand_linear(
+            first_emit,
+            new_in=self.processor_net[0].out_features,
+            new_out=new_out
+        )
 
         # 5) buffer 重分配
         self._D_env = D_env
@@ -1563,7 +1574,7 @@ class ImmuneCogGraph(CogGraph):
         self._maybe_report_by_stage()
 
         if self.current_step % 500 == 0:
-            batch_size = 32
+            batch_size = 10
             # buffer 不够就跳过
             if len(self.rl_buffer) < batch_size:
                 logger.warning(f"[PER 跳过] RL buffer 大小 {len(self.rl_buffer)} < {batch_size}")
@@ -1933,12 +1944,10 @@ class ImmuneCogGraph(CogGraph):
         if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
             self.rl_buffer.append(transition, priority)
 
-        # A2C 更新
-        self.policy_update(state_tensor, self.last_flat_idx, total_reward)
+        # # A2C 更新
+        # self.policy_update(state_tensor, self.last_flat_idx, total_reward)
 
-        return hit
-
-
+        return total_reward
 
     def _record_antibody_effectiveness(self, action: dict, feat: torch.Tensor):
         """判断抗体动作是否成功清除感染，并更新计数器"""
@@ -2027,7 +2036,10 @@ class ImmuneCogGraph(CogGraph):
             # 3) 如果 emitter 确实存在 personal_goal，再检查是否到达
             if u.role == "emitter" and hasattr(u, "personal_goal") and u.personal_goal:
                 out = u.get_output().flatten()
-                pred = torch.argmax(out).item()
+                seq_len = self.env.size * self.env.size
+                # 只对 “MOVE” 那前 seq_len 维做 argmax
+                move_logits = out[:seq_len]
+                pred = torch.argmax(move_logits).item()
                 # 把 flat 索引转换成 (x,y)
                 goal_x, goal_y = u.personal_goal
                 px = pred % self.env.size
@@ -2281,134 +2293,92 @@ class ImmuneCogGraph(CogGraph):
                 u.meta.record(action="timeout_penalty", reward=-penalty)
         self.punished_map &= (self.env.infected_map > 0)
 
-
     def _run_emitter_actions(self):
+        size = self.env.size
+        seq_len = size * size
+
+        # 先把当前环境状态打平成 [1, D_env]，供后续 policy_update 使用
+        raw = self.env.get_state_tensor()  # [C, H, W]
+        state_tensor = raw.view(1, -1).to(self.device)  # [1, D_env]
+
         for unit in self.units:
             if unit.role != "emitter" or not hasattr(unit, "get_output"):
                 continue
 
             unit.guided_this_round = False
-            action_vec = unit.get_output()
+            action_vec = unit.get_output()  # 长度 3*seq_len
             action = self._decode_action_from_output(unit, action_vec)
 
-            # 如果是“移动”动作，先移动并重新解码
-            if action and action["type"] == "move":
-                unit.position = action["target"]
-                action = self._decode_action_from_output(unit, action_vec)
+            # 先把 act_type 和 flat_idx_cell 都算出来
+            if action["type"] == "move":
+                act_type = 0
+            elif action["type"] == ACTION_BLOCK:
+                act_type = 1
+            else:  # ACTION_HACK_DEFENSE
+                act_type = 2
 
-            if not action or action["type"] == "move":
+            x, y = action["target"]
+            flat_idx_cell = y * size + x  # [0..seq_len-1]
+            flat_for_rl = act_type * seq_len + flat_idx_cell  # [0..3*seq_len-1]
+
+            # MOVE 分支：先移动，然后 continue，不做奖励
+            if action["type"] == "move":
+                unit.position = (x, y)
                 continue
 
-            # 先把 flat_idx 记录下来（供 A2C 用）
-            x, y = action["target"]
-            size = self.env.size
-            self.last_flat_idx = y * size + x
+            # BLOCK 或 HACK_DEFENSE 分支：调用 _apply_and_reward，得到 total_reward
+            total_reward = self._apply_and_reward(unit, action)
 
-            # —— 直接把所有的清理/统计工作交给 _apply_and_reward —— #
-            hit = self._apply_and_reward(unit, action)
-
-            # -------- 注意：**这里不再做任何额外的“中心统计”** --------
-            # （原来在这里对 action["type"]==ACTION_BLOCK／HACK_DEFENSE、hit==True 的
-            #  再次把 kill_stats/virus_kill_stats_by_type++，已经全部迁移到 _apply_and_reward 里了）
-            #
-            # 例如，原来可能有：
-            #     if action["type"] == ACTION_BLOCK and hit:
-            #         self.kill_stats[...] +=1
-            #         ...
-            #         unit.cleared_positions.add((x, y))
-            #
-            # 这一整段都要删掉，确保“一次清理 → 一处统计”。
-
-
-
+            # 最后把完整的扁平下标（含动作类型）传给 policy_update
+            # 注意：state_tensor 需要在外面预先定义。示例里假设它一直在作用域里。
+            self.policy_update(state_tensor, flat_for_rl, total_reward)
 
     def _decode_action_from_output(self, unit, output_vec):
         """
-        让Emitter“学会”自己根据网络输出决定下一步移动：
-          1. 先根据 output_vec.argmax() 得到一个 flat_idx → (tx, ty)；
-          2. 如果 unit.personal_goal 存在并且距离 personal_goal ≤1，进入硬编码的 3×3 清理/隔离 逻辑；
-             （发现附近 hack → hack_defense；否则发现附近 virus → block；都没发现 → quarantine，同时把个人目标清空）
-          3. 否则，无论有没有 personal_goal，都让网络输出的 (tx,ty) 决定下一步“朝它”迈一步。
+        现在 output_vec.shape = (3*seq_len,)，我们把它视作
+          [ row 0: MOVE logits (seq_len),
+            row 1: BLOCK logits (seq_len),
+            row 2: HACK_DEFENSE logits (seq_len) ] 扁平拼接后得到的长度 3*seq_len。
+
+        1) argmax 得到 flat ∈ [0..3*seq_len)
+        2) act_type = flat // seq_len  （0=MOVE, 1=BLOCK, 2=HACK_DEFENSE）
+        3) flat_idx  = flat % seq_len  （格子索引）
+        4) (tx, ty) = (flat_idx % size, flat_idx // size)
+        5) 返回对应动作字典：
+           - MOVE → {"type":"move", "target":(nx,ny) 或 (tx,ty)}
+           - BLOCK → {"type":ACTION_BLOCK, "target":(tx,ty)}
+           - HACK_DEFENSE → {"type":ACTION_HACK_DEFENSE, "target":(tx,ty)}
         """
         size = self.env.size
-        ux, uy = unit.position  # 当前 Emitter 位置
+        seq_len = size * size
+        ux, uy = unit.position  # 当前 Emitter 所在坐标
 
-        # —— 1) 先用网络输出选一个“意图目标” flat_idx —— #
-        flat_idx = torch.argmax(output_vec).item()
+        # 1) 从 output_vec 中拆出动作类型和格子索引
+        flat = torch.argmax(output_vec).item()  # 介于 [0, 3*seq_len)
+        act_type = flat // seq_len  # 0=MOVE, 1=BLOCK, 2=HACK_DEFENSE
+        flat_idx = flat % seq_len  # 0..seq_len-1
         tx = flat_idx % size
         ty = flat_idx // size
 
-        # # —— 2) 如果 personal_goal 存在，且当前离它的曼哈顿距离 ≤1，就进入硬编码清理/隔离 —— #
-        # if hasattr(unit, "personal_goal") and unit.personal_goal is not None:
-        #     goal_x, goal_y = unit.personal_goal
-        #     dist_to_goal = abs(ux - goal_x) + abs(uy - goal_y)
-        #
-        #     if dist_to_goal <= 1:
-        #         # 到达 personal_goal 附近，先在 3×3 区域寻找 hack
-        #         H, W = self.env.infected_map.shape  # 地图尺寸
-        #         # 优先查 hack
-        #         for dy in (-1, 0, 1):
-        #             for dx in (-1, 0, 1):
-        #                 cx = ux + dx
-        #                 cy = uy + dy
-        #                 if 0 <= cx < W and 0 <= cy < H and self.env.privilege_level[cy, cx] > 0.004:
-        #                     # 在周围找到一个 hack，就执行 hack_defense
-        #                     # 并把 personal_goal 清空，下轮重新分配
-        #                     unit.personal_goal = None
-        #                     unit.goal_type = None
-        #                     return {"type": ACTION_HACK_DEFENSE, "target": (cx, cy)}
-        #         # 如果没找到 hack，再在 3×3 区域找 virus
-        #         for dy in (-1, 0, 1):
-        #             for dx in (-1, 0, 1):
-        #                 cx = ux + dx
-        #                 cy = uy + dy
-        #                 if 0 <= cx < W and 0 <= cy < H and self.env.infected_map[cy, cx] > 0.004:
-        #                     # 找到 virus，就执行 block
-        #                     unit.personal_goal = None
-        #                     unit.goal_type = None
-        #                     return {"type": ACTION_BLOCK, "target": (cx, cy)}
-        #         # 既没 hack 也没 virus，就在原地隔离一次，并把 personal_goal 清空
-        #         unit.personal_goal = None
-        #         unit.goal_type = None
-        #         return {"type": ACTION_QUARANTINE, "target": (ux, uy)}
+        # 2) 根据 act_type 决定返回哪个 action
+        if act_type == 0:
+            # MOVE：如果距离大于 1，就只能一步迈向 (tx,ty)；否则一步到位
+            if abs(tx - ux) + abs(ty - uy) > 1:
+                nx = ux + (1 if tx > ux else -1) if tx != ux else ux
+                ny = uy + (1 if ty > uy else -1) if ty != uy else uy
+                nx = max(0, min(nx, size - 1))
+                ny = max(0, min(ny, size - 1))
+                return {"type": "move", "target": (nx, ny)}
+            else:
+                return {"type": "move", "target": (tx, ty)}
 
-        # —— 3) 其余情况：由网络输出 (tx,ty) 决定下一步朝它迈一步 —— #
-        # 如果网络预测的 (tx,ty) 与当前位置相距 >1，就只走一步
-        if abs(tx - ux) + abs(ty - uy) > 1:
-            # 按原逻辑先计算出 nx, ny
-            nx = ux + (1 if tx > ux else -1) if tx != ux else ux
-            ny = uy + (1 if ty > uy else -1) if ty != uy else uy
-
-            # —— clamp 到合法范围 —— #
-            size = self.env.size
-            nx = max(0, min(nx, size - 1))
-            ny = max(0, min(ny, size - 1))
-
-            return {"type": "move", "target": (nx, ny)}
+        elif act_type == 1:
+            # BLOCK：让环境在 (tx,ty) 做一次 3×3 範围内的病毒清理
+            return {"type": ACTION_BLOCK, "target": (tx, ty)}
 
         else:
-            # —— 3) 否则（距离 ≤ 1），以 (tx,ty) 为中心扫描它的 3×3 区域 —— #
-            H, W = self.env.infected_map.shape
-            # 先看 hack
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    cx = tx + dx
-                    cy = ty + dy
-                    if 0 <= cx < W and 0 <= cy < H and self.env.privilege_level[cy, cx] > 0.004:
-                        return {"type": ACTION_HACK_DEFENSE, "target": (cx, cy)}
-
-            # 再看 virus
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    cx = tx + dx
-                    cy = ty + dy
-                    if 0 <= cx < W and 0 <= cy < H and self.env.infected_map[cy, cx] > 0.004:
-                        return {"type": ACTION_BLOCK, "target": (cx, cy)}
-
-            # 九宫格里都没有 hack/virus，就隔离当前位置
-            unit.personal_goal = None
-            unit.goal_type = None
-            return {"type": ACTION_QUARANTINE, "target": (ux, uy)}
+            # HACK_DEFENSE：让环境在 (tx,ty) 做一次 3×3 範围内的黑客清理
+            return {"type": ACTION_HACK_DEFENSE, "target": (tx, ty)}
 
     def _argmax_position(self, output_vec):
         """
@@ -2477,67 +2447,60 @@ class ImmuneCogGraph(CogGraph):
             hack_maps.append(mask)
         hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
 
-        # 3) 拼接
+        # 3) 拼接为 full_state
         full_state = torch.cat([env_flat, hack_flat, goal_flat], dim=1)
 
-        # 4) 前向算 logits
+        # 4) 前向算 logits，这里 emitter_net 输出 [1, 3*seq_len]
         sensor_out = self.sensor_forward(full_state)
         proc_out = self.processor_forward(sensor_out)
-        logits = self.emitter_net(proc_out)  # [1, seq_len]
-        probs = torch.softmax(logits, dim=-1)
+        logits = self.emitter_net(proc_out)  # [1, 3*seq_len]
+        probs = torch.softmax(logits, dim=-1)  # [1, 3*seq_len]
 
-        # —— 新增：保证索引合法 —— #
-        seq_len = probs.size(1)
-        flat_idx = flat_idx % seq_len  # 或者用 min(flat_idx, seq_len-1)
+        # —— 保证索引合法 —— #
+        max_len = probs.size(1)
+        flat_idx = flat_idx % max_len  # 限制在 [0..3*seq_len-1]
 
-        # —— 5) A2C 更新 —— #
+        # —— A2C 更新 —— #
         # 5.1) 计算 log π(a|s)
         log_p = torch.log(probs[0, flat_idx] + 1e-8)
 
+        # 5.2) Critic：估计 V(s) 并计算优势 A = R − V(s)
         D_in = full_state.size(1)
-        # 先拿到旧的层
         old_v = self.value_head
         old_in, _ = old_v.in_features, old_v.out_features
         new_in = D_in
         if new_in > old_in:
-            # 构造新的更大输入维度层
+            # 如果维度不匹配，就扩容 value_head
             new_v = nn.Linear(new_in, 1, bias=(old_v.bias is not None)).to(self.device)
-            # 把旧权重和偏置拷过去
             with torch.no_grad():
                 new_v.weight[:, :old_in].copy_(old_v.weight)
                 if old_v.bias is not None:
                     new_v.bias.copy_(old_v.bias)
             self.value_head = new_v
-
-            # 把 optimizer 的参数列表替换成新的 layer，保留 state（动量等）
             for group in self.value_optimizer.param_groups:
                 group['params'] = [self.value_head.weight, self.value_head.bias]
 
-        # 5.2) 估计 V(s) 并计算优势 A = R − V(s)
-        # full_state 在前面已经拼接过：[1, full_state_dim]
-        value = self.value_head(full_state).squeeze(0)       # shape=[1] → scalar
+        value = self.value_head(full_state).squeeze(0)  # [1] → scalar
         advantage = reward - value.detach()
 
-        # 5.3) Actor loss 与 Critic loss
-        actor_loss  = -log_p * advantage
+        # 5.3) Actor loss & Critic loss
+        actor_loss = -log_p * advantage
         critic_loss = F.mse_loss(value, torch.tensor([reward], device=self.device))
 
-        # —— 新增 entropy bonus —— #
-        # 这里我们需要重新构造分布，以便计算熵
+        # —— 熵正则 —— #
         dist = torch.distributions.Categorical(logits=logits)
-        entropy = dist.entropy().mean()  # 标量
+        entropy = dist.entropy().mean()
 
-        # 合成总 loss
-        total_loss = actor_loss \
-                     + 0.5 * critic_loss \
-                     - self.entropy_coef * entropy
+        total_loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy
 
-        # 5.4) 联合反向、更新
+        # 5.4) 反向更新
         self.policy_optimizer.zero_grad()
         self.value_optimizer.zero_grad()
         total_loss.backward()
         self.policy_optimizer.step()
         self.value_optimizer.step()
+
+
 
 
 
