@@ -198,7 +198,7 @@ class GridSecurityEnv:
             decay_mask = torch.rand_like(self.visited_map, dtype=torch.float32) < 0.1  # 10% decay
             self.visited_map[decay_mask] = False
         # 更新感染持续时间：+1 或清零
-        new_infected = self.infected_map > 0.5
+        new_infected = self.infected_map > 0.04
         self.infected_duration_map[new_infected] += 1
         self.infected_duration_map[~new_infected] = 0
 
@@ -210,14 +210,14 @@ class GridSecurityEnv:
         new_attacks = {}
 
         # 先算当前感染点数 & 分段上限
-        curr = int((self.infected_map > 0.5).sum().item())
+        curr = int((self.infected_map > 0.04).sum().item())
         if   self.step_count < 1000: max_inf = 10
         elif self.step_count < 2000: max_inf = 20
         elif self.step_count < 5000: max_inf = 40
         else:                        max_inf = float('inf')
         if self.step_count >= 0:
             # ────────── 1) 4-邻扩散：一次卷积完成 ──────────
-            infected = (self.infected_map > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+            infected = (self.infected_map > 0.04).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
             kernel = torch.tensor([[0, 1, 0],
                                    [1, 1, 1],
                                    [0, 1, 0]],
@@ -270,7 +270,7 @@ class GridSecurityEnv:
 
             # —— 如果总步数 < 2000，需要保证“总感染数 ≤ 20” —— #
             if self.step_count < 2000:
-                curr_inf = int((self.infected_map > 0.5).sum().item())
+                curr_inf = int((self.infected_map > 0.04).sum().item())
                 remain_slots = 20 - curr_inf
                 if remain_slots <= 0:
                     new_inf = torch.zeros_like(raw_new_inf)
@@ -310,7 +310,7 @@ class GridSecurityEnv:
 
                 # —— burst 新增也要受“前 2000 步 ≤20 个”限制 —— #
                 if self.step_count < 2000:
-                    curr_inf2 = int((self.infected_map > 0.5).sum().item())
+                    curr_inf2 = int((self.infected_map > 0.04).sum().item())
                     remain2 = 20 - curr_inf2
                     if remain2 <= 0:
                         burst_new = torch.zeros_like(raw_burst)
@@ -338,10 +338,10 @@ class GridSecurityEnv:
 
         self.attack_history.clamp_(0, 10)
 
-        curr = int((self.infected_map > 0.5).sum().item())
+        curr = int((self.infected_map > 0.04).sum().item())
 
         # 代替固定间隔触发入侵
-        spawn_chance = 4 / self.spawn_interval  # e.g. 每步有 20/200 概率
+        spawn_chance = 1 / self.spawn_interval  # e.g. 每步有 1/200 概率
         if curr < max_inf and random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 

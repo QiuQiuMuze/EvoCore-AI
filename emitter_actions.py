@@ -77,7 +77,7 @@ class EmitterActions:
                 after = env.infected_map[ny, nx].item()
 
                 # 如果确实从“感染”变成“无感染”，就为对应的 emitter 记录 cleared_positions
-                if before > 0.5 and after == 0.0:
+                if before > 0.04 and after == 0.0:
                     # env._external_units 通常是所有外部注册到环境的单元列表
                     for u in getattr(env, "_external_units", []):
                         if getattr(u, "role", None) == "emitter" and getattr(u, "position", None) == (nx, ny):

@@ -109,6 +109,8 @@ class ImmuneCogGraph(CogGraph):
         self._update_target_vector()
         self.last_report_stage = None
         self.hack_kill_stats = {"self_direct": 0, "guided": 0}
+        # —— 新增：连续无感染计数器 —— #
+        self.zero_infection_counter = 0
         # 追踪各黑客类型的击杀数
         self.hack_kill_stats_by_type = {}
         # --- 可学习的黑客类型权重 embedding ---
@@ -406,10 +408,10 @@ class ImmuneCogGraph(CogGraph):
             while idx < len(cells):
                 x, y = cells[idx]
                 # 只要 env.infected_map[y,x] > 0.5，就认为这里是“感染格”
-                if self.env.infected_map[y, x] > 0.5:
+                if self.env.infected_map[y, x] > 0.04:
                     self.known_infections.add((x, y))
                 # 只要 env.privilege_level[y,x] > 0.05，就认为这里是“提权（黑客）格”
-                if self.env.privilege_level[y, x] > 0.05:
+                if self.env.privilege_level[y, x] > 0.04:
                     self.known_hacks.add((x, y))
                 idx += S
 
@@ -432,7 +434,7 @@ class ImmuneCogGraph(CogGraph):
 
         # —— 2. 病毒痕迹触发唤醒——
         tensor_state = self.env.get_state_tensor()
-        infected_count = (tensor_state[0] > 0.5).sum().item()  # 通道0：是否感染
+        infected_count = (tensor_state[0] > 0.04).sum().item()  # 通道0：是否感染
         if self.static_mode and infected_count >= 1:
             logger.warning(f"[静息唤醒] 来敌人啦，快干他！检测到病毒痕迹，感染点数 = {infected_count}")
             self._exit_static_mode()
@@ -1692,7 +1694,7 @@ class ImmuneCogGraph(CogGraph):
                     cy = cy0 + dy
                     if 0 <= cx < W and 0 <= cy < H:
                         before_inf = self.env.infected_map[cy, cx].item()
-                        if before_inf > 0.5:
+                        if before_inf > 0.04:
                             # 只有在 before_inf>0.5 才执行，否则连 perform 都不调也节省时间
                             self.emitter_actions.perform({
                                 "type": ACTION_BLOCK,
@@ -1709,7 +1711,7 @@ class ImmuneCogGraph(CogGraph):
 
                                 # 按病毒类型累加
                                 v_info = self.env.attacks.get((cx, cy))
-                                virus_type = v_info.get("type", "virus") if v_info is not None else "virus"
+                                virus_type = v_info.get("type", "virus") if v_info is not None else "扩散点"
                                 bucket_v = self.virus_kill_stats_by_type.setdefault(
                                     virus_type, {"self_direct": 0, "guided": 0}
                                 )
@@ -1734,8 +1736,8 @@ class ImmuneCogGraph(CogGraph):
             self.emitter_actions.perform(action)
             after_priv = self.env.privilege_level[y, x].item()
             after_stealth = self.env.hack_strength[y, x].item()
-            hit = ((before_priv > 0.05 and after_priv == 0.0) or
-                   (before_stealth > 0.05 and after_stealth == 0.0))
+            hit = ((before_priv > 0.04 and after_priv == 0.0) or
+                   (before_stealth > 0.04 and after_stealth == 0.0))
             if hit:
                 # 累加 hack 统计
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
@@ -1828,7 +1830,7 @@ class ImmuneCogGraph(CogGraph):
         infected_after = env_clone.infected_map[y, x].item()
 
         # --- 5) 根据 before/after 判定 success ---
-        success = (infected_before > 0.5 and infected_after == 0.0)
+        success = (infected_before > 0.04 and infected_after == 0.0)
         if success:
             self.antibody_success_count += 1
         else:
@@ -1925,9 +1927,21 @@ class ImmuneCogGraph(CogGraph):
           - 在同一次循环里，对未清除提权的 emitter 单独扣能量
           - 新增：对刚连续3回合未被清理的病毒点，扣最近 emitter 能量
         """
-        # --- A. 靠近病毒微奖励 / 远离扣分 ---------------------------------
+        # ==== 新增：如果连续 100 步“感染格数为 0”，给全体细胞（所有单元）+1.0 能量奖励 ====
+        curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
+        if curr_inf_count == 0:
+            self.zero_infection_counter += 1
+        else:
+            self.zero_infection_counter = 0
 
-        # —— A. 批量靠近病毒小奖 / 离开撤销 ——
+        if self.zero_infection_counter >= 100:
+            for u in self.units:
+                u.energy += 1.0
+                u.meta.record(action="zero_infection_bonus", reward=1.0)
+            self.zero_infection_counter = 0
+        # ====================================================================================
+
+        # --- A. 靠近病毒微奖励 / 远离扣分 ---------------------------------
         emitters = [u for u in self.units if u.role == "emitter" and hasattr(u, "position")]
         # 预先构造 emitter 坐标张量，后面 B/C 段都能重用
         if emitters:
@@ -2026,7 +2040,7 @@ class ImmuneCogGraph(CogGraph):
         # —— 3) 收集当前仍处于提权状态的位置 —— #
         priv_positions = {
             (x.item(), y.item())
-            for y, x in torch.nonzero(self.env.privilege_level > 0.05)
+            for y, x in torch.nonzero(self.env.privilege_level > 0.04)
         }
         penalty_per_node = 0.2  # 每个未清除提权节点，对应 emitter 扣的能量
 
@@ -2113,7 +2127,7 @@ class ImmuneCogGraph(CogGraph):
             # ----------------------------------------------------------
 
         # —— 6) 黑客防御奖励 —— #
-        cleared_priv = (prev_priv > 0.05).sum() - (self.env.privilege_level > 0.05).sum()
+        cleared_priv = (prev_priv > 0.04).sum() - (self.env.privilege_level > 0.04).sum()
         reduced_vuln = (prev_vuln - self.env.vulnerability).clamp(min=0).sum()
         reduced_fail = (prev_fail - self.env.login_failures).clamp(min=0).sum()
         hack_reward = (

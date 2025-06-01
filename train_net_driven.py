@@ -112,7 +112,7 @@ def main(cfg):
         # 记录上一步环境中“已有多少感染 / 有多少活跃 hack”
         # （这些变量只用来给打印看，真正清除数下面通过 graph.kill_stats_by_type 计算）
         last_inf  = env.infected_map.sum().item()
-        last_hack = (env.privilege_level > 0.05).sum().item()
+        last_hack = (env.privilege_level > 0.04).sum().item()
 
         # 用于“每 1000 步将 累计清除计数 滚动归零”的辅助量
         last_reset_step = global_step
