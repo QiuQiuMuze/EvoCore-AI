@@ -2037,7 +2037,7 @@ class ImmuneCogGraph(CogGraph):
             cleared = len(getattr(u, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-                reward = 1.2 * cleared
+                reward = 0.4 * cleared
                 if getattr(u, "guided_this_round", False):
                     reward *= GUIDED_FACTOR  # ← guided 击杀折扣
                 u.energy += reward
