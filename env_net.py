@@ -52,15 +52,15 @@ class GridSecurityEnv:
 
         # 支持的攻击类型及参数
         self.attack_types = {
-            'worm':    {'spread_prob': 0.4, 'stealth': 0.0, 'burst': False},
-            'trojan':  {'spread_prob': 0.1, 'stealth': 0.6, 'burst': False},
+            'worm':    {'spread_prob': 0.2, 'stealth': 0.0, 'burst': False},
+            'trojan':  {'spread_prob': 0.05, 'stealth': 0.6, 'burst': False},
             'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.5, 'burst_area': 3},
-            'ransom':  {'spread_prob': 0.2, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'apt':     {'spread_prob': 0.3, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
+            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
+            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
         }
 
         self.attacks = {}
-        self.hack_spawn_interval = 10
+        self.hack_spawn_interval = 50
         self.hack_types = {
             'bruteforce':      {'spawn_prob': 0.02, 'max_fail': 5},
             'phishing':        {'spawn_prob': 0.01, 'stealth':0.8},
@@ -217,70 +217,83 @@ class GridSecurityEnv:
         else:                        max_inf = float('inf')
         if self.step_count >= 0:
             # ────────── 1) 4-邻扩散：一次卷积完成 ──────────
-            infected = (self.infected_map > 0.5).float().unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
+            infected = (self.infected_map > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
             kernel = torch.tensor([[0, 1, 0],
                                    [1, 1, 1],
                                    [0, 1, 0]],
-                                  dtype=infected.dtype,  # <-- 关键
+                                  dtype=infected.dtype,
                                   device=self.device).view(1, 1, 3, 3)
 
-            nbr_cnt  = F.conv2d(infected, kernel, padding=1).squeeze()               # [H,W]
-            cand     = (nbr_cnt > 0) & (self.infected_map == 0) & (self.is_quarantined == 0)
+            nbr_cnt = F.conv2d(infected, kernel, padding=1).squeeze()  # [H,W]
+            cand = (nbr_cnt > 0) & (self.infected_map == 0) & (self.is_quarantined == 0)
 
-            # spread_prob_map：同一格只要有邻居感染，就取邻居里**最大的** spread_prob
+            # —— 按阶段设定扩散倍率 factor_spread —— #
+            if self.step_count < 1000:
+                factor_spread = 0.5
+            elif self.step_count < 2000:
+                factor_spread = 1.0
+            else:
+                factor_spread = 2.0
+
+            # ────────── 2) 计算 spread_prob_map ──────────
             spread_prob_map = torch.zeros_like(self.infected_map)
-            if self.attacks:                                  # self.attacks 是 dict[(x,y)]→info
-                # 先准备一张 “当前每格攻击类型 id” 的矩阵
+            if self.attacks:
+                # 构造“类型矩阵”：type_map[y,x] = idx_of_attack_type
                 type_map = torch.full_like(self.infected_map, -1, dtype=torch.long)
                 for (x, y), info in self.attacks.items():
-                    type_idx = list(self.attack_types).index(info['type'])   # 0,1,2…
+                    type_idx = list(self.attack_types).index(info['type'])
                     type_map[y, x] = type_idx
 
+                # difficulty = min(1.0, self.step_count / self.difficulty_ramp) （在 step 最前面已经算过）
+                prob_seed = torch.zeros_like(self.infected_map)
                 for idx, (t, p) in enumerate(self.attack_types.items()):
-                    if p['spread_prob'] == 0:        # 没有扩散能力
+                    base_p = p['spread_prob']
+                    if base_p <= 0:
                         continue
-                    mask = (type_map == idx)
-                    if mask.any():
-                        spr = p['spread_prob'] * (1 + difficulty * 0.5)
-                        spread_prob_map = torch.where(mask, torch.full_like(spread_prob_map, spr), spread_prob_map)
+                    # 将 base_p 先乘以 (1 + difficulty*0.5)，再乘我们自定义的 factor_spread
+                    spr = base_p * (1 + difficulty * 0.5) * factor_spread
+                    prob_seed[type_map == idx] = spr
 
-                # ---------- 计算 spread_prob_map（同一格取邻居中最大的 spread_prob） ----------
-                if self.attacks:
-                    type_map = torch.full_like(self.infected_map, -1, dtype=torch.long)
-                    for (x, y), info in self.attacks.items():
-                        type_idx = list(self.attack_types).index(info['type'])
-                        type_map[y, x] = type_idx
+                # “4-邻”扩散：邻居取最大
+                kernel_4 = torch.tensor([[0, 1, 0],
+                                         [1, 1, 1],
+                                         [0, 1, 0]],
+                                        dtype=infected.dtype,
+                                        device=self.device).view(1, 1, 3, 3)
+                spread_prob_map = F.conv2d(prob_seed.unsqueeze(0).unsqueeze(0),
+                                           kernel_4, padding=1).squeeze()
+            else:
+                spread_prob_map = torch.zeros_like(self.infected_map)
 
-                    prob_seed = torch.zeros_like(self.infected_map)  # 先只在感染源格写 spr
-                    for idx, (t, p) in enumerate(self.attack_types.items()):
-                        if p['spread_prob'] == 0:
-                            continue
-                        spr = p['spread_prob'] * (1 + difficulty * 0.5)
-                        prob_seed[type_map == idx] = spr
+            rand_mat = torch.rand_like(self.infected_map)
+            raw_new_inf = cand & (rand_mat < spread_prob_map)  # 候选新增感染格
 
-                    # >>> PATCH begin —— 把 spr 扩散到 4-邻域，邻居取最大的 spread_prob
-                    kernel_4 = torch.tensor([[0, 1, 0],
-                                             [1, 1, 1],
-                                             [0, 1, 0]],
-                                            dtype=infected.dtype,
-                                            device=self.device).view(1, 1, 3, 3)
-
-                    spread_prob_map = F.conv2d(prob_seed.unsqueeze(0).unsqueeze(0),
-                                               kernel_4, padding=1).squeeze()
+            # —— 如果总步数 < 2000，需要保证“总感染数 ≤ 20” —— #
+            if self.step_count < 2000:
+                curr_inf = int((self.infected_map > 0.5).sum().item())
+                remain_slots = 20 - curr_inf
+                if remain_slots <= 0:
+                    new_inf = torch.zeros_like(raw_new_inf)
                 else:
-                    spread_prob_map = torch.zeros_like(self.infected_map)
+                    new_indices = torch.nonzero(raw_new_inf, as_tuple=False)  # N×2
+                    if new_indices.size(0) <= remain_slots:
+                        new_inf = raw_new_inf.clone()
+                    else:
+                        perm = torch.randperm(new_indices.size(0), device=new_indices.device)
+                        chosen = new_indices[perm[:remain_slots]]
+                        new_inf = torch.zeros_like(raw_new_inf)
+                        new_inf[chosen[:, 0], chosen[:, 1]] = True
+            else:
+                new_inf = raw_new_inf
 
-                rand_mat = torch.rand_like(self.infected_map)
-                new_inf = cand & (rand_mat < spread_prob_map)
+            self.infected_map[new_inf] = 1.0
+            self.infection_strength[new_inf] = 1.0
 
-                self.infected_map[new_inf]       = 1.0
-                self.infection_strength[new_inf] = 1.0
-
-            # ────────── 2) burst 爆发传播 ──────────
+            # ────────── 3) burst 爆发传播 ──────────
             for t, p in self.attack_types.items():
                 if not p.get('burst'):
                     continue
-                area  = p['burst_area']
+                area = p['burst_area']
                 bmask = torch.zeros_like(self.infected_map, dtype=torch.bool)
                 for (x, y), info in self.attacks.items():
                     if info['type'] == t:
@@ -288,13 +301,32 @@ class GridSecurityEnv:
                 if not bmask.any():
                     continue
 
-                # 对 bmask 膨胀 (2*area+1)^2
-                k = torch.ones(1,1, 2*area+1, 2*area+1, device=self.device)
-                burst_area = (F.conv2d(bmask.float()[None,None], k, padding=area) > 0).squeeze()
-                m1   = burst_area & (self.is_quarantined == 0) & (self.infected_map == 0)
-                m2   = torch.rand_like(self.infected_map) < p['burst_chance'] * (1 + difficulty)
-                burst_new = m1 & m2
-                self.infected_map[burst_new]       = 1.0
+                # 膨胀 (2*area+1)^2 区域
+                k = torch.ones(1, 1, 2 * area + 1, 2 * area + 1, device=self.device)
+                burst_area = (F.conv2d(bmask.float()[None, None], k, padding=area) > 0).squeeze()
+                m1 = burst_area & (self.is_quarantined == 0) & (self.infected_map == 0)
+                m2 = torch.rand_like(self.infected_map) < (p['burst_chance'] * (1 + difficulty))
+                raw_burst = m1 & m2
+
+                # —— burst 新增也要受“前 2000 步 ≤20 个”限制 —— #
+                if self.step_count < 2000:
+                    curr_inf2 = int((self.infected_map > 0.5).sum().item())
+                    remain2 = 20 - curr_inf2
+                    if remain2 <= 0:
+                        burst_new = torch.zeros_like(raw_burst)
+                    else:
+                        burst_indices = torch.nonzero(raw_burst, as_tuple=False)
+                        if burst_indices.size(0) <= remain2:
+                            burst_new = raw_burst.clone()
+                        else:
+                            perm2 = torch.randperm(burst_indices.size(0), device=burst_indices.device)
+                            chosen2 = burst_indices[perm2[:remain2]]
+                            burst_new = torch.zeros_like(raw_burst)
+                            burst_new[chosen2[:, 0], chosen2[:, 1]] = True
+                else:
+                    burst_new = raw_burst
+
+                self.infected_map[burst_new] = 1.0
                 self.infection_strength[burst_new] = 1.0
 
         self.attacks.update(new_attacks)
@@ -309,7 +341,7 @@ class GridSecurityEnv:
         curr = int((self.infected_map > 0.5).sum().item())
 
         # 代替固定间隔触发入侵
-        spawn_chance = 20 / self.spawn_interval  # e.g. 每步有 20/200 概率
+        spawn_chance = 4 / self.spawn_interval  # e.g. 每步有 20/200 概率
         if curr < max_inf and random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 
