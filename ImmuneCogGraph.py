@@ -1638,21 +1638,30 @@ class ImmuneCogGraph(CogGraph):
           2) hits = len(all_to_clear)，并更新 kill_stats、virus_kill_stats_by_type，以及 unit.cleared_positions；
           3) 对 all_to_clear 中每个坐标依次 perform() 清理；
           4) 统一根据 hits 发放能量奖励。
-        其余类型（ACTION_HACK_DEFENSE、QUARANTINE）的逻辑不变。
+
+        如果 action['type'] 是 ACTION_HACK_DEFENSE，现在也做「3×3 批量扫描→批量清理→一次性奖励」：
+          1) 在 orig_priv、orig_stealth 快照里，把目标 (x,y) 周围 3×3 范围内所有的 hack 点（privilege_level>0.04 或 hack_strength>0.04）都收集起来；
+          2) hits = len(all_to_clear)，更新 hack_kill_stats、hack_kill_stats_by_type，以及 unit.cleared_hack；
+          3) 对 all_to_clear 里每个坐标都执行一次 perform(ACTION_HACK_DEFENSE)；
+          4) 统一根据 hits 发放能量奖励（同病毒分支里的缩放方式）。
+
+        其余类型（QUARANTINE）逻辑不变。
         """
         size = self.env.size
         H, W = self.env.infected_map.shape
 
-        # === 1) 先做“打击前”的感染图快照，供本次收集使用 ===
+        # === 1) “打击前”的感染图快照与提权/隐身快照 ===
         orig_inf = self.env.infected_map.clone()
+        orig_priv = self.env.privilege_level.clone()
+        orig_stealth = self.env.hack_strength.clone()
 
-        # --- 保存“打”动作之前的状态，供 A2C 用 ---
+        # --- 保存动作之前的状态，供 A2C 用 ---
         raw_state = self.env.get_state_tensor().cpu()
         state_tensor = raw_state.view(1, -1).to(self.device)
         state_vec = unit.get_output().detach().view(-1).cpu()
         goal_flat = self.tv_cached.view(1, -1)
 
-        # hack 通道准备（与原来保持一致）
+        # hack 通道准备（与原来一致）
         hack_maps = []
         for t in self.env.attack_types:
             mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
@@ -1664,7 +1673,7 @@ class ImmuneCogGraph(CogGraph):
 
         full_state = torch.cat([state_tensor, hack_flat, goal_flat], dim=1)
 
-        # —— 自动扩容 value_head，如果 D_in 不匹配也会在这里重建 value_head —— #
+        # —— 如果 value_head 维度不匹配，本次也会重建 —— #
         with torch.no_grad():
             value_s = self.value_head(full_state).squeeze(0)
 
@@ -1675,7 +1684,7 @@ class ImmuneCogGraph(CogGraph):
         if action["type"] == ACTION_BLOCK:
             cx0, cy0 = action["target"]
 
-            # —— ① 基于 orig_inf 构造 to_clear（中心 3×3 区域内的感染点）—— #
+            # —— ① 构造 to_clear（中心 3×3 区域内的感染点） —— #
             to_clear = []
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
@@ -1686,45 +1695,40 @@ class ImmuneCogGraph(CogGraph):
                         virus_type = "扩散点" if v_info is None else v_info.get("type", "virus")
                         to_clear.append((cx, cy, virus_type))
 
-            # —— ② 基于 to_clear 构造 all_to_clear（去重后的实际 3×3 覆盖集合）—— #
-            clear_dict = {}  # key=(x,y), value=virus_type
+            # —— ② 基于 to_clear 构造 all_to_clear（去重后的实际 3×3 覆盖集合） —— #
+            clear_dict = {}
             for (cx, cy, _) in to_clear:
                 for dy in (-1, 0, 1):
                     for dx in (-1, 0, 1):
                         x = cx + dx
                         y = cy + dy
                         if 0 <= x < W and 0 <= y < H and orig_inf[y, x] > 0.04:
-                            # 重新获取病毒类型，保证按实际存储
                             v_info2 = self.env.attacks.get((x, y), None)
                             virus_type2 = "扩散点" if v_info2 is None else v_info2.get("type", "virus")
                             clear_dict[(x, y)] = virus_type2
-            # all_to_clear 是一个列表：[(x, y, virus_type), ...]
             all_to_clear = [(x, y, vt) for ((x, y), vt) in clear_dict.items()]
 
-            # —— ③ hits = len(all_to_clear)，更新 kill_stats、virus_kill_stats_by_type、unit.cleared_positions —— #
+            # —— ③ 更新 kill_stats、virus_kill_stats_by_type、unit.cleared_positions —— #
             hits = len(all_to_clear)
             if hits > 0:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
-                unit.cleared_positions = set()  # 重置为本轮待清理集合
+                unit.cleared_positions = set()
                 for (x, y, virus_type) in all_to_clear:
-                    # 全局累计命中次数
                     self.kill_stats[src] += 1
-                    # 按“病毒子类型”统计
                     bucket_v = self.virus_kill_stats_by_type.setdefault(
                         virus_type, {"self_direct": 0, "guided": 0}
                     )
                     bucket_v[src] += 1
-                    # 记到 unit.cleared_positions
                     unit.cleared_positions.add((x, y))
 
-                # —— ④ 对 all_to_clear 中每个坐标执行一次 perform() —— #
+                # —— ④ perform 每个坐标的清理 —— #
                 for (x, y, _) in all_to_clear:
                     self.emitter_actions.perform({
                         "type": ACTION_BLOCK,
                         "target": (x, y)
                     })
 
-                # —— ⑤ 统一根据 hits 发放能量奖励 —— #
+                # —— ⑤ 统一奖励，根据场上感染数衰减 —— #
                 curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
                 factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
@@ -1735,14 +1739,11 @@ class ImmuneCogGraph(CogGraph):
                 total_reward += reward
                 logger.warning(f"[清理奖励] 本次共清除 {hits} 个病毒，获得能量 {reward:.2f}")
 
-                # —— ⑥ 距离 bonus & 上游 processor 分成逻辑 —— #
+                # —— ⑥ 距离 bonus & 上游 processor 分成 —— #
                 infected_points = torch.nonzero(self.env.infected_map > 0).tolist()
                 if infected_points and hasattr(unit, "position"):
                     ux, uy = unit.position
-                    dists = [
-                        math.hypot(ux - px, uy - py)
-                        for (py, px) in infected_points
-                    ]
+                    dists = [math.hypot(ux - px, uy - py) for (py, px) in infected_points]
                     bonus = max(0, (5 - min(dists)) / 5) * 0.05 * hits
                     unit.energy += bonus
                     unit.meta.record(action="distance_bonus", reward=bonus)
@@ -1754,45 +1755,90 @@ class ImmuneCogGraph(CogGraph):
                         p.energy += fb
                         p.meta.record(action="upstream", reward=fb)
 
-                # —— ⑦ 本轮结束后清空 unit.cleared_positions —— #
-                unit.cleared_positions.clear()
-
             hit = (hits > 0)
 
         elif action["type"] == ACTION_HACK_DEFENSE:
-            x, y = action["target"]
-            # —— ① 打之前先读一次原始 hack 类型 —— #
-            info = self.env.hacks.get((x, y), None)
-            hack_type = "unknown" if info is None else info.get("type", "unknown")
+            # —— 新增：和病毒一样做 3×3 批量扫描 —— #
+            x0, y0 = action["target"]
 
-            before_priv = self.env.privilege_level[y, x].item()
-            before_stealth = self.env.hack_strength[y, x].item()
+            # ① 在原始快照里找出 3×3 区域内所有 hack 点
+            to_clear = []
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    x = x0 + dx
+                    y = y0 + dy
+                    if 0 <= x < W and 0 <= y < H:
+                        # 只要在 orig_priv 或 orig_stealth 有值，就视为“hack 点”
+                        if orig_priv[y, x] > 0.04 or orig_stealth[y, x] > 0.04:
+                            info = self.env.hacks.get((x, y), None)
+                            hack_type = "传播点" if info is None else info.get("type", "unknown")
+                            to_clear.append((x, y, hack_type))
 
-            # —— ② 执行清理 —— #
-            self.emitter_actions.perform(action)
+            # ② 把 to_clear 扩展到实际的 all_to_clear（去重即可，这里 3×3 扫描已经不需要再扩）
+            #     由于我们只在 3×3 范围里判断一次，所以直接用 to_clear 去重就行
+            clear_dict = {}
+            for (x, y, hack_type) in to_clear:
+                clear_dict[(x, y)] = hack_type
+            all_to_clear = [(x, y, ht) for ((x, y), ht) in clear_dict.items()]
 
-            after_priv = self.env.privilege_level[y, x].item()
-            after_stealth = self.env.hack_strength[y, x].item()
-            hit = ((before_priv > 0.04 and after_priv == 0.0) or
-                   (before_stealth > 0.04 and after_stealth == 0.0))
-            if hit:
+            # ③ 更新 hack_kill_stats、hack_kill_stats_by_type、unit.cleared_hack
+            hits = len(all_to_clear)
+            if hits > 0:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
-                self.hack_kill_stats[src] += 1
+                # 新增 cleared_hack 集合，用来给 _apply_defense_rewards 批量奖励
+                unit.cleared_hack = set()
+                for (x, y, hack_type) in all_to_clear:
+                    self.hack_kill_stats[src] += 1
+                    bucket_h = self.hack_kill_stats_by_type.setdefault(
+                        hack_type, {"self_direct": 0, "guided": 0}
+                    )
+                    bucket_h[src] += 1
+                    unit.cleared_hack.add((x, y))
 
-                bucket_h = self.hack_kill_stats_by_type.setdefault(
-                    hack_type, {"self_direct": 0, "guided": 0}
+                # ④ perform 每个坐标的清理
+                for (x, y, _) in all_to_clear:
+                    self.emitter_actions.perform({
+                        "type": ACTION_HACK_DEFENSE,
+                        "target": (x, y)
+                    })
+
+                # ⑤ 统一奖励，根据场上剩余 hack 数量衰减
+                curr_hack_count = len(self.env.hacks)
+                scale = 1.0 / (1 + curr_hack_count)
+                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
+                reward = HIT_BONUS * hits * factor * scale
+
+                unit.energy += reward
+                unit.meta.record(action="hack_defense", reward=reward)
+                total_reward += reward
+                logger.warning(
+                    f"[黑客批量奖励] 本次共清除 {hits} 个 hack，场上剩余 hack={curr_hack_count}，"
+                    f"缩放后获得能量 {reward:.2f}"
                 )
-                bucket_h[src] += 1
 
-                hit_reward = HIT_BONUS * (GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2)
-                unit.energy += hit_reward
-                unit.meta.record(action="hack_defense", reward=hit_reward)
-                total_reward += hit_reward
-                logger.warning(f"[黑客奖励] 本次清除 hack 类型 {hack_type}，获得能量 {hit_reward:.2f}")
+                # 距离 bonus & 上游 processor 分成（同病毒逻辑）
+                hack_positions = [(x, y) for (x, y, _) in all_to_clear]
+                if hack_positions and hasattr(unit, "position"):
+                    ux, uy = unit.position
+                    dists = [math.hypot(ux - hx, uy - hy) for (hx, hy) in hack_positions]
+                    bonus = max(0, (5 - min(dists)) / 5) * 0.05 * hits
+                    unit.energy += bonus
+                    unit.meta.record(action="distance_bonus", reward=bonus)
+
+                for pid in self.reverse_connections.get(unit.id, ()):
+                    p = self.unit_map.get(pid)
+                    if p and p.role == "processor":
+                        fb = reward * 0.6
+                        p.energy += fb
+                        p.meta.record(action="upstream", reward=fb)
+
             else:
+                # 如果 3×3 范围内根本没有 hack 点，就算打空
                 total_reward += -MISS_PENALTY
                 unit.energy = max(0.0, unit.energy - MISS_PENALTY)
                 unit.meta.record(action="miss_penalty", reward=-MISS_PENALTY)
+
+            hit = (hits > 0)
 
         else:
             # 其余类型（如 QUARANTINE），只 perform 一次，不给奖励/惩罚
@@ -1800,7 +1846,7 @@ class ImmuneCogGraph(CogGraph):
             hit = False
             total_reward += 0.0
 
-        # === 3) A2C 更新、PER 更新等逻辑保持不变 ===
+        # === 3) A2C 更新、PER 更新等逻辑不变 ===
         next_raw_state = self.env.get_state_tensor().to(self.device)
         next_state_tensor = next_raw_state.view(1, -1)
         goal_flat = self.tv_cached.view(1, -1)
@@ -1813,10 +1859,9 @@ class ImmuneCogGraph(CogGraph):
             old_in2 = old_v2.in_features
             if D_in2 != old_in2:
                 new_v2 = nn.Linear(D_in2, 1, bias=(old_v2.bias is not None)).to(self.device)
-                with torch.no_grad():
-                    new_v2.weight[:, :old_in2].copy_(old_v2.weight)
-                    if old_v2.bias is not None:
-                        new_v2.bias.copy_(old_v2.bias)
+                new_v2.weight[:, :old_in2].copy_(old_v2.weight)
+                if old_v2.bias is not None:
+                    new_v2.bias.copy_(old_v2.bias)
                 self.value_head = new_v2
                 for g in self.value_optimizer.param_groups:
                     g['params'] = [self.value_head.weight, self.value_head.bias]
@@ -1843,6 +1888,8 @@ class ImmuneCogGraph(CogGraph):
         self.policy_update(state_tensor, self.last_flat_idx, total_reward)
 
         return hit
+
+
 
     def _record_antibody_effectiveness(self, action: dict, feat: torch.Tensor):
         """判断抗体动作是否成功清除感染，并更新计数器"""
@@ -1956,10 +2003,11 @@ class ImmuneCogGraph(CogGraph):
           - 只奖励有清除行为的 emitter
           - 上游 processor 奖励按比例反馈
           - 全局新增感染可作为环境惩罚处理（非每个 emitter 扣分）
-          - 在同一次循环里，对未清除提权的 emitter 单独扣能量
-          - 新增：对刚连续3回合未被清理的病毒点，扣最近 emitter 能量
+          - 对未清除提权的 emitter 单独扣能量
+          - 对刚连续3回合未被清理的病毒点，扣最近 emitter 能量
+          - 黑客防御奖励也按剩余 hack 数量缩放
         """
-        # ==== 新增：如果连续 100 步“感染格数为 0”，给全体细胞（所有单元）+1.0 能量奖励 ====
+        # ==== 连续 100 步“感染格数为 0”时，全体 +1 能量奖励 ====
         curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
         if curr_inf_count == 0:
             self.zero_infection_counter += 1
@@ -1971,26 +2019,22 @@ class ImmuneCogGraph(CogGraph):
                 u.energy += 1.0
                 u.meta.record(action="zero_infection_bonus", reward=1.0)
             self.zero_infection_counter = 0
-        # ====================================================================================
+        # ==================================================================================
 
         # --- A. 靠近病毒微奖励 / 远离扣分 ---------------------------------
         emitters = [u for u in self.units if u.role == "emitter" and hasattr(u, "position")]
-        # 预先构造 emitter 坐标张量，后面 B/C 段都能重用
         if emitters:
             emit_pos = torch.tensor(
                 [u.position for u in emitters],
                 device=self.device, dtype=torch.float32
-            )[:, [0, 1]]  # (x,y)
+            )[:, [0, 1]]
 
-
-        virus_idx = torch.nonzero(self.env.infected_map > 0)  # [V,2]
+        virus_idx = torch.nonzero(self.env.infected_map > 0)
         if emitters and virus_idx.numel() > 0:
-            virus_xy = virus_idx[:, [1, 0]].to(torch.float32)  # (x,y)
-            # cdist → [E,V]
+            virus_xy = virus_idx[:, [1, 0]].to(torch.float32)
             dists = torch.cdist(emit_pos, virus_xy, p=1)
-            min_dists, min_idxs = dists.min(dim=1)  # [E], [E]
+            min_dists, min_idxs = dists.min(dim=1)
             mask = min_dists <= 4.0
-            # 只遍历需要更新的小集合
             for i, u in enumerate(emitters):
                 if not hasattr(u, "latest_base_reward"):
                     u.latest_base_reward = 0.0
@@ -2023,17 +2067,13 @@ class ImmuneCogGraph(CogGraph):
             h, w = prev_dur.shape
             aligned[:h, :w] = prev_dur
             prev_dur = aligned
-        # —— 0) 病毒持续3回合惩罚 —— #
 
-        curr_dur = self.env.infected_duration_map
-        # 只找那些刚跨过 3 回合，且之前没被惩罚过的
-        # —— B. “3 回合滞留”惩罚 ——
-        just_stale = torch.nonzero((curr_dur >= 3) & (prev_dur < 3))  # [S,2]
+        # —— B. “3 回合滞留”惩罚 —— #
+        just_stale = torch.nonzero((curr_dur >= 3) & (prev_dur < 3))
         if emitters and just_stale.numel() > 0:
-            stale_xy = just_stale[:, [1, 0]].to(torch.float32)  # (x,y)
-            # reuse emit_pos
-            d2 = torch.cdist(stale_xy, emit_pos, p=1)  # [S,E]
-            far_idxs = d2.min(dim=1).indices  # 每 stale 对应的最近 emitter idx
+            stale_xy = just_stale[:, [1, 0]].to(torch.float32)
+            d2 = torch.cdist(stale_xy, emit_pos, p=1)
+            far_idxs = d2.min(dim=1).indices
             penalty = 0.2
             for sid, fidx in enumerate(far_idxs):
                 u = emitters[fidx.item()]
@@ -2041,17 +2081,14 @@ class ImmuneCogGraph(CogGraph):
                     u.energy = max(0.0, u.energy - penalty)
                     u.meta.record(action="persistence_penalty", reward=-penalty)
                     logger.info(f"[滞留惩罚] emitter {u.id} 扣能量 {penalty}，让你摸鱼！")
-
-            # 清零持续计数（只保留一次）
             for y, x in just_stale.tolist():
                 self.env.infected_duration_map[y, x] = 0
                 if hasattr(self, "prev_dur"):
                     self.prev_dur[y, x] = 0
 
-        # —— 2) 计算病毒传播带来的全局惩罚量 —— #
+        # —— 2) 计算全局病毒传播惩罚 —— #
         curr = self.env.infected_map
 
-        # —— 对齐所有 prev_* 到 curr.shape —— #
         def align(old, target_shape):
             if old.shape == target_shape:
                 return old
@@ -2069,33 +2106,25 @@ class ImmuneCogGraph(CogGraph):
 
         infected_points = torch.nonzero(curr).tolist()
 
-        # —— 3) 收集当前仍处于提权状态的位置 —— #
+        # —— 3) 当前提权位置 —— #
         priv_positions = {
             (x.item(), y.item())
             for y, x in torch.nonzero(self.env.privilege_level > 0.04)
         }
-        penalty_per_node = 0.2  # 每个未清除提权节点，对应 emitter 扣的能量
+        penalty_per_node = 0.2
 
         total_cleared = 0
-        # 在进入循环之前，先算一下当前场上有多少感染点
         curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
 
-        # —— 4) 遍历所有 emitter，一次性处理 清理奖励 + 黑客惩罚 —— #
+        # —— 4) 遍历所有 emitter，处理病毒奖励 & 黑客惩罚 —— #
         for u in [u for u in self.units if u.role == "emitter"]:
             # —— 4.1) 病毒清理奖励 —— #
             cleared = len(getattr(u, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-
-                # 先算一个“基础奖励”，不考虑场上病毒数量
-                base_reward = 1 * cleared
-
-                # 然后按场上病毒数量做衰减：病毒越多，实际给到每次清理的奖励越少
-                # 这里示例用 1 / (1 + curr_inf_count) 作为缩放因子，你可以根据实际需求调整
+                base_reward = 1
                 scale = 1.0 / (1.0 + curr_inf_count)
                 reward = base_reward * scale
-
-                # 如果是 guided 状态，则再乘以 GUIDED_FACTOR
                 if getattr(u, "guided_this_round", False):
                     reward *= GUIDED_FACTOR
 
@@ -2104,17 +2133,12 @@ class ImmuneCogGraph(CogGraph):
                 logger.warning(f"真棒，干掉了个病毒，场上感染点越多，奖励越低，给奖励{reward}")
                 u.cleared_positions.clear()
 
-                # 距离 bonus
                 if infected_points and hasattr(u, "position"):
-                    dists = [
-                        math.hypot(u.position[0] - x, u.position[1] - y)
-                        for x, y in infected_points
-                    ]
+                    dists = [math.hypot(u.position[0] - x, u.position[1] - y) for x, y in infected_points]
                     bonus = max(0, (5 - min(dists)) / 5) * 0.05 * cleared
                     u.energy += bonus
                     u.meta.record(action="distance_bonus", reward=bonus)
 
-                # 上游 processor 分一部分
                 for pid in self.reverse_connections.get(u.id, ()):
                     p = self.unit_map.get(pid)
                     if p and p.role == "processor":
@@ -2124,11 +2148,17 @@ class ImmuneCogGraph(CogGraph):
 
                 u.cleared_positions.clear()
 
-            # ==== NEW：hack 清理奖励 ====
+            # ==== NEW：hack 清理奖励（若 cleared_hack 属性存在）====
             if hasattr(u, "cleared_hack") and u.cleared_hack:
-                hack_r = 2 * len(u.cleared_hack)
+                # 基础 hack 奖励
+                hack_r = 2
                 if getattr(u, "guided_this_round", False):
                     hack_r *= GUIDED_FACTOR
+
+                # 计算当前剩余 hack 数量 & 缩放
+                curr_hack_count = len(self.env.hacks)
+                scale = 1.0 / (1 + curr_hack_count)
+                hack_r *= scale
 
                 u.energy += hack_r
                 u.meta.record(action="hack_defense", reward=hack_r)
@@ -2142,55 +2172,54 @@ class ImmuneCogGraph(CogGraph):
                         p.meta.record(action="hack_defense", reward=fb)
 
             # —— 4.2) 黑客惩罚 —— #
-            # 如果 emitter 当前所在位置仍在提权列表里，就扣能量
             if hasattr(u, "position") and u.position in priv_positions:
                 u.energy = max(0.0, u.energy - penalty_per_node)
                 u.meta.record(action="hack_failure", reward=-penalty_per_node)
                 logger.info(
                     f"[黑客惩罚] emitter {u.id} 在 {u.position} 未清除提权，扣能量 {penalty_per_node}，菜就多练!"
                 )
-            # ---------- “不动 / 原地打圈” 惩罚 ------------------
-            # 如果之前还没创建 output_positions（可能这一局从未遇到过病毒）
+            # —— 不动/打圈惩罚 —— #
             if not hasattr(u, "output_positions"):
                 u.output_positions = deque(maxlen=20)
-            # 每 10 步检查一次最近 20 步的活动范围
             if (len(u.output_positions) == u.output_positions.maxlen
                     and self.current_step % 10 == 0):
                 start = u.output_positions[0]
-                end   = u.output_positions[-1]
+                end = u.output_positions[-1]
                 manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
 
-                if manhattan < 3:                 # 几乎没动
+                if manhattan < 3:
                     u.energy -= 0.1
                     u.meta.record(action="idle_penalty", reward=-0.1)
 
-                # 打圈：20 步内只覆盖 ≤3 个不同格子
                 uniq = len(set(u.output_positions))
                 if uniq <= 3:
                     u.energy -= 0.14
                     u.meta.record(action="loop_penalty", reward=-0.14)
-            # ----------------------------------------------------------
-
-        # —— 6) 黑客防御奖励 —— #
+        # —— 6) 全局黑客防御奖励 —— #
         cleared_priv = (prev_priv > 0.04).sum() - (self.env.privilege_level > 0.04).sum()
         reduced_vuln = (prev_vuln - self.env.vulnerability).clamp(min=0).sum()
         reduced_fail = (prev_fail - self.env.login_failures).clamp(min=0).sum()
-        hack_reward = (
+        base_hack_reward = (
             0.3 * cleared_priv.item()
             + 0.15 * reduced_vuln.item()
             + 0.1 * reduced_fail.item()
         )
-        if hack_reward > 0:
+        if base_hack_reward > 0:
+            curr_hack_count = len(self.env.hacks)
+            scale = 1.0 / (1 + curr_hack_count)
+            hack_reward = base_hack_reward * scale
+
             self.energy_pool += hack_reward
             logger.warning(
                 f"[黑客防御奖励] 降权 {cleared_priv.item()}，"
                 f"修复 {reduced_vuln.item():.1f}，"
-                f"重置登录失败 {reduced_fail.item():.1f}"
+                f"重置登录失败 {reduced_fail.item():.1f}，"
+                f"场上剩余 hack={curr_hack_count}，缩放后奖励={hack_reward:.2f}"
             )
 
         self.energy_pool = max(self.energy_pool, 0.0)
 
-        # —— 7) 超时病毒惩罚（>50回合，每个病毒每步都扣 0.1）—— #
+        # —— 7) 超时病毒惩罚 —— #
         dur_map = self.env.infected_duration_map
         overlong_mask = (dur_map > 100)
         num_overlong = overlong_mask.sum().item()
@@ -2202,6 +2231,7 @@ class ImmuneCogGraph(CogGraph):
                 u.energy = max(0.0, u.energy - penalty)
                 u.meta.record(action="timeout_penalty", reward=-penalty)
         self.punished_map &= (self.env.infected_map > 0)
+
 
     def _run_emitter_actions(self):
         for unit in self.units:
