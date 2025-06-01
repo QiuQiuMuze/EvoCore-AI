@@ -377,6 +377,7 @@ class GridSecurityEnv:
                                                  torch.ones(dst.shape[1], device=self.device),
                                                  accumulate=True)
                     self.hack_strength[dst[1], dst[0]] = p
+                    self.privilege_level[dst[1], dst[0]] = p
                     for x, y in zip(dst[0].tolist(), dst[1].tolist()):
                         self.hacks[(x, y)] = {'type': 'lateral_move', 'power': p}
 

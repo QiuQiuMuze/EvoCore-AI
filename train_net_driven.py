@@ -251,3 +251,7 @@ if __name__ == "__main__":
     start = time.time()
     main(cfg)
     print(f"Total runtime: {time.time() - start:.1f}s")
+
+"""
+python train_net_driven.py --episodes 500 --max-steps 500 --device cpu
+"""
