@@ -25,6 +25,8 @@ from models.transformer_policy import TransformerPolicyNetwork
 from env import logger
 from torch.optim import AdamW
 from CogUnit import CogUnit
+from sensor_module import SensorMLP
+
 
 HIT_THRESH = 0.15          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
@@ -79,6 +81,17 @@ class ImmuneCogGraph(CogGraph):
         self.goal_vec = None
 
         self._rng = torch.Generator(device=device)
+
+        # ——— 在这里 env 已经创建，self.env.size 已经可用 ———
+        H, W = self.env.size, self.env.size
+
+        # ① 实例化可学习的 SensorMLP
+        self.learnable_sensor = SensorMLP(H, W).to(self.device)
+        # ② 为它单独创建一个优化器
+        self.sensor_optimizer = torch.optim.Adam(
+            self.learnable_sensor.parameters(), lr=1e-3
+        )
+
         # self._rng.manual_seed(42)  # 任选一个固定种子，方便复现
         # 用当前 env.size 构造一次全局网络
         seq_len = self.env.size * self.env.size
@@ -224,6 +237,7 @@ class ImmuneCogGraph(CogGraph):
         # —— **1) 全局 policy (actor) —— #
         # 包含 hack_type_embedding 参数，使其可被 policy 更新
         self.policy_optimizer = AdamW(
+            # list(self.learnable_sensor.parameters()) +
             list(self.sensor_net.parameters()) +
             list(self.processor_net.parameters()) +
             list(self.emitter_net.parameters()) +
@@ -332,6 +346,8 @@ class ImmuneCogGraph(CogGraph):
         CogUnit.clone = _clone_patched
         self._last_seq_len = self.env.size * self.env.size
         self._last_hack_keys = set(self.env.hacks.keys())
+
+
         # -----------------------------------------------------------
 
     def _should_evolve(self) -> bool:
@@ -384,36 +400,41 @@ class ImmuneCogGraph(CogGraph):
 
     def _run_sensor_scans(self):
         """
-        让所有的 sensor 单元“平分”当前整张网格中的(H*W)个格子：
-        - 假设有 S 个 sensor，先把所有格子按行优先打平到一个列表 cells；
-        - 给第 i（0 ≤ i < S）个 sensor 扫 cells[i], cells[i+S], cells[i+2S], … 这些坐标。
-        扫到病毒就放进 self.known_infections；扫到黑客就放进 self.known_hacks。
+        原本：遍历每个 active sensor 分片扫描地图。
+        现在：用 learnable_sensor 直接预测整张地图上的“感染概率”和“提权概率”。
         """
-        # 先收集所有 active 的 sensor 单元
-        sensors = [u for u in self.units if u.role == "sensor" and hasattr(u, "position")]
-        S = len(sensors)
-        if S == 0:
-            return  # 没有 sensor，就不用扫描了
+        # 1) 准备输入：把 infected_map 和 privilege_level 各自展平，然后拼接
+        #    形状原本都是 [H, W]，先 view(-1)，得到 [H*W]，再 cat → [2*H*W]
+        inf_map = self.env.infected_map.view(-1).unsqueeze(0)    # [1, H*W]
+        priv_map = self.env.privilege_level.view(-1).unsqueeze(0)  # [1, H*W]
+        sensor_input = torch.cat([inf_map, priv_map], dim=1).to(self.device)  # [1, 2*H*W]
 
-        # 把当前网格 flatten 成一个列表
-        H, W = self.env.infected_map.shape
-        cells = [(x, y) for y in range(H) for x in range(W)]  # 长度 = H*W
+        # 2) 预测：得到 [1, 2, H, W]
+        with torch.no_grad():
+            prob_maps = self.learnable_sensor(sensor_input)  # [1, 2, H, W]
 
-        # 遍历每个 sensor，给它一个“索引 i”，让它负责扫 cells[i : : S]
-        # 为了让“哪些格子分给哪个 sensor”是固定顺序，可以根据 sensors 列表的顺序来编号
-        for i, s in enumerate(sensors):
-            # i 是当前 sensor 在 sensors 列表中的“索引”
-            # 它要扫描 cells[i], cells[i+S], cells[i+2S], ... 直到越界
-            idx = i
-            while idx < len(cells):
-                x, y = cells[idx]
-                # 只要 env.infected_map[y,x] > 0.5，就认为这里是“感染格”
-                if self.env.infected_map[y, x] > 0.04:
-                    self.known_infections.add((x, y))
-                # 只要 env.privilege_level[y,x] > 0.05，就认为这里是“提权（黑客）格”
-                if self.env.privilege_level[y, x] > 0.04:
-                    self.known_hacks.add((x, y))
-                idx += S
+        # 3) 按阈值取整 → 0/1 探测结果
+        #    prob_maps[0,0] 对应“感染概率通道”；> thresh 就认为是“感染点”
+        #    prob_maps[0,1] 对应“提权概率通道”；> thresh 就认为是“hack 点”
+        thresh = 0.5  # 你可以调节，或把它做成超参数
+        inf_pred  = (prob_maps[0, 0] > thresh).to(torch.bool)  # [H, W] bool
+        hack_pred = (prob_maps[0, 1] > thresh).to(torch.bool)  # [H, W] bool
+
+        # 4) 清空旧的 known_infections / known_hacks
+        self.known_infections.clear()
+        self.known_hacks.clear()
+
+        # 5) 把所有预测为 True 的格子记录到集合里
+        H, W = inf_pred.shape
+        ys_inf, xs_inf   = torch.nonzero(inf_pred, as_tuple=True)
+        ys_hack, xs_hack = torch.nonzero(hack_pred, as_tuple=True)
+
+        # 6) 将坐标 (x,y) 加到对应集合
+        for y, x in zip(ys_inf.tolist(), xs_inf.tolist()):
+            self.known_infections.add((x, y))
+        for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
+            self.known_hacks.add((x, y))
+
 
     def _handle_reward_and_penalty(self):
         """
@@ -650,6 +671,12 @@ class ImmuneCogGraph(CogGraph):
             new_lvt[:h0, :w0] = old_lvt
             self.long_virus_tracker = new_lvt
         ############################
+
+        # （11）—— 新增 —— 把 learnable_sensor 一并扩容 —— #
+        new_H, new_W = self.env.size, self.env.size
+        self.learnable_sensor.resize(new_H, new_W)
+
+
 
 
     def _update_hack_channels(self):
@@ -1418,12 +1445,34 @@ class ImmuneCogGraph(CogGraph):
         if self.current_step % 40 == 0:
             self.rebalance_cell_types()
 
-        # 每一步开始时，清空已知集合，让 sensor 重新扫描
+        # ——— 在这里，用环境真实数据给 learnable_sensor 造“伪标签”并训练 ———
+
+        # 1) 真实标签：感染点 / 提权点，都视为 1，其他为 0，形状 [1,2,H,W]
+        inf_label  = (self.env.infected_map > 0.04).float().view(1, 1, self.env.size, self.env.size)
+        hack_label = (self.env.privilege_level > 0.04).float().view(1, 1, self.env.size, self.env.size)
+        pseudo_label = torch.cat([inf_label, hack_label], dim=1).to(self.device)  # [1,2,H,W]
+
+        # 2) SensorMLP 输入：把 infected_map 和 privilege_level 各自展平再 concat → [1, 2*H*W]
+        inf_flat  = self.env.infected_map.view(1, -1)
+        priv_flat = self.env.privilege_level.view(1, -1)
+        sensor_in = torch.cat([inf_flat, priv_flat], dim=1).to(self.device)  # [1,2*H*W]
+
+        # 3) 前向算出来概率图 [1,2,H,W]
+        pred_maps = self.learnable_sensor(sensor_in)
+
+        # 4) 计算二元交叉熵 Loss
+        loss_sensor = F.binary_cross_entropy(pred_maps, pseudo_label)
+
+        # 5) 反向更新 learnable_sensor
+        self.sensor_optimizer.zero_grad()
+        loss_sensor.backward()
+        self.sensor_optimizer.step()
+
+        # ——— 训练完毕后，再用更新后的 SensorMLP 去填充 known_infections/known_hacks ———
         self.known_infections.clear()
         self.known_hacks.clear()
-
-        # 所有 sensor 并行平分扫描整张地图
         self._run_sensor_scans()
+
 
 
         # —— 统一遍历所有单元，一次完成下列任务 ——
