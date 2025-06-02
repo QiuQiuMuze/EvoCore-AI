@@ -414,7 +414,8 @@ class ImmuneCogGraph(CogGraph):
 
         # 2) 预测：得到 [1, 2, H, W]
         with torch.no_grad():
-            prob_maps = self.learnable_sensor(sensor_input)  # [1, 2, H, W]
+            raw_logits = self.learnable_sensor(sensor_input)  # [1,2,H,W] raw_logits
+            prob_maps = torch.sigmoid(raw_logits)  # [1,2,H,W] 明确映射到 [0,1] 概率
 
         # 3) 按阈值取整 → 0/1 探测结果
         #    prob_maps[0,0] 对应“感染概率通道”；> thresh 就认为是“感染点”
@@ -729,28 +730,10 @@ class ImmuneCogGraph(CogGraph):
         unvisited = prio.view(1, -1)  # shape:[1 , size²]
 
         # —— 1) 通道 1：感染点 —— #
+        # 直接不做“距离 emitter ≤4”的局部过滤，只要 env.infected_map>0 就当感染
         if hasattr(self.env, "infected_map"):
-            full_inf = self.env.infected_map.clone()    # (H, W)
-            local_inf = torch.zeros_like(full_inf)  # (H,W)
-            emitters_xy = [
-                u.position for u in self.units
-                if u.role == "emitter" and hasattr(u, "position")
-            ]
-            if emitters_xy:  # 可能当前没有 emitter
-                pos = torch.as_tensor(emitters_xy, device=full_inf.device, dtype=torch.long)
-                ys, xs = pos[:, 1], pos[:, 0]  # 注意 (x,y) 顺序
-                mask = torch.zeros_like(full_inf)
-                mask[ys, xs] = 1.0  # 发射 1-hot
-                # 9×9 = (2*4+1) 的全部 1 Kernel，相当于把 4-Manhattan 近邻全 Dilate
-                dilated = self._dilate(mask.unsqueeze(0).unsqueeze(0))[0, 0]
-
-                local_inf = (dilated > 0).float() * full_inf  # 只保留真正感染格
-            else:
-                local_inf.zero_()
-            infected = local_inf.view(1, -1)
-            # <<< END PATCH
-
-
+            full_inf = self.env.infected_map.clone()  # (H, W)
+            infected = (full_inf > 0.04).float().view(1, -1)  # 只要 env.infected_map[y,x]>0.04 就算 1
         else:
             infected = torch.zeros_like(unvisited)
 
@@ -937,10 +920,9 @@ class ImmuneCogGraph(CogGraph):
         """
         把“从 known_infections ∪ known_hacks 里挑最近优先点”这一逻辑，改成：
           1) 用 goal_net(threat_vec) 计算每个威胁点的得分；
-          2) 在所有存在的威胁 flat_index 中取 top_k 得分最高的候选，并对黑客点额外加权；
-          3) 对每个候选点，如果已有 ≥10 个 emitter 把它设为 personal_goal，则跳过；
-          4) 在剩下的候选里找跟 emitter 最近的那个，设为 personal_goal；
-        如果所有 top_k 都超额，则退回到好奇点逻辑。
+          2) 在所有存在的威胁 flat_index 中按得分从高到低遍历，挑出最多 max_k 个“未满 3 人”的候选；
+          3) 在这几个候选里选与当前 emitter 最近的一个，设为 personal_goal；
+          4) 如果始终没捞到任何“未满 3 人”的威胁点，则退回到好奇点逻辑。
         """
         size = self.env.size
         seq_len = size * size
@@ -965,52 +947,46 @@ class ImmuneCogGraph(CogGraph):
 
         if threat_list:
             device = self.device
+            # 2.1) 构造 one-hot 向量并做一次前向
             threat_vec = torch.zeros((1, seq_len), device=device)
             indices = torch.tensor(threat_list, dtype=torch.long, device=device)
-            threat_vec[0].scatter_(0, indices, 1.0)
+            threat_vec[0].scatter_(0, indices, 1.0)  # [1, seq_len]
 
-            # —— 2.1) 用 goal_net 得到 logits → Softmax → probs —— #
-            logits = self.goal_net(threat_vec)      # [1, seq_len]
-            probs  = torch.softmax(logits, dim=-1)  # [1, seq_len]
+            logits = self.goal_net(threat_vec)  # [1, seq_len]
+            probs = torch.softmax(logits, dim=-1)  # [1, seq_len]
 
-            # —— 2.2) 给“黑客点”额外加权，让它更容易被选中 —— #
-            hack_bias = 2.0  # 越大越偏向黑客
-            threat_probs = probs[0, indices].clone()  # shape = [len(threat_list)]
+            # 2.2) 给“黑客点”额外加权，让它更容易被选中
+            hack_bias = 2.0
+            threat_probs = probs[0, indices].clone()  # [len(threat_list)]
             for idx_i, flat_i in enumerate(indices.tolist()):
                 cx = flat_i % size
                 cy = flat_i // size
                 if (cx, cy) in self.known_hacks:
                     threat_probs[idx_i] *= hack_bias
 
-            # —— 2.3) 取出 top_k 候选 flat_idx —— #
-            top_k = 5
-            if threat_probs.numel() <= top_k:
-                top_indices_in_threat = torch.arange(threat_probs.numel(), device=device)
-            else:
-                _, top_indices_in_threat = torch.topk(threat_probs, k=top_k, largest=True)
-
-            raw_candidates = indices[top_indices_in_threat].tolist()  # 原始 [flat1, flat2, ...]
-
-            # —— 2.4) 过滤：如果某个点已有 ≥10 个 emitter 正在瞄它，跳过 —— #
+            # 2.3) 从“所有威胁”按得分从高到低遍历，挑出最多 max_k 个“未满 3 人”的候选
+            max_k = 5
+            sorted_probs, sorted_idxs_in_threat = torch.sort(threat_probs, descending=True)
             filtered_candidates = []
-            for flat_idx in raw_candidates:
-                cx = flat_idx % size
-                cy = flat_idx // size
+            for idx_in_threat in sorted_idxs_in_threat.tolist():
+                flat_idx = indices[idx_in_threat].item()
+                cx, cy = flat_idx % size, flat_idx // size
+                cnt = 0
                 # 统计当前有多少 emitter 的 personal_goal == (cx, cy)
-                count = 0
                 for e in self.units:
                     if e.role == "emitter" and getattr(e, "personal_goal", None) == (cx, cy):
-                        count += 1
-                    if count >= 3:
-                        break
-                if count < 3:
+                        cnt += 1
+                        if cnt >= 3:
+                            break
+                if cnt < 3:
                     filtered_candidates.append(flat_idx)
+                    if len(filtered_candidates) >= max_k:
+                        break
 
-            # 如果过滤后没剩，就退回到好奇点逻辑
+            # 2.4) 如果没有任何“未满 3 人”的威胁点，就退到好奇点
             if not filtered_candidates:
-                # —— 好奇点逻辑（参考下面第 ③ 段） —— #
-                visited  = self.env.visited_map
-                age_map   = self.visit_age_map
+                visited = self.env.visited_map
+                age_map = self.visit_age_map
                 never_visited_mask = ~visited
                 cooldown = getattr(u, "intrinsic_cooldown", 0)
                 long_time_mask = (age_map >= cooldown)
@@ -1033,35 +1009,31 @@ class ImmuneCogGraph(CogGraph):
                 logger.info(f"[好奇点 fallback] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
                 return
 
-            # —— 2.5) 从 filtered_candidates 里选距离最近的 —— #
+            # 2.5) 从这最多 max_k 个“未满员”候选里，选与当前 emitter 最近的一个
             ux, uy = u.position
-            best_flat = None
-            best_dist = None
+            best_flat, best_dist = None, None
             for flat_idx in filtered_candidates:
-                cx = flat_idx % size
-                cy = flat_idx // size
+                cx, cy = flat_idx % size, flat_idx // size
                 d = abs(cx - ux) + abs(cy - uy)
                 if best_dist is None or d < best_dist:
-                    best_dist = d
-                    best_flat = flat_idx
+                    best_dist, best_flat = d, flat_idx
 
             goal_x, goal_y = best_flat % size, best_flat // size
 
-            # —— 2.6) 标记 goal_type（黑客优先）—— #
+            # 2.6) 标记 goal_type 并赋给 emitter
             if (goal_x, goal_y) in self.known_hacks:
                 u.goal_type = "hack"
             else:
                 u.goal_type = "infection"
             u.personal_goal = (goal_x, goal_y)
-            cooldown = getattr(u, "intrinsic_cooldown", 0)
-            u._last_intrinsic_step = self.current_step - cooldown
+            u._last_intrinsic_step = self.current_step
             logger.info(f"[学习+距离+Capacity] 给 emitter {u.id} 分配目标 → ({goal_x},{goal_y}), 距离={best_dist}")
             return
 
-        # —— ③ 如果没有任何威胁，就走“好奇点”逻辑 —— #
+        # —— ③ 如果没有任何威胁，或者前面都返回后，这里走“好奇点”逻辑 —— #
         if getattr(u, "goal_type", None) is None:
-            visited  = self.env.visited_map
-            age_map   = self.visit_age_map
+            visited = self.env.visited_map
+            age_map = self.visit_age_map
             never_visited_mask = ~visited
             cooldown = getattr(u, "intrinsic_cooldown", 0)
             long_time_mask = (age_map >= cooldown)
@@ -1082,9 +1054,6 @@ class ImmuneCogGraph(CogGraph):
             u.goal_type = "curiosity"
             u._last_intrinsic_step = self.current_step
             logger.info(f"[好奇点] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
-
-
-
 
     def processor_forward(self, sensor_out: torch.Tensor):
         if sensor_out.dim() == 1:
@@ -1497,11 +1466,12 @@ class ImmuneCogGraph(CogGraph):
         priv_flat = self.env.privilege_level.view(1, -1)
         sensor_in = torch.cat([inf_flat, priv_flat], dim=1).to(self.device)  # [1,2*H*W]
 
-        # 3) 前向算出来概率图 [1,2,H,W]
-        pred_maps = self.learnable_sensor(sensor_in)
+        # 3) 前向算出 raw_logits [1,2,H,W]
+        raw_logits = self.learnable_sensor(sensor_in)
 
-        # 4) 计算二元交叉熵 Loss
-        loss_sensor = F.binary_cross_entropy(pred_maps, pseudo_label)
+        # 4) 用 BCEWithLogitsLoss（内部会做 sigmoid→BCE），让训练在 logits 空间稳定收敛
+        loss_fn = nn.BCEWithLogitsLoss()
+        loss_sensor = loss_fn(raw_logits, pseudo_label)
 
         # 5) 反向更新 learnable_sensor
         self.sensor_optimizer.zero_grad()
