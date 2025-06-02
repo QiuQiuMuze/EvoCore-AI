@@ -2082,37 +2082,52 @@ class ImmuneCogGraph(CogGraph):
             self.zero_infection_counter = 0
         # ==================================================================================
 
-        # --- A. 靠近病毒微奖励 / 远离扣分 ---------------------------------
-        emitters = [u for u in self.units if u.role == "emitter" and hasattr(u, "position")]
-        if emitters:
+        # --- A. 靠近病毒微奖励 / 远离扣分（向量化后，只对发生变化的 emitter 做 Python 操作） ---
+        emitter_units = [u for u in self.units if u.role == "emitter" and hasattr(u, "position")]
+        M = len(emitter_units)
+        if M > 0:
             emit_pos = torch.tensor(
-                [u.position for u in emitters],
+                [u.position for u in emitter_units],
                 device=self.device, dtype=torch.float32
-            )[:, [0, 1]]
+            )[:, [0, 1]]  # [M, 2]
 
-        virus_idx = torch.nonzero(self.env.infected_map > 0)
-        if emitters and virus_idx.numel() > 0:
-            virus_xy = virus_idx[:, [1, 0]].to(torch.float32)
-            dists = torch.cdist(emit_pos, virus_xy, p=1)
-            min_dists, min_idxs = dists.min(dim=1)
-            mask = min_dists <= 4.0
-            for i, u in enumerate(emitters):
-                if not hasattr(u, "latest_base_reward"):
-                    u.latest_base_reward = 0.0
-                    u.last_rewarded_target_idx = None
-                if mask[i]:
-                    idx = min_idxs[i].item()
+            virus_idx = torch.nonzero(self.env.infected_map > 0.04)
+            if virus_idx.numel() > 0:
+                virus_xy = virus_idx[:, [1, 0]].to(torch.float32)  # [N, 2]
+                dists = torch.cdist(emit_pos, virus_xy, p=1)        # [M, N]
+                min_dists, min_idxs = dists.min(dim=1)             # [M]
+                close_mask = min_dists <= 4.0                       # [M] 布尔向量
+
+                # 初始化历史字段（若尚未创建）
+                for u in emitter_units:
+                    if not hasattr(u, "latest_base_reward"):
+                        u.latest_base_reward = 0.0
+                        u.last_rewarded_target_idx = None
+
+                # 筛选需要给奖励和需要撤销奖励的索引
+                need_reward_idx = [i for i, flag in enumerate(close_mask.tolist()) if flag]
+                need_undo_idx = [
+                    i for i, flag in enumerate(close_mask.tolist())
+                    if (not flag and emitter_units[i].latest_base_reward > 0)
+                ]
+
+                # 给奖励
+                for i in need_reward_idx:
+                    u = emitter_units[i]
+                    idx = int(min_idxs[i].item())
                     if u.last_rewarded_target_idx != idx:
                         u.energy += 0.08
                         u.meta.record(action="approach_bonus", reward=0.05)
                         u.latest_base_reward = 0.08
                         u.last_rewarded_target_idx = idx
-                else:
-                    if u.latest_base_reward > 0:
-                        u.energy = max(0.0, u.energy - u.latest_base_reward)
-                        u.meta.record(action="leave_penalty", reward=-u.latest_base_reward)
-                        u.latest_base_reward = 0.0
-                        u.last_rewarded_target_idx = None
+
+                # 撤销之前的奖励
+                for i in need_undo_idx:
+                    u = emitter_units[i]
+                    u.energy = max(0.0, u.energy - u.latest_base_reward)
+                    u.meta.record(action="leave_penalty", reward=-u.latest_base_reward)
+                    u.latest_base_reward = 0.0
+                    u.last_rewarded_target_idx = None
 
         # -----------------------------------------------------------------
 
@@ -2131,13 +2146,13 @@ class ImmuneCogGraph(CogGraph):
 
         # —— B. “3 回合滞留”惩罚 —— #
         just_stale = torch.nonzero((curr_dur >= 3) & (prev_dur < 3))
-        if emitters and just_stale.numel() > 0:
-            stale_xy = just_stale[:, [1, 0]].to(torch.float32)
-            d2 = torch.cdist(stale_xy, emit_pos, p=1)
-            far_idxs = d2.min(dim=1).indices
+        if emitter_units and just_stale.numel() > 0:
+            stale_xy = just_stale[:, [1, 0]].to(torch.float32)  # [S, 2]
+            d2 = torch.cdist(stale_xy, emit_pos, p=1)           # [S, M]
+            far_idxs = d2.min(dim=1).indices                     # [S]
             penalty = 0.2
             for sid, fidx in enumerate(far_idxs):
-                u = emitters[fidx.item()]
+                u = emitter_units[fidx.item()]
                 if not getattr(u, "is_permanent_explorer", False):
                     u.energy = max(0.0, u.energy - penalty)
                     u.meta.record(action="persistence_penalty", reward=-penalty)
@@ -2292,6 +2307,7 @@ class ImmuneCogGraph(CogGraph):
                 u.energy = max(0.0, u.energy - penalty)
                 u.meta.record(action="timeout_penalty", reward=-penalty)
         self.punished_map &= (self.env.infected_map > 0)
+
 
     def _run_emitter_actions(self):
         size = self.env.size

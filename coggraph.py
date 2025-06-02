@@ -1287,8 +1287,8 @@ class CogGraph:
             self.subsystem_competition = True
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
-        # 🟡 预热补偿（前 500 步）
-        if self.current_step < 500:
+        # 🟡 预热补偿（前 300 步）
+        if self.current_step < 300:
             for unit in self.units:
                 unit.energy += 0.01
                 logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.01")
