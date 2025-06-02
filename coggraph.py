@@ -1304,10 +1304,10 @@ class CogGraph:
                 excess = total_e - max_e
                 tiers = [
                     (0.00, 0.10, 0.05),
-                    (0.10, 0.15, 0.10),
-                    (0.15, 0.35, 0.15),
-                    (0.35, 0.55, 0.20),
-                    (0.50, float("inf"), 0.25)
+                    (0.10, 0.15, 0.15),
+                    (0.15, 0.35, 0.40),
+                    (0.35, 0.55, 0.70),
+                    (0.55, float("inf"), 1.0)
                 ]
                 tax = 0.0
                 for lower, upper, rate in tiers:
@@ -1354,7 +1354,7 @@ class CogGraph:
         return list(approved)
 
     def _expand_energy_cap_if_needed(self):
-        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 2000:
+        if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
             old_max = self.max_total_energy
             self.max_total_energy *= 2
             logger.info(

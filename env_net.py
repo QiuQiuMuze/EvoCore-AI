@@ -85,9 +85,9 @@ class GridSecurityEnv:
         self.attack_types = {
             'worm':    {'spread_prob': 0.2, 'stealth': 0.0, 'burst': False},
             'trojan':  {'spread_prob': 0.05, 'stealth': 0.6, 'burst': False},
-            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.5, 'burst_area': 3},
-            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
+            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.25, 'burst_area': 3},
+            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.15, 'burst_area': 2},
+            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.2, 'burst_area': 4},
         }
 
         self.attacks = {}
@@ -416,7 +416,7 @@ class GridSecurityEnv:
             self._spawn_attack()
 
         # —— 调整：每 hack_spawn_interval 步才做一次 spawn —— #
-        if self.step_count >= 1000 and self.step_count % self.hack_spawn_interval == 0:
+        if self.step_count % self.hack_spawn_interval == 0:
             for ht, params in self.hack_types.items():
                 if random.random() < params['spawn_prob']:
                     x, y = random.randrange(self.size), random.randrange(self.size)

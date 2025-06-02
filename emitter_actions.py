@@ -44,15 +44,29 @@ class EmitterActions:
             raise ValueError(f"未知的 emitter 动作类型：{atype}")
 
     def _hack_defense(self, pos: Tuple[int,int], env: GridSecurityEnv):
-        x, y = pos
-        env.privilege_level[y, x] = 0.0
-        env.login_failures[y, x]  = 0.0
-        env.vulnerability[y, x]  *= 0.5
-        env.hack_strength[y, x]   = 0.0
-        env.hacks.pop((x, y), None)
-        logger.info(f"[HACK_DEFENSE] 在 {pos} 执行黑客防御")
-        # 5) 清 hack_history 里最近一次记录（避免累计条目总是递增）
-        env.hack_history[y, x] = max(env.hack_history[y, x] - 1.0, 0.0)
+        """
+        把以 pos 为中心的 3×3 区域内所有黑客状态都清除掉。
+        """
+        cx, cy = pos
+        H, W = env.privilege_level.shape  # privilege_level、hack_strength、vulnerability 等张量尺寸相同
+
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                nx, ny = cx + dx, cy + dy
+                if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                    continue
+
+                # 对 (nx, ny) 执行“黑客防御”单点清理
+                env.privilege_level[ny, nx] = 0.0
+                env.login_failures[ny, nx]  = 0.0
+                env.vulnerability[ny, nx]  *= 0.5
+                env.hack_strength[ny, nx]   = 0.0
+                env.hacks.pop((nx, ny), None)
+                logger.info(f"[HACK_DEFENSE] 在 ({nx},{ny}) 执行黑客防御（3×3 范围）")
+
+                # 如果你维护了 hack_history，需要同步减一：
+                env.hack_history[ny, nx] = max(env.hack_history[ny, nx] - 1.0, 0.0)
+
 
     def _block(self, pos: Tuple[int, int], env: GridSecurityEnv):
         """

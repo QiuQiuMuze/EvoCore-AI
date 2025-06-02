@@ -937,70 +937,107 @@ class ImmuneCogGraph(CogGraph):
         """
         把“从 known_infections ∪ known_hacks 里挑最近优先点”这一逻辑，改成：
           1) 用 goal_net(threat_vec) 计算每个威胁点的得分；
-          2) 在所有存在的威胁 flat_index 中取 top_k 得分最高的候选；
-          3) 在 top_k 中找跟 emitter 最近的那个，设为 personal_goal。
-        其余到达后 fallback 回好奇点的逻辑不变。
+          2) 在所有存在的威胁 flat_index 中取 top_k 得分最高的候选，并对黑客点额外加权；
+          3) 对每个候选点，如果已有 ≥10 个 emitter 把它设为 personal_goal，则跳过；
+          4) 在剩下的候选里找跟 emitter 最近的那个，设为 personal_goal；
+        如果所有 top_k 都超额，则退回到好奇点逻辑。
         """
         size = self.env.size
         seq_len = size * size
 
-        # —— ①（可选）保留“旧目标还在集合里就不改变”—— #
+        # —— ① 保留“旧目标还在集合里就不改变” —— #
         old_goal = getattr(u, "personal_goal", None)
         old_type = getattr(u, "goal_type", None)
         if old_type in ("infection", "hack") and old_goal is not None:
-            # 如果旧目标依然在 known_infections 或 known_hacks 里，就维持原目标
             if old_type == "infection" and old_goal in self.known_infections:
                 return
             if old_type == "hack" and old_goal in self.known_hacks:
                 return
-            # 否则清除 old_goal，接着重新选
             u.personal_goal = None
             u.goal_type = None
 
         # —— ② 构造“威胁 flat index 列表” threat_list —— #
         threat_list = []
-        # 把 known_infections 内每个 (x,y) 转成 flat_idx = y * size + x
         for (x_inf, y_inf) in self.known_infections:
             threat_list.append(y_inf * size + x_inf)
-        # 把 known_hacks 内每个 (x,y) 转成 flat_idx
         for (x_hk, y_hk) in self.known_hacks:
             threat_list.append(y_hk * size + x_hk)
 
         if threat_list:
-            # —— 2.1) 构造二值向量 threat_vec，shape=[1, seq_len] —— #
             device = self.device
             threat_vec = torch.zeros((1, seq_len), device=device)
             indices = torch.tensor(threat_list, dtype=torch.long, device=device)
             threat_vec[0].scatter_(0, indices, 1.0)
 
-            # —— 2.2) 用 goal_net 输出 logits，再 Softmax 得到 probs —— #
-            logits = self.goal_net(threat_vec)    # [1, seq_len]
-            probs = torch.softmax(logits, dim=-1) # [1, seq_len]
+            # —— 2.1) 用 goal_net 得到 logits → Softmax → probs —— #
+            logits = self.goal_net(threat_vec)      # [1, seq_len]
+            probs  = torch.softmax(logits, dim=-1)  # [1, seq_len]
 
-            # —— 2.3) 从所有 `threat_list` 中取 top_k 得分最高的索引 —— #
-            top_k = 5  # 你可以改成 1、3、5 或更大
-            # 从 probs[0, threat_list] 里找前 top_k 大的
-            # 先取出 threat_list 对应位置的概率
-            threat_probs = probs[0, indices]     # shape = [len(threat_list)]
-            # 找到这几个概率里最大的 top_k 个在 threat_list 里的相对位置
+            # —— 2.2) 给“黑客点”额外加权，让它更容易被选中 —— #
+            hack_bias = 2.0  # 越大越偏向黑客
+            threat_probs = probs[0, indices].clone()  # shape = [len(threat_list)]
+            for idx_i, flat_i in enumerate(indices.tolist()):
+                cx = flat_i % size
+                cy = flat_i // size
+                if (cx, cy) in self.known_hacks:
+                    threat_probs[idx_i] *= hack_bias
+
+            # —— 2.3) 取出 top_k 候选 flat_idx —— #
+            top_k = 5
             if threat_probs.numel() <= top_k:
-                # 如果威胁点总数 ≤ top_k，就直接把所有直接作为候选
                 top_indices_in_threat = torch.arange(threat_probs.numel(), device=device)
             else:
-                # 否则取前 top_k 大的那几个
                 _, top_indices_in_threat = torch.topk(threat_probs, k=top_k, largest=True)
 
-            # 真正的候选 flat idx，就用 indices[top_indices_in_threat]
-            candidates = indices[top_indices_in_threat]  # shape = [ ≤ top_k ]
-            # 把它变成 Python list 的 flat_idx
-            candidates = candidates.tolist()  # e.g. [flat1, flat2, flat3, ...]
+            raw_candidates = indices[top_indices_in_threat].tolist()  # 原始 [flat1, flat2, ...]
 
-            # —— 2.4) 在候选里，选一个与 emitter 当前位置曼哈顿距离最小的 —— #
-            # 先拿出 emitter 当前位置 (ux,uy)
+            # —— 2.4) 过滤：如果某个点已有 ≥10 个 emitter 正在瞄它，跳过 —— #
+            filtered_candidates = []
+            for flat_idx in raw_candidates:
+                cx = flat_idx % size
+                cy = flat_idx // size
+                # 统计当前有多少 emitter 的 personal_goal == (cx, cy)
+                count = 0
+                for e in self.units:
+                    if e.role == "emitter" and getattr(e, "personal_goal", None) == (cx, cy):
+                        count += 1
+                    if count >= 3:
+                        break
+                if count < 3:
+                    filtered_candidates.append(flat_idx)
+
+            # 如果过滤后没剩，就退回到好奇点逻辑
+            if not filtered_candidates:
+                # —— 好奇点逻辑（参考下面第 ③ 段） —— #
+                visited  = self.env.visited_map
+                age_map   = self.visit_age_map
+                never_visited_mask = ~visited
+                cooldown = getattr(u, "intrinsic_cooldown", 0)
+                long_time_mask = (age_map >= cooldown)
+                candidate_mask = never_visited_mask | long_time_mask
+                cand = torch.nonzero(candidate_mask)
+                if cand.numel() == 0:
+                    return
+                ex, ey = u.position
+                mask_far = []
+                for (yy, xx) in cand.tolist():
+                    mask_far.append(abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST)
+                mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
+                if mask_far.any():
+                    cand = cand[mask_far]
+                sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
+                ty, tx = cand[sel].tolist()
+                u.personal_goal = (tx, ty)
+                u.goal_type = "curiosity"
+                u._last_intrinsic_step = self.current_step
+                logger.info(f"[好奇点 fallback] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
+                return
+
+            # —— 2.5) 从 filtered_candidates 里选距离最近的 —— #
             ux, uy = u.position
             best_flat = None
             best_dist = None
-            for flat_idx in candidates:
+            for flat_idx in filtered_candidates:
                 cx = flat_idx % size
                 cy = flat_idx // size
                 d = abs(cx - ux) + abs(cy - uy)
@@ -1008,55 +1045,41 @@ class ImmuneCogGraph(CogGraph):
                     best_dist = d
                     best_flat = flat_idx
 
-            # best_flat 就是最终选中的 flat index
             goal_x, goal_y = best_flat % size, best_flat // size
 
-            # —— 2.5) 标记 goal_type：优先判断是不是黑客，否则当病毒 —— #
+            # —— 2.6) 标记 goal_type（黑客优先）—— #
             if (goal_x, goal_y) in self.known_hacks:
                 u.goal_type = "hack"
             else:
                 u.goal_type = "infection"
-
             u.personal_goal = (goal_x, goal_y)
-            # 重置好奇冷却（如果你留了这段逻辑）
             cooldown = getattr(u, "intrinsic_cooldown", 0)
             u._last_intrinsic_step = self.current_step - cooldown
-
-            logger.info(f"[学习+距离] 给 emitter {u.id} 分配目标 → ({goal_x},{goal_y}), 距离={best_dist}")
+            logger.info(f"[学习+距离+Capacity] 给 emitter {u.id} 分配目标 → ({goal_x},{goal_y}), 距离={best_dist}")
             return
 
         # —— ③ 如果没有任何威胁，就走“好奇点”逻辑 —— #
         if getattr(u, "goal_type", None) is None:
-            visited = self.env.visited_map
-            age_map = self.visit_age_map
-
+            visited  = self.env.visited_map
+            age_map   = self.visit_age_map
             never_visited_mask = ~visited
             cooldown = getattr(u, "intrinsic_cooldown", 0)
-            long_time_mask    = (age_map >= cooldown)
-
+            long_time_mask = (age_map >= cooldown)
             candidate_mask = never_visited_mask | long_time_mask
             cand = torch.nonzero(candidate_mask)
-
             if cand.numel() == 0:
                 return
-
-            if hasattr(u, "position"):
-                ex, ey = u.position
-                mask_far = []
-                for (yy, xx) in cand.tolist():
-                    if abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST:
-                        mask_far.append(True)
-                    else:
-                        mask_far.append(False)
-                mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
-                if mask_far.any():
-                    cand = cand[mask_far]
-
+            ex, ey = u.position
+            mask_far = []
+            for (yy, xx) in cand.tolist():
+                mask_far.append(abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST)
+            mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
+            if mask_far.any():
+                cand = cand[mask_far]
             sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
             ty, tx = cand[sel].tolist()
-
-            u.personal_goal      = (tx, ty)
-            u.goal_type          = "curiosity"
+            u.personal_goal = (tx, ty)
+            u.goal_type = "curiosity"
             u._last_intrinsic_step = self.current_step
             logger.info(f"[好奇点] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
 
@@ -1798,12 +1821,12 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“扩散点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
+                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.4
 
                 weighted_hits = 0.0
                 for (_, _, virus_type) in all_to_clear:
                     if virus_type == "扩散点":
-                        weighted_hits += 0.01
+                        weighted_hits += 0.1
                     else:
                         weighted_hits += 1.0
 
@@ -1888,12 +1911,12 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“传播点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
+                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.4
 
                 weighted_hits = 0.0
                 for (_, _, hack_type) in all_to_clear:
                     if hack_type == "传播点":
-                        weighted_hits += 0.01
+                        weighted_hits += 0.1
                     else:
                         weighted_hits += 1.0
 
@@ -2098,19 +2121,45 @@ class ImmuneCogGraph(CogGraph):
           - 上游 processor 奖励按比例反馈
           - 全局新增感染可作为环境惩罚处理（非每个 emitter 扣分）
           - 对未清除提权的 emitter 单独扣能量
-          - 对刚连续3回合未被清理的病毒点，扣最近 emitter 能量
+          - 对刚连续3回合未被清理的病毒点，扣最近 emitter 能量（并在 env.infected_duration_map 上清零）
+          - 对持续超过50回合的“真正”未被清理的病毒点，进行全局惩罚
           - 黑客防御奖励也按剩余 hack 数量缩放
         """
-        # ==== 连续 100 步“感染格数为 0”时，全体 +1 能量奖励 ====
+        # —— 新增：在此函数内部维护“真实感染计时” —— #
+        # 第一次调用时初始化：
+        curr_dur = self.env.infected_duration_map
+        H, W = curr_dur.shape
+        if not hasattr(self, "true_inf_age_map"):
+            # 第一次创建：跟环境短期计时图同尺寸，int32 类型
+            self.true_inf_age_map = torch.zeros_like(curr_dur, dtype=torch.int32, device=self.device)
+        else:
+            old = self.true_inf_age_map
+            h0, w0 = old.shape
+            if (h0, w0) != (H, W):
+                # 扩到新尺寸：先生成全 0，再拷贝旧数据到左上角
+                new = torch.zeros((H, W), dtype=old.dtype, device=old.device)
+                new[:h0, :w0] = old
+                self.true_inf_age_map = new
+
+        # “真实感染计时”更新：只要 env.infected_map[y,x] >0.04，就累加；否则清零
+        curr_inf_mask = (self.env.infected_map > 0.04)
+        self.true_inf_age_map = torch.where(
+            curr_inf_mask,
+            self.true_inf_age_map + 1,
+            torch.zeros_like(self.true_inf_age_map)
+        )
+        # =============================================================
+
+        # ==== 连续 100（这里你改成200）步“感染格数为 0”时，全体 +0.5 能量奖励 ====
         curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
         if curr_inf_count == 0:
             self.zero_infection_counter += 1
         else:
             self.zero_infection_counter = 0
 
-        if self.zero_infection_counter >= 100:
+        if self.zero_infection_counter >= 200:
             for u in self.units:
-                u.energy += 1.0
+                u.energy += 0.5
                 u.meta.record(action="zero_infection_bonus", reward=1.0)
             self.zero_infection_counter = 0
         # ==================================================================================
@@ -2146,21 +2195,21 @@ class ImmuneCogGraph(CogGraph):
 
                 # 给奖励
                 for i in need_reward_idx:
-                    u = emitter_units[i]
+                    u_i = emitter_units[i]
                     idx = int(min_idxs[i].item())
-                    if u.last_rewarded_target_idx != idx:
-                        u.energy += 0.08
-                        u.meta.record(action="approach_bonus", reward=0.05)
-                        u.latest_base_reward = 0.08
-                        u.last_rewarded_target_idx = idx
+                    if u_i.last_rewarded_target_idx != idx:
+                        u_i.energy += 0.08
+                        u_i.meta.record(action="approach_bonus", reward=0.05)
+                        u_i.latest_base_reward = 0.08
+                        u_i.last_rewarded_target_idx = idx
 
                 # 撤销之前的奖励
                 for i in need_undo_idx:
-                    u = emitter_units[i]
-                    u.energy = max(0.0, u.energy - u.latest_base_reward)
-                    u.meta.record(action="leave_penalty", reward=-u.latest_base_reward)
-                    u.latest_base_reward = 0.0
-                    u.last_rewarded_target_idx = None
+                    u_i = emitter_units[i]
+                    u_i.energy = max(0.0, u_i.energy - u_i.latest_base_reward)
+                    u_i.meta.record(action="leave_penalty", reward=-u_i.latest_base_reward)
+                    u_i.latest_base_reward = 0.0
+                    u_i.last_rewarded_target_idx = None
 
         # -----------------------------------------------------------------
 
@@ -2183,14 +2232,15 @@ class ImmuneCogGraph(CogGraph):
             stale_xy = just_stale[:, [1, 0]].to(torch.float32)  # [S, 2]
             d2 = torch.cdist(stale_xy, emit_pos, p=1)           # [S, M]
             far_idxs = d2.min(dim=1).indices                     # [S]
-            penalty = 0.2
+            penalty = 0.5
             for sid, fidx in enumerate(far_idxs):
-                u = emitter_units[fidx.item()]
-                if not getattr(u, "is_permanent_explorer", False):
-                    u.energy = max(0.0, u.energy - penalty)
-                    u.meta.record(action="persistence_penalty", reward=-penalty)
-                    logger.info(f"[滞留惩罚] emitter {u.id} 扣能量 {penalty}，让你摸鱼！")
+                u_j = emitter_units[fidx.item()]
+                if not getattr(u_j, "is_permanent_explorer", False):
+                    u_j.energy = max(0.0, u_j.energy - penalty)
+                    u_j.meta.record(action="persistence_penalty", reward=-penalty)
+                    logger.info(f"[滞留惩罚] emitter {u_j.id} 扣能量 {penalty}，让你摸鱼！")
             for y, x in just_stale.tolist():
+                # 3 回合滞留惩罚：重置 env.infected_duration_map，开始重新计数
                 self.env.infected_duration_map[y, x] = 0
                 if hasattr(self, "prev_dur"):
                     self.prev_dur[y, x] = 0
@@ -2220,60 +2270,58 @@ class ImmuneCogGraph(CogGraph):
             (x.item(), y.item())
             for y, x in torch.nonzero(self.env.privilege_level > 0.04)
         }
-        penalty_per_node = 0.2
+        penalty_per_node = 0.5
 
         total_cleared = 0
         curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
 
         # —— 4) 遍历所有 emitter，处理病毒奖励 & 黑客惩罚 —— #
-        for u in [u for u in self.units if u.role == "emitter"]:
+        for u_k in [u for u in self.units if u.role == "emitter"]:
             # —— 4.1) 病毒清理奖励 —— #
-            cleared = len(getattr(u, "cleared_positions", set()))
+            cleared = len(getattr(u_k, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
                 base_reward = 1
                 scale = 1.0 / (1.0 + curr_inf_count)
                 reward = base_reward * scale
-                if getattr(u, "guided_this_round", False):
+                if getattr(u_k, "guided_this_round", False):
                     reward *= GUIDED_FACTOR
 
-                u.energy += reward
-                u.meta.record(action="defense", reward=reward)
+                u_k.energy += reward
+                u_k.meta.record(action="defense", reward=reward)
                 logger.warning(f"真棒，干掉了个病毒，场上感染点越多，奖励越低，给奖励{reward}")
-                u.cleared_positions.clear()
+                u_k.cleared_positions.clear()
 
-                if infected_points and hasattr(u, "position"):
-                    dists = [math.hypot(u.position[0] - x, u.position[1] - y) for x, y in infected_points]
+                if infected_points and hasattr(u_k, "position"):
+                    dists = [math.hypot(u_k.position[0] - x, u_k.position[1] - y) for x, y in infected_points]
                     bonus = max(0, (5 - min(dists)) / 5) * 0.05 * cleared
-                    u.energy += bonus
-                    u.meta.record(action="distance_bonus", reward=bonus)
+                    u_k.energy += bonus
+                    u_k.meta.record(action="distance_bonus", reward=bonus)
 
-                for pid in self.reverse_connections.get(u.id, ()):
+                for pid in self.reverse_connections.get(u_k.id, ()):
                     p = self.unit_map.get(pid)
                     if p and p.role == "processor":
                         fb = reward * 0.6
                         p.energy += fb
                         p.meta.record(action="upstream", reward=fb)
 
-                u.cleared_positions.clear()
+                u_k.cleared_positions.clear()
 
             # ==== NEW：hack 清理奖励（若 cleared_hack 属性存在）====
-            if hasattr(u, "cleared_hack") and u.cleared_hack:
-                # 基础 hack 奖励
+            if hasattr(u_k, "cleared_hack") and u_k.cleared_hack:
                 hack_r = 2
-                if getattr(u, "guided_this_round", False):
+                if getattr(u_k, "guided_this_round", False):
                     hack_r *= GUIDED_FACTOR
 
-                # 计算当前剩余 hack 数量 & 缩放
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
                 hack_r *= scale
 
-                u.energy += hack_r
-                u.meta.record(action="hack_defense", reward=hack_r)
-                u.cleared_hack.clear()
+                u_k.energy += hack_r
+                u_k.meta.record(action="hack_defense", reward=hack_r)
+                u_k.cleared_hack.clear()
 
-                for pid in self.reverse_connections.get(u.id, ()):
+                for pid in self.reverse_connections.get(u_k.id, ()):
                     p = self.unit_map.get(pid)
                     if p and p.role == "processor":
                         fb = hack_r * 0.6
@@ -2281,29 +2329,29 @@ class ImmuneCogGraph(CogGraph):
                         p.meta.record(action="hack_defense", reward=fb)
 
             # —— 4.2) 黑客惩罚 —— #
-            if hasattr(u, "position") and u.position in priv_positions:
-                u.energy = max(0.0, u.energy - penalty_per_node)
-                u.meta.record(action="hack_failure", reward=-penalty_per_node)
+            if hasattr(u_k, "position") and u_k.position in priv_positions:
+                u_k.energy = max(0.0, u_k.energy - penalty_per_node)
+                u_k.meta.record(action="hack_failure", reward=-penalty_per_node)
                 logger.info(
-                    f"[黑客惩罚] emitter {u.id} 在 {u.position} 未清除提权，扣能量 {penalty_per_node}，菜就多练!"
+                    f"[黑客惩罚] emitter {u_k.id} 在 {u_k.position} 未清除提权，扣能量 {penalty_per_node}，菜就多练!"
                 )
             # —— 不动/打圈惩罚 —— #
-            if not hasattr(u, "output_positions"):
-                u.output_positions = deque(maxlen=20)
-            if (len(u.output_positions) == u.output_positions.maxlen
+            if not hasattr(u_k, "output_positions"):
+                u_k.output_positions = deque(maxlen=20)
+            if (len(u_k.output_positions) == u_k.output_positions.maxlen
                     and self.current_step % 10 == 0):
-                start = u.output_positions[0]
-                end = u.output_positions[-1]
+                start = u_k.output_positions[0]
+                end = u_k.output_positions[-1]
                 manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
 
                 if manhattan < 3:
-                    u.energy -= 0.1
-                    u.meta.record(action="idle_penalty", reward=-0.1)
+                    u_k.energy -= 0.3
+                    u_k.meta.record(action="idle_penalty", reward=-0.1)
 
-                uniq = len(set(u.output_positions))
+                uniq = len(set(u_k.output_positions))
                 if uniq <= 3:
-                    u.energy -= 0.14
-                    u.meta.record(action="loop_penalty", reward=-0.14)
+                    u_k.energy -= 0.5
+                    u_k.meta.record(action="loop_penalty", reward=-0.14)
         # —— 6) 全局黑客防御奖励 —— #
         cleared_priv = (prev_priv > 0.04).sum() - (self.env.privilege_level > 0.04).sum()
         reduced_vuln = (prev_vuln - self.env.vulnerability).clamp(min=0).sum()
@@ -2328,18 +2376,24 @@ class ImmuneCogGraph(CogGraph):
 
         self.energy_pool = max(self.energy_pool, 0.0)
 
-        # —— 7) 超时病毒惩罚 —— #
-        dur_map = self.env.infected_duration_map
-        overlong_mask = (dur_map > 100)
+        # —— 7) 超时病毒惩罚（使用 true_inf_age_map） —— #
+        overlong_mask = (self.true_inf_age_map > 100)
         num_overlong = overlong_mask.sum().item()
 
-        if num_overlong > 0 and self.current_step > 2000:
-            penalty = 0.05 * num_overlong
-            logger.warning(f"[超时病毒惩罚] 有 {num_overlong} 个病毒超过 50 回合，全体每个细胞扣能量 {penalty:.2f}")
+        if num_overlong > 1 and self.current_step > 3000:
+            penalty = 0.01 * num_overlong
+            logger.warning(f"[超时病毒惩罚] 有 {num_overlong} 个格子持续感染超 100 回合，全体每个细胞扣能量 {penalty:.2f}")
             for u in self.units:
                 u.energy = max(0.0, u.energy - penalty)
                 u.meta.record(action="timeout_penalty", reward=-penalty)
+
+            # 同时，把这些格子的计时都重置
+            self.env.infected_duration_map[overlong_mask] = 0
+            self.true_inf_age_map[overlong_mask] = 0
+
         self.punished_map &= (self.env.infected_map > 0)
+
+
 
     def _run_emitter_actions(self):
         size = self.env.size
