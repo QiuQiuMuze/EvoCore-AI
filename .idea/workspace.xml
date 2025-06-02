@@ -7,8 +7,6 @@
     <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ImmuneCogGraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/ImmuneCogGraph.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/env_net.py" beforeDir="false" afterPath="$PROJECT_DIR$/env_net.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -169,7 +167,7 @@
       <workItem from="1748318369940" duration="7307000" />
       <workItem from="1748478262043" duration="43437000" />
       <workItem from="1748600437463" duration="46791000" />
-      <workItem from="1748823342151" duration="5219000" />
+      <workItem from="1748823342151" duration="8917000" />
     </task>
     <servers />
   </component>

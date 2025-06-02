@@ -6,6 +6,7 @@ from collections import deque, Counter
 from coggraph import CogGraph
 import copy
 from env_net import GridSecurityEnv
+from torch.nn.functional import conv2d
 from emitter_actions import EmitterActions
 from memory_net_unit import MemoryNetUnit
 from processor_immune import ImmuneProcessor
@@ -682,9 +683,6 @@ class ImmuneCogGraph(CogGraph):
         new_H, new_W = self.env.size, self.env.size
         self.learnable_sensor.resize(new_H, new_W)
 
-
-
-
     def _update_hack_channels(self):
         """每 step 调用：检查 hack 点变化，更新 self._hack_onehot"""
         new_keys = set(self.env.hacks.keys())
@@ -692,17 +690,25 @@ class ImmuneCogGraph(CogGraph):
             return
 
         size = self.env.size
-        # 重建 flat indices
-        flat_idxs = [
-            self.hack_type_to_idx[info['type']] * (size*size) + (hy*size + hx)
-            for (hx, hy), info in self.env.hacks.items()
-        ]
-        self._hack_flat_indices = torch.tensor(flat_idxs, dtype=torch.long, device=self.device)
+        coords = list(self.env.hacks.keys())
+        if not coords:
+            # 没有任何 hack 点，直接清零并更新 last_hack_keys
+            self._hack_onehot.zero_()
+            self._last_hack_keys = new_keys
+            return
 
-        # zero + scatter
+        types = [self.env.hacks[xy]['type'] for xy in coords]
+        hx_list, hy_list = zip(*coords)
+        hx_tensor = torch.tensor(hx_list, dtype=torch.long, device=self.device)
+        hy_tensor = torch.tensor(hy_list, dtype=torch.long, device=self.device)
+        type_indices = [self.hack_type_to_idx[t] for t in types]
+        type_tensor = torch.tensor(type_indices, dtype=torch.long, device=self.device)
+
+        flat_position = hy_tensor * size + hx_tensor
+        flat_idxs = type_tensor * (size * size) + flat_position
+
         self._hack_onehot.zero_()
-        self._hack_onehot[0].scatter_(0, self._hack_flat_indices, 1.0)
-
+        self._hack_onehot[0].scatter_(0, flat_idxs, 1.0)
         self._last_hack_keys = new_keys
 
     def _update_target_vector(self):
@@ -1694,16 +1700,16 @@ class ImmuneCogGraph(CogGraph):
     def _apply_and_reward(self, unit, action):
         """
         如果 action['type'] 是 ACTION_BLOCK，就把 action['target'] 作为 3×3 中心：
-          1) 基于 orig_inf 里该 3×3 区域内所有 orig_inf>0.04 的格子，构造一个 all_to_clear 列表（去重后）；
+          1) 用一次 3×3 卷积/限域掩码找出所有要清理的感染点；
           2) hits = len(all_to_clear)，并更新 kill_stats、virus_kill_stats_by_type，以及 unit.cleared_positions；
           3) 对 all_to_clear 中每个坐标依次 perform() 清理；
           4) 统一根据 hits 发放能量奖励。
 
-        如果 action['type'] 是 ACTION_HACK_DEFENSE，现在也做「3×3 批量扫描→批量清理→一次性奖励」：
-          1) 在 orig_priv、orig_stealth 快照里，把目标 (x,y) 周围 3×3 范围内所有的 hack 点（privilege_level>0.04 或 hack_strength>0.04）都收集起来；
+        如果 action['type'] 是 ACTION_HACK_DEFENSE，也做同样的 3×3 限域 → 卷积 → 清理 → 一次性奖励：
+          1) 用限域掩码只保留 target 周围 3×3 的 hack 种子，再卷积找出所有要清理的 hack 点；
           2) hits = len(all_to_clear)，更新 hack_kill_stats、hack_kill_stats_by_type，以及 unit.cleared_hack；
           3) 对 all_to_clear 里每个坐标都执行一次 perform(ACTION_HACK_DEFENSE)；
-          4) 统一根据 hits 发放能量奖励（同病毒分支里的缩放方式）。
+          4) 统一根据 hits 发放能量奖励（“传播点=0.01”“命名点=1.0”“全命名点×5倍”）。
 
         其余类型（QUARANTINE）逻辑不变。
         """
@@ -1721,7 +1727,7 @@ class ImmuneCogGraph(CogGraph):
         state_vec = unit.get_output().detach().view(-1).cpu()
         goal_flat = self.tv_cached.view(1, -1)
 
-        # hack 通道准备（与原来一致）
+        # hack 通道准备（保持不变）
         hack_maps = []
         for t in self.env.attack_types:
             mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
@@ -1741,34 +1747,35 @@ class ImmuneCogGraph(CogGraph):
         hits = 0
         total_reward = 0.0
 
+        # 3×3 卷积核（都用同一个）
+        kernel3 = torch.ones((1, 1, 3, 3), device=self.device, dtype=torch.float32)
+
         if action["type"] == ACTION_BLOCK:
             cx0, cy0 = action["target"]
 
-            # —— ① 构造 to_clear（中心 3×3 区域内的感染点） —— #
-            to_clear = []
+            # —— ① 先做“种子点”掩码：target 周围 3×3 且 orig_inf>阈值 的位置 —— #
+            seed_mask = torch.zeros_like(orig_inf, dtype=torch.float32, device=self.device)  # [H,W]
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
-                    cx = cx0 + dx
-                    cy = cy0 + dy
-                    if 0 <= cx < W and 0 <= cy < H and orig_inf[cy, cx] > 0.04:
-                        v_info = self.env.attacks.get((cx, cy), None)
-                        virus_type = "扩散点" if v_info is None else v_info.get("type", "virus")
-                        to_clear.append((cx, cy, virus_type))
+                    xx = cx0 + dx
+                    yy = cy0 + dy
+                    if 0 <= xx < W and 0 <= yy < H and orig_inf[yy, xx] > 0.04:
+                        seed_mask[yy, xx] = 1.0
 
-            # —— ② 基于 to_clear 构造 all_to_clear（去重后的实际 3×3 覆盖集合） —— #
-            clear_dict = {}
-            for (cx, cy, _) in to_clear:
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        x = cx + dx
-                        y = cy + dy
-                        if 0 <= x < W and 0 <= y < H and orig_inf[y, x] > 0.04:
-                            v_info2 = self.env.attacks.get((x, y), None)
-                            virus_type2 = "扩散点" if v_info2 is None else v_info2.get("type", "virus")
-                            clear_dict[(x, y)] = virus_type2
-            all_to_clear = [(x, y, vt) for ((x, y), vt) in clear_dict.items()]
+            # —— ② 对 seed_mask 做一次 3×3 卷积 → neighbor_from_seed —— #
+            seed_bin = seed_mask.unsqueeze(0).unsqueeze(0)                    # [1,1,H,W]
+            neighbor_from_seed = conv2d(seed_bin, kernel3, padding=1)[0, 0]    # [H,W]
 
-            # —— ③ 更新 kill_stats、virus_kill_stats_by_type、unit.cleared_positions —— #
+            # —— ③ all_to_clear：只保留 (neighbor_from_seed>0 且 orig_inf>阈值) 的位置 —— #
+            mask_to_clear = (neighbor_from_seed > 0) & (orig_inf > 0.04)  # [H,W] bool
+            ys, xs = torch.nonzero(mask_to_clear, as_tuple=True)
+            all_to_clear = []
+            for y, x in zip(ys.tolist(), xs.tolist()):
+                v_info = self.env.attacks.get((x, y), None)
+                virus_type = "扩散点" if v_info is None else v_info.get("type", "virus")
+                all_to_clear.append((x, y, virus_type))
+
+            # —— ④ 更新 kill_stats、virus_kill_stats_by_type、unit.cleared_positions —— #
             hits = len(all_to_clear)
             if hits > 0:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
@@ -1781,26 +1788,41 @@ class ImmuneCogGraph(CogGraph):
                     bucket_v[src] += 1
                     unit.cleared_positions.add((x, y))
 
-                # —— ④ perform 每个坐标的清理 —— #
+                # —— ⑤ perform 每个坐标的清理 —— #
                 for (x, y, _) in all_to_clear:
                     self.emitter_actions.perform({
                         "type": ACTION_BLOCK,
                         "target": (x, y)
                     })
 
-                # —— ⑤ 统一奖励，根据场上感染数衰减 —— #
+                # —— ⑥ 统一奖励：根据“扩散点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
                 factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
-                reward = HIT_BONUS * hits * factor * scale
 
+                weighted_hits = 0.0
+                for (_, _, virus_type) in all_to_clear:
+                    if virus_type == "扩散点":
+                        weighted_hits += 0.01
+                    else:
+                        weighted_hits += 1.0
+
+                multiplier = 5.0 if not any(vt == "扩散点" for (_, _, vt) in all_to_clear) else 1.0
+
+                reward = HIT_BONUS * weighted_hits * factor * scale * multiplier
                 unit.energy += reward
-                unit.meta.record(action="hit_bonus", reward=reward)
+                unit.meta.record(action="defense", reward=reward)
                 total_reward += reward
-                logger.warning(f"[清理奖励] 本次共清除 {hits} 个病毒，获得能量 {reward:.2f}")
 
-                # —— ⑥ 距离 bonus & 上游 processor 分成 —— #
-                infected_points = torch.nonzero(self.env.infected_map > 0).tolist()
+                logger.warning(
+                    f"[清理奖励] 总权重 {weighted_hits:.2f}，"
+                    f"带名字点倍率 {multiplier}×，"
+                    f"场上感染数 {curr_inf_count} → 缩放 {scale:.3f}，"
+                    f"最终能量 {reward:.2f}"
+                )
+
+                # —— ⑦ 距离 bonus & 上游 processor 分成 —— #
+                infected_points = torch.nonzero(self.env.infected_map > 0.04).tolist()
                 if infected_points and hasattr(unit, "position"):
                     ux, uy = unit.position
                     dists = [math.hypot(ux - px, uy - py) for (py, px) in infected_points]
@@ -1818,34 +1840,35 @@ class ImmuneCogGraph(CogGraph):
             hit = (hits > 0)
 
         elif action["type"] == ACTION_HACK_DEFENSE:
-            # —— 新增：和病毒一样做 3×3 批量扫描 —— #
             x0, y0 = action["target"]
 
-            # ① 在原始快照里找出 3×3 区域内所有 hack 点
-            to_clear = []
+            # —— ① 先做“hack 种子点”掩码：target 周围 3×3 中 orig_priv>阈值 或 orig_stealth>阈值 的位置 —— #
+            hack_seed = torch.zeros_like(orig_priv, dtype=torch.float32, device=self.device)  # [H,W]
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
-                    x = x0 + dx
-                    y = y0 + dy
-                    if 0 <= x < W and 0 <= y < H:
-                        # 只要在 orig_priv 或 orig_stealth 有值，就视为“hack 点”
-                        if orig_priv[y, x] > 0.04 or orig_stealth[y, x] > 0.04:
-                            info = self.env.hacks.get((x, y), None)
-                            hack_type = "传播点" if info is None else info.get("type", "unknown")
-                            to_clear.append((x, y, hack_type))
+                    xx = x0 + dx
+                    yy = y0 + dy
+                    if (0 <= xx < W and 0 <= yy < H and
+                        (orig_priv[yy, xx] > 0.04 or orig_stealth[yy, xx] > 0.04)):
+                        hack_seed[yy, xx] = 1.0
 
-            # ② 把 to_clear 扩展到实际的 all_to_clear（去重即可，这里 3×3 扫描已经不需要再扩）
-            #     由于我们只在 3×3 范围里判断一次，所以直接用 to_clear 去重就行
-            clear_dict = {}
-            for (x, y, hack_type) in to_clear:
-                clear_dict[(x, y)] = hack_type
-            all_to_clear = [(x, y, ht) for ((x, y), ht) in clear_dict.items()]
+            # —— ② 对 hack_seed 做一次 3×3 卷积 → neighbor_hack —— #
+            hack_seed_bin = hack_seed.unsqueeze(0).unsqueeze(0)                 # [1,1,H,W]
+            neighbor_hack = conv2d(hack_seed_bin, kernel3, padding=1)[0, 0]     # [H,W]
 
-            # ③ 更新 hack_kill_stats、hack_kill_stats_by_type、unit.cleared_hack
+            # —— ③ all_to_clear：只保留 (neighbor_hack>0 且 (orig_priv>阈值 或 orig_stealth>阈值)) 的点 —— #
+            valid_mask = (neighbor_hack > 0) & ((orig_priv > 0.04) | (orig_stealth > 0.04))
+            ys, xs = torch.nonzero(valid_mask, as_tuple=True)
+            all_to_clear = []
+            for y, x in zip(ys.tolist(), xs.tolist()):
+                info = self.env.hacks.get((x, y), None)
+                hack_type = "传播点" if info is None else info.get("type", "unknown")
+                all_to_clear.append((x, y, hack_type))
+
+            # —— ④ 更新 hack_kill_stats、hack_kill_stats_by_type、unit.cleared_hack —— #
             hits = len(all_to_clear)
             if hits > 0:
                 src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
-                # 新增 cleared_hack 集合，用来给 _apply_defense_rewards 批量奖励
                 unit.cleared_hack = set()
                 for (x, y, hack_type) in all_to_clear:
                     self.hack_kill_stats[src] += 1
@@ -1855,28 +1878,40 @@ class ImmuneCogGraph(CogGraph):
                     bucket_h[src] += 1
                     unit.cleared_hack.add((x, y))
 
-                # ④ perform 每个坐标的清理
+                # —— ⑤ perform 每个坐标的清理 —— #
                 for (x, y, _) in all_to_clear:
                     self.emitter_actions.perform({
                         "type": ACTION_HACK_DEFENSE,
                         "target": (x, y)
                     })
 
-                # ⑤ 统一奖励，根据场上剩余 hack 数量衰减
+                # —— ⑥ 统一奖励：根据“传播点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
                 factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.2
-                reward = HIT_BONUS * hits * factor * scale
 
-                unit.energy += reward
-                unit.meta.record(action="hack_defense", reward=reward)
-                total_reward += reward
+                weighted_hits = 0.0
+                for (_, _, hack_type) in all_to_clear:
+                    if hack_type == "传播点":
+                        weighted_hits += 0.01
+                    else:
+                        weighted_hits += 1.0
+
+                multiplier = 5.0 if not any(ht == "传播点" for (_, _, ht) in all_to_clear) else 1.0
+
+                hack_reward = HIT_BONUS * weighted_hits * factor * scale * multiplier
+                unit.energy += hack_reward
+                unit.meta.record(action="hack_defense", reward=hack_reward)
+                total_reward += hack_reward
+
                 logger.warning(
-                    f"[黑客批量奖励] 本次共清除 {hits} 个 hack，场上剩余 hack={curr_hack_count}，"
-                    f"缩放后获得能量 {reward:.2f}"
+                    f"[黑客批量奖励] 总权重 {weighted_hits:.2f}，"
+                    f"带名字点倍率 {multiplier}×，"
+                    f"场上剩余 hack {curr_hack_count} → 缩放 {scale:.3f}，"
+                    f"最终能量 {hack_reward:.2f}"
                 )
 
-                # 距离 bonus & 上游 processor 分成（同病毒逻辑）
+                # —— 距离 bonus & 上游 processor 分成 —— #
                 hack_positions = [(x, y) for (x, y, _) in all_to_clear]
                 if hack_positions and hasattr(unit, "position"):
                     ux, uy = unit.position
@@ -1888,12 +1923,12 @@ class ImmuneCogGraph(CogGraph):
                 for pid in self.reverse_connections.get(unit.id, ()):
                     p = self.unit_map.get(pid)
                     if p and p.role == "processor":
-                        fb = reward * 0.6
+                        fb = hack_reward * 0.6
                         p.energy += fb
                         p.meta.record(action="upstream", reward=fb)
 
             else:
-                # 如果 3×3 范围内根本没有 hack 点，就算打空
+                # 如果 3×3 范围内没有 hack 点，就算打空
                 total_reward += -MISS_PENALTY
                 unit.energy = max(0.0, unit.energy - MISS_PENALTY)
                 unit.meta.record(action="miss_penalty", reward=-MISS_PENALTY)
@@ -1906,12 +1941,12 @@ class ImmuneCogGraph(CogGraph):
             hit = False
             total_reward += 0.0
 
-        # === 3) A2C 更新、PER 更新等逻辑不变 ===
+        # === 3) A2C 更新、PER 更新等逻辑不变（只不过 VALUE_HEAD 批量扩容保持旧逻辑） === #
         next_raw_state = self.env.get_state_tensor().to(self.device)
         next_state_tensor = next_raw_state.view(1, -1)
-        goal_flat = self.tv_cached.view(1, -1)
-        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)
-        full_next_state = torch.cat([next_state_tensor, hack_flat, goal_flat], dim=1)
+        goal_flat_next = self.tv_cached.view(1, -1)
+        hack_flat_next = torch.stack(hack_maps, dim=0).view(1, -1)
+        full_next_state = torch.cat([next_state_tensor, hack_flat_next, goal_flat_next], dim=1)
 
         with torch.no_grad():
             D_in2 = full_state.size(1)
@@ -1944,10 +1979,8 @@ class ImmuneCogGraph(CogGraph):
         if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
             self.rl_buffer.append(transition, priority)
 
-        # # A2C 更新
-        # self.policy_update(state_tensor, self.last_flat_idx, total_reward)
-
         return total_reward
+
 
     def _record_antibody_effectiveness(self, action: dict, feat: torch.Tensor):
         """判断抗体动作是否成功清除感染，并更新计数器"""
@@ -2308,24 +2341,39 @@ class ImmuneCogGraph(CogGraph):
                 u.meta.record(action="timeout_penalty", reward=-penalty)
         self.punished_map &= (self.env.infected_map > 0)
 
-
     def _run_emitter_actions(self):
         size = self.env.size
         seq_len = size * size
 
-        # 先把当前环境状态打平成 [1, D_env]，供后续 policy_update 使用
+        # 先把当前环境状态打平成 [1, D_env]，供后续 batch 更新使用
         raw = self.env.get_state_tensor()  # [C, H, W]
         state_tensor = raw.view(1, -1).to(self.device)  # [1, D_env]
+
+        # 构造 hack_flat 和 goal_flat
+        hack_maps = []
+        for t in self.env.attack_types:
+            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
+            for (hx, hy), info in self.env.hacks.items():
+                if info.get('type') == t:
+                    mask[hy, hx] = 1.0
+            hack_maps.append(mask)
+        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)  # [1, D_hack]
+        goal_flat = self.tv_cached.view(1, -1)  # [1, D_goal]
+
+        # 收集所有需要批量更新的 emitter 及其 flat_idx 和 reward
+        batch_units = []
+        batch_flats = []
+        batch_rewards = []
 
         for unit in self.units:
             if unit.role != "emitter" or not hasattr(unit, "get_output"):
                 continue
 
             unit.guided_this_round = False
-            action_vec = unit.get_output()  # 长度 3*seq_len
+            action_vec = unit.get_output()  # [3*seq_len]
             action = self._decode_action_from_output(unit, action_vec)
 
-            # 先把 act_type 和 flat_idx_cell 都算出来
+            # 先算出 act_type 与 flat_idx_cell
             if action["type"] == "move":
                 act_type = 0
             elif action["type"] == ACTION_BLOCK:
@@ -2337,17 +2385,59 @@ class ImmuneCogGraph(CogGraph):
             flat_idx_cell = y * size + x  # [0..seq_len-1]
             flat_for_rl = act_type * seq_len + flat_idx_cell  # [0..3*seq_len-1]
 
-            # MOVE 分支：先移动，然后 continue，不做奖励
+            # MOVE：只移动、不做奖励
             if action["type"] == "move":
                 unit.position = (x, y)
                 continue
 
-            # BLOCK 或 HACK_DEFENSE 分支：调用 _apply_and_reward，得到 total_reward
+            # BLOCK 或 HACK_DEFENSE：先算 reward、再收集到 batch
             total_reward = self._apply_and_reward(unit, action)
+            batch_units.append(unit)
+            batch_flats.append(flat_for_rl)
+            batch_rewards.append(total_reward)
 
-            # 最后把完整的扁平下标（含动作类型）传给 policy_update
-            # 注意：state_tensor 需要在外面预先定义。示例里假设它一直在作用域里。
-            self.policy_update(state_tensor, flat_for_rl, total_reward)
+        # 如果没有任何 BLOCK/HACK_DEFENSE，就直接 return
+        if not batch_units:
+            return
+
+        # ==== 统一做一次 batch A2C 更新 ====
+        B = len(batch_units)
+        flat_tensor = torch.tensor(batch_flats, dtype=torch.long, device=self.device)  # [B]
+        reward_tensor = torch.tensor(batch_rewards, dtype=torch.float32, device=self.device)  # [B]
+
+        # 构造 full_state_batch: [B, D_env+D_hack+D_goal]
+        fs_env = state_tensor.expand(B, -1)  # [B, D_env]
+        fs_hack = hack_flat.expand(B, -1)  # [B, D_hack]
+        fs_goal = goal_flat.expand(B, -1)  # [B, D_goal]
+        full_state_batch = torch.cat([fs_env, fs_hack, fs_goal], dim=1)  # [B, total_dim]
+
+        # —— 1) 前向：Sensor → Processor → Emitter logits
+        sensor_out_b = self._sensor_net(full_state_batch)  # [B, H_s]
+        proc_out_b = self.processor_net(sensor_out_b)  # [B, H_p]
+        logits_b = self.emitter_net(proc_out_b)  # [B, 3*seq_len]
+        probs_b = torch.softmax(logits_b, dim=-1)  # [B, 3*seq_len]
+
+        # —— 2) 取出各自的 log π(a|s)
+        idx_batch = torch.arange(B, device=self.device)
+        logp_b = torch.log(probs_b[idx_batch, flat_tensor] + 1e-8)  # [B]
+
+        # —— 3) Critic：估计 V(s)
+        value_b = self.value_head(full_state_batch).squeeze(-1)  # [B]
+        advantage_b = reward_tensor - value_b.detach()  # [B]
+
+        # —— 4) 计算 loss
+        actor_loss_b = - (logp_b * advantage_b).mean()
+        critic_loss_b = torch.nn.functional.mse_loss(value_b, reward_tensor)
+        entropy_b = torch.distributions.Categorical(logits=logits_b).entropy().mean()
+
+        total_loss = actor_loss_b + 0.5 * critic_loss_b - self.entropy_coef * entropy_b
+
+        # —— 5) 反向更新
+        self.policy_optimizer.zero_grad()
+        self.value_optimizer.zero_grad()
+        total_loss.backward()
+        self.policy_optimizer.step()
+        self.value_optimizer.step()
 
     def _decode_action_from_output(self, unit, output_vec):
         """
@@ -2515,7 +2605,6 @@ class ImmuneCogGraph(CogGraph):
         total_loss.backward()
         self.policy_optimizer.step()
         self.value_optimizer.step()
-
 
 
 
