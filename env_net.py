@@ -85,13 +85,13 @@ class GridSecurityEnv:
         self.attack_types = {
             'worm':    {'spread_prob': 0.2, 'stealth': 0.0, 'burst': False},
             'trojan':  {'spread_prob': 0.05, 'stealth': 0.6, 'burst': False},
-            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.25, 'burst_area': 3},
-            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.15, 'burst_area': 2},
-            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.2, 'burst_area': 4},
+            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.4, 'burst_area': 3},
+            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
+            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
         }
 
         self.attacks = {}
-        self.hack_spawn_interval = 50
+        self.hack_spawn_interval = 20
         self.hack_types = {
             'bruteforce':      {'spawn_prob': 0.02, 'max_fail': 5},
             'phishing':        {'spawn_prob': 0.01, 'stealth':0.8},
@@ -155,69 +155,84 @@ class GridSecurityEnv:
         # 同时把新键加入 _last_attack_keys（如果 _spawn_attack 也可能在 step() 里调用多次，保证最终增量同步）
         self._last_attack_keys.add((x, y))
 
-    def _expand_environment(self, growth=2):
+    def _expand_environment(self, growth: int = 2):
+        """
+        将网格从 old_size 扩展到 new_size (= old_size + growth)。
+        同时正确重建所有依赖于 “flat 索引 = y * size + x” 的一维缓存：
+          * self._attack_type_flat   （记录每格病毒类型索引，-1 表示无）
+          * self._hack_onehot        （黑客 one-hot）
+        这样后续扩散 / hack 逻辑不会出现坐标错位。
+        """
         old_size = self.size
-        new_size = old_size + growth
-        new_size = min(40, new_size)
+        new_size = min(40, old_size + growth)  # 最大 40×40
+        if new_size == old_size:  # 没有真正扩容
+            return
         self.size = new_size
 
-        def expand(tensor, fill=0.0):
-            new_t = torch.full(
-                (new_size, new_size),
-                fill,
-                dtype=tensor.dtype,
-                device=tensor.device
-            )
-            new_t[:old_size, :old_size] = tensor
-            return new_t
+        # ---------- 1) 辅助函数：把二维张量扩到新尺寸 ----------
+        def _expand(tensor, fill_val=0):
+            new = torch.full((new_size, new_size),
+                             fill_val,
+                             dtype=tensor.dtype,
+                             device=tensor.device)
+            new[:old_size, :old_size] = tensor
+            return new
 
-        # —— 扩展原有的各种图 —— #
-        self.infected_map = expand(self.infected_map)
-        self.infected_duration_map = expand(self.infected_duration_map, fill=0)
+        # ---------- 2) 扩容所有 2-D 状态张量 ----------
+        self.infected_map = _expand(self.infected_map)
+        self.infected_duration_map = _expand(self.infected_duration_map, fill_val=0)
+        self.infection_strength = _expand(self.infection_strength)
+        self.attack_history = _expand(self.attack_history)
+        self.behavior_score = _expand(self.behavior_score)
+        self.is_quarantined = _expand(self.is_quarantined)
+        self.visited_map = _expand(self.visited_map, fill_val=False)
+        self.net_traffic = _expand(self.net_traffic)
+        self.perm_level = _expand(self.perm_level)
 
-        self.infection_strength = expand(self.infection_strength)
-        self.attack_history = expand(self.attack_history)
-        self.behavior_score = expand(self.behavior_score)
-        self.is_quarantined = expand(self.is_quarantined)
-        self.visited_map = expand(self.visited_map, fill=False)
-        self.net_traffic = expand(self.net_traffic)
-        self.perm_level = expand(self.perm_level)
+        # --- 黑客相关张量 ---
+        self.hack_history = _expand(self.hack_history)
+        self.hack_strength = _expand(self.hack_strength)
+        self.vulnerability = _expand(self.vulnerability,
+                                     fill_val=torch.rand(()).item() * 0.5)
+        self.privilege_level = _expand(self.privilege_level)
+        self.login_failures = _expand(self.login_failures)
 
-        # —— 一并扩展所有“黑客”相关张量 —— #
-        # 已有历史要保留，新节点 vulnerability 可以给个随机初始
-        self.hack_history = expand(self.hack_history)
-        self.hack_strength = expand(self.hack_strength)
-        self.vulnerability = expand(self.vulnerability, fill=random.random() * 0.5)
-        self.privilege_level = expand(self.privilege_level)
-        self.login_failures = expand(self.login_failures)
-
-        # 保持 device 一致
-        self.device = self.infected_map.device
-
-        # —— 扩展 syscall_history 中的历史帧 —— #
-        new_syscalls = deque(maxlen=20)
+        # ---------- 3) 扩容 syscall_history 中的历史帧 ----------
+        new_history = deque(maxlen=self.syscall_history.maxlen)
         for t in self.syscall_history:
-            pad_t = torch.full((self.size, self.size), 0.0, device=self.device)
-            old_size = t.shape[0]
-            pad_t[:old_size, :old_size] = t
-            new_syscalls.append(pad_t)
-        self.syscall_history = new_syscalls
+            pad = torch.zeros((new_size, new_size),
+                              dtype=t.dtype, device=t.device)
+            pad[:old_size, :old_size] = t
+            new_history.append(pad)
+        self.syscall_history = new_history
 
-        # 假设 new_size = self.size 已经更新
-        old_flat_len = old_size * old_size
-        new_flat_len = new_size * new_size
+        # ---------- 4) 重新构建一维缓存向量 ----------
+        flat_len = new_size * new_size
 
-        # 先备份旧的 one-hot / 类型索引
-        old_hack = self._hack_onehot
-        old_type = self._attack_type_flat
+        # 4-a) _attack_type_flat：先全部置 -1，然后按 self.attacks 重写
+        self._attack_type_flat = torch.full((flat_len,),
+                                            -1,
+                                            dtype=torch.long,
+                                            device=self.device)
+        for (x, y), info in self.attacks.items():
+            flat = y * new_size + x
+            type_idx = list(self.attack_types).index(info['type'])
+            self._attack_type_flat[flat] = type_idx
+        self._last_attack_keys = set(self.attacks.keys())  # 同步
 
-        # 重新分配新的向量，先全部清零（或 -1）
-        self._hack_onehot = torch.zeros(new_flat_len, dtype=torch.float32, device=self.device)
-        self._attack_type_flat = torch.full((new_flat_len,), -1, dtype=torch.long, device=self.device)
+        # 4-b) _hack_onehot：先清零，再按 self.hacks 重写
+        self._hack_onehot = torch.zeros(flat_len,
+                                        dtype=torch.float32,
+                                        device=self.device)
+        if self.hacks:
+            flats = torch.tensor([y * new_size + x for (x, y) in self.hacks],
+                                 dtype=torch.long, device=self.device)
+            self._hack_onehot[flats] = 1.0
+        self._last_hack_keys = set(self.hacks.keys())  # 同步
 
-        # 把原来对应的 [0:old_flat_len] 区域拷贝回去
-        self._hack_onehot[:old_flat_len] = old_hack
-        self._attack_type_flat[:old_flat_len] = old_type
+        # ---------- 5) 内部辅助计数器保持一致 ----------
+        # 注意：如果你在别处保存了依赖旧尺寸的索引，也要同步刷新
+        # 例如：self._kernel4, self._max_burst_kernel 已经按最大尺寸预生成，无需改动
 
     def resize(self, new_size):
         growth = new_size - self.size
@@ -411,7 +426,7 @@ class GridSecurityEnv:
         curr = int((self.infected_map > 0.04).sum().item())
 
         # 代替固定间隔触发入侵
-        spawn_chance = 1 / self.spawn_interval  # e.g. 每步有 1/200 概率
+        spawn_chance = 5 / self.spawn_interval  # e.g. 每步有 5/200 概率
         if curr < max_inf and random.random() < spawn_chance and self.step_count >= 0:
             self._spawn_attack()
 

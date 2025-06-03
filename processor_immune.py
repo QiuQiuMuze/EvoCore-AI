@@ -112,16 +112,16 @@ class ImmuneProcessor(nn.Module):
             feats = feats.unsqueeze(0)
         return self.classifier(feats)
 
-
     def classify_and_match(self, state: torch.Tensor) -> Optional[Dict]:
         """
         处理输入状态并返回防御策略
         :param state: 单个细胞/格子的状态张量，shape=[C, H, W]
         :return: 防御策略字典或 None
         """
+        # 1) 提取特征向量
         vec = self._extract_features(state)
 
-        # —— 安全解包 memory.match 的返回值 —— #
+        # 2) 特异性匹配：从记忆池里找相似样本
         match_res = self.memory.match(
             vec, k=3, similarity_threshold=self.similarity_threshold
         )
@@ -131,41 +131,54 @@ class ImmuneProcessor(nn.Module):
             action, sim = match_res
         else:
             action, sim = match_res, None
-        # 记录一下最后一次相似度
+
+        # 记录最近一次相似度
         self.last_similarity = sim
         if action:
-            return action  # 特异性防御
+            return action  # 如果记忆里有对应动作，优先返回
 
+        # 3) 新增：如果检测到感染，就返回 ACTION_BLOCK 清理病毒
+        #    假设 state[0] 是 "infected_map" 通道
+        infected_map = state[0]  # shape = [H, W]
+        flat_inf = infected_map.flatten()
+        max_inf = flat_inf.max().item()
+        if max_inf > 0.00:
+            idx = flat_inf.argmax().item()
+            # W = state.size(2)
+            y, x = divmod(idx, state.size(2))
+            return {"type": "block", "target": (x, y)}
 
-        # 2. 模糊规则：根据行为异常评分决定通用隔离
-        anomaly_score = state[3].mean().item()  # 通道3：行为评分
+        # 4) 模糊规则：根据行为异常评分决定通用隔离
+        #    通道 3 是“行为评分”
+        anomaly_score = state[3].mean().item()
         if anomaly_score > 0.5:
             target = self._loc_of_max(state[3])
             return {"type": "quarantine", "target": target}
 
-        # 3) 模糊规则—黑客防御
-        # 3.1 暴力破解：login_failures 通道是索引 13
+        # 5) 模糊规则—黑客防御
+        # 5.1 暴力破解：login_failures 通道是索引 13
         lf = state[13].flatten()
-        if lf.max().item() > 5:  # fix me: silly check
+        if lf.max().item() > 5:
             idx = lf.argmax().item()
             y, x = divmod(idx, state.size(2))
             return {"type": "kill_process", "target": (x, y)}
 
-        # 3.2 提权检测：privilege_level 通道是索引 12
+        # 5.2 提权检测：privilege_level 通道是索引 12
         pl = state[12].flatten()
         if pl.max().item() > 0.5:
             idx = pl.argmax().item()
             y, x = divmod(idx, state.size(2))
             return {"type": "demote_privilege", "target": (x, y)}
 
-        # 脆弱度过高时打补丁
+        # 5.3 脆弱度过高：vulnerability 通道是索引 11
         vuln = state[11].flatten()
         if vuln.max().item() > 0.8:
             pos = self._loc_of_max(state[11])
             return {"type": "restore_vulnerability", "target": pos}
 
-        # 3. 默认不采取动作
+        # 6) 默认不采取动作
         return None
+
 
     def _loc_of_max(self, matrix: torch.Tensor) -> Tuple[int, int]:
         """
