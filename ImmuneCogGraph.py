@@ -150,6 +150,20 @@ class ImmuneCogGraph(CogGraph):
         self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
         seq_len = self.env.size * self.env.size
 
+        # ─────────── 静息模式相关字段 ─────────── #
+        # 统计连续多少步内环境没有任何感染 & 没有任何黑客
+        self.no_threat_steps = 0
+        # 连续多少步无威胁就进入静息：可以调整，比如设 100
+        self.static_threshold = 100
+        # 标记是否在静息模式下
+        self.static_mode = False
+        # 记录进入静息模式时的 step，用于保护单元 age 不增长
+        self.static_mode_entry_step = None
+        # 记录退出静息模式时的 step，用于短期保护 CogUnit 不被误杀
+        self.static_mode_exit_step = -1
+        self._orig_age = {}
+
+        # ──────────────────────────────────────── #
         # —— 使用带 n_step 的 PER ——（n=3, γ=0.99）
         self.gamma = 0.99
         # 专门给 RL 用
@@ -403,31 +417,79 @@ class ImmuneCogGraph(CogGraph):
         except:
             self._sensor_net = self.sensor_net
 
+    import math
+    import torch
+
     def _run_sensor_scans(self):
         """
-        直接从 env.infected_map / env.privilege_level 里做阈值扫描，
-        把所有 > thr 的格子坐标写入 self.known_infections / self.known_hacks。
+        将全局网格按当前所有 sensor 单元数量分段，让它们各自扫描自己负责的区间（可重合），
+        最后把扫描到的坐标统一写入 self.known_infections / self.known_hacks。
         """
-        thr = 0.04  # 任何实际数值 > 0.04 就认为是感染（或提权）点
+        thr = 0.04  # 阈值：任何实际数值 > 0.04 就认为是感染（或提权）点
 
         # 先清空旧的记录
         self.known_infections.clear()
         self.known_hacks.clear()
 
-        # 1) 感染阈值扫描
-        inf_mask = (self.env.infected_map > thr)       # [H, W] bool
-        ys_inf, xs_inf = torch.nonzero(inf_mask, as_tuple=True)
-        for y, x in zip(ys_inf.tolist(), xs_inf.tolist()):
-            # torch.nonzero 返回 (行=y，列=x)
-            self.known_infections.add((int(x), int(y)))
+        # 找到所有 role=="sensor" 的单元
+        sensors = [u for u in self.units if getattr(u, "role", None) == "sensor"]
+        num_sensors = len(sensors)
 
-        # 2) 提权阈值扫描
-        hack_mask = (self.env.privilege_level > thr)   # [H, W] bool
-        ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
-        for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
-            self.known_hacks.add((int(x), int(y)))
+        # 如果没有 sensor，就直接整表扫描（退回到原逻辑）
+        H, W = self.env.infected_map.shape
+        total_cells = H * W
+        if num_sensors == 0:
+            # 感染阈值扫描
+            inf_mask = (self.env.infected_map > thr)  # [H, W] bool
+            ys_inf, xs_inf = torch.nonzero(inf_mask, as_tuple=True)
+            for y, x in zip(ys_inf.tolist(), xs_inf.tolist()):
+                self.known_infections.add((int(x), int(y)))
 
+            # 提权阈值扫描
+            hack_mask = (self.env.privilege_level > thr)
+            ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
+            for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
+                self.known_hacks.add((int(x), int(y)))
+            return
 
+        # 否则，把所有格子按 num_sensors 均分给他们
+        inf_flat = self.env.infected_map.view(-1)  # [H*W]
+        hack_flat = self.env.privilege_level.view(-1)  # [H*W]
+        # 计算每个 sensor 负责的扁平索引区间大小
+        chunk_size = math.ceil(total_cells / num_sensors)
+
+        for i in range(num_sensors):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_cells)
+
+            # 1) 当前 sensor 扫描自己负责区间内的“感染点”
+            segment_inf = inf_flat[start:end]  # [chunk_size]
+            # 在这段里找 > thr 的索引
+            idxs_local_inf = torch.nonzero(segment_inf > thr, as_tuple=True)[0]
+            for local_idx in idxs_local_inf.tolist():
+                flat_idx = local_idx + start
+                x = flat_idx % W
+                y = flat_idx // W
+                self.known_infections.add((int(x), int(y)))
+
+            # 2) 当前 sensor 扫描自己负责区间内的“提权点”
+            segment_hack = hack_flat[start:end]
+            idxs_local_hack = torch.nonzero(segment_hack > thr, as_tuple=True)[0]
+            for local_idx in idxs_local_hack.tolist():
+                flat_idx = local_idx + start
+                x = flat_idx % W
+                y = flat_idx // W
+                self.known_hacks.add((int(x), int(y)))
+
+        # （可选）如果你希望“扫描可以重合”——
+        #  上面我们直接把网格均分给不同 sensor，间隙是不会重叠的。
+        #  如果你想让它们重叠几行/几列，只需把每个 [start:end] 的计算
+        #  改成稍微多取几格，比如：
+        #      overlap = 2  # 每段多留 2 个单元重叠
+        #      start = max(0, i*chunk_size - overlap)
+        #      end = min(total_cells, (i+1)*chunk_size + overlap)
+        #
+        #  然后再运行同样的局部扫描即可。
 
     def _handle_reward_and_penalty(self):
         """
@@ -814,43 +876,6 @@ class ImmuneCogGraph(CogGraph):
         ys, xs = torch.nonzero(free, as_tuple=True)  # 返回一对张量：ys, xs
         self.free_positions = [(int(xx), int(yy)) for xx, yy in zip(xs, ys)]
 
-
-    def _static_step(self, full_state: torch.Tensor):
-        """
-        静息模式下的一步：只对 active emitter 走一次 sense→act→update 流程，
-        其它单元完全冻结，并执行奖励/惩罚 & 系统维护。
-        """
-        # —— 1) 更新所有 emitter 的 goal_vec —— #
-        for u in self.units:
-            if u.role == "emitter":
-                # tv_cached 在 step() 里已设为最新 target_vector
-                u.goal_vec = self.tv_cached
-                u.current_hazard_xy = getattr(self, "current_hazard_xy", None)
-
-        # —— 2) 发射动作 —— #
-        self._run_emitter_actions()
-
-        # —— 3) 让所有未 resting 的 emitter 真正跑一次 update —— #
-        active_ids = {u.id for u in self.units if u.role == "emitter" and not getattr(u, "resting", False)}
-        expected_in = full_state.shape[1]
-        for u in self.units:
-            if u.id in active_ids:
-                inp = self._prepare_unit_before_update(u, full_state, expected_in)
-                self._apply_unit_metabolism(u, inp)
-                u.update(inp)
-                # 恢复 age（让‘静息’之外的 emitter 也能正确地冻结/唤醒）
-                u.age = self._orig_age.get(u.id, u.age)
-
-        # 奖励 / 惩罚（是否触发退出静息）
-        self._handle_reward_and_penalty()
-
-        # 所有 resting 单元的 age 冻结
-        for u in self.units:
-            if getattr(u, "resting", False):
-                u.age = self._orig_age.get(u.id, u.age)
-
-        # 最后做一次全局维护
-        self._perform_system_maintenance()
 
     def sensor_forward(self, flat_state: torch.Tensor):
         # 保证 [B, D_full]
@@ -1346,6 +1371,86 @@ class ImmuneCogGraph(CogGraph):
                 list(self.goal_net.parameters())
         )
 
+    def _check_enter_static_mode(self):
+        """
+        每一步在 step() 末尾调用：
+          1) 如果不在静息模式：只要环境（known_infections, known_hacks）都为空，就 no_threat_steps += 1；
+             一旦 no_threat_steps >= static_threshold，就进入静息模式 (_enter_static_mode)。
+          2) 如果已经在静息模式：只要出现 任意（感染 or 黑客），就退出静息模式 (_exit_static_mode)。
+        """
+        no_infections = len(self.known_infections) == 0
+        no_hacks = len(self.known_hacks) == 0
+
+        if not self.static_mode:
+            # 如果当前不在静息模式
+            if no_infections and no_hacks:
+                self.no_threat_steps += 1
+            else:
+                self.no_threat_steps = 0
+
+            if self.no_threat_steps >= self.static_threshold:
+                # 连续多步“无感染 & 无黑客”，触发静息
+                self._enter_static_mode()
+        else:
+            # 已在静息模式：只要出现任一感染 or 黑客，就退出
+            if not (no_infections and no_hacks):
+                self._exit_static_mode()
+
+    def _enter_static_mode(self):
+        """
+        切换到静息模式：
+          • 标记 static_mode=True
+          • 记录进入静息模式的 step
+          • 冻结所有单元的 age（存到 self._orig_age 里）
+        """
+        self.static_mode = True
+        self.static_mode_entry_step = self.current_step
+
+        # 存储每个单元当前 age，后续在静息中一直保持这个值
+        for u in self.units:
+            self._orig_age[u.id] = u.age
+
+        logger.warning(
+            f"[进入静息模式] step={self.current_step}；"
+            f"已连续 {self.static_threshold} 步无感染／无黑客，开始休眠"
+        )
+
+
+    def _exit_static_mode(self):
+        """
+        退出静息模式，恢复正常流程：
+          • static_mode=False
+          • 重置 no_threat_steps
+          • 记录退出静息的 step，用于短期保护 CogUnit 不被误杀
+        """
+        self.static_mode = False
+        self.no_threat_steps = 0
+        self.static_mode_exit_step = self.current_step
+        logger.warning(
+            f"[退出静息模式] step={self.current_step}；"
+            f"检测到新威胁，重新上线"
+        )
+
+    def _static_step(self, full_state: torch.Tensor):
+        """
+        静息模式下的一步：只让 sensor 扫描环境（更新 known_infections/known_hacks），
+        其它单元完全冻结（age/energy 不变），也不做任何结构维护。
+        """
+        # —— 1) 冻结所有单元的 age —— #
+        for u in self.units:
+            u.age = self._orig_age.get(u.id, u.age)
+
+        # —— 2) 扫描一次环境，把 known_infections/known_hacks 都更新 —— #
+        self._threshold_scan()
+
+        # —— 3) 如果这一步发现了任何感染 or 黑客，就立即退出静息 —— #
+        if len(self.known_infections) > 0 or len(self.known_hacks) > 0:
+            self._exit_static_mode()
+            return
+
+        # —— 4) 如果依旧无威胁，一切保持冻结，直接返回 —— #
+        return
+
     def step(self, input_tensor: torch.Tensor):
         self.current_step += 1
 
@@ -1378,34 +1483,15 @@ class ImmuneCogGraph(CogGraph):
         self._update_global_counts()
         self._expand_energy_cap_if_needed()
 
-        # 解包环境状态 + 目标（当前设计中：未访问区域 + 感染热图 + 提权热图）
-        env_dim = self.env.size * self.env.size * self._STATE_CHANNELS
-        env_state = input_tensor[:, :env_dim]  # 通道 0~(_STATE_CHANNELS-1)
-
-        unvisited_map = self.target_vector[0].unsqueeze(0)  # [1, size²]
-        infected_map  = self.target_vector[1].unsqueeze(0)  # [1, size²]
-        privileged_map = self.target_vector[2].unsqueeze(0)  # [1, size²]
-
-        # 填充 full_state 缓冲区
-        fs = self._full_state_buf
-        fs[:, :self._D_env] = env_state
-        fs[:, self._D_env: self._D_env + self._D_hack] = self._hack_onehot
-
-        offset = self._D_env + self._D_hack
-        fs[:, offset: offset + self._S2] = unvisited_map
-        fs[:, offset + self._S2: offset + 2 * self._S2] = infected_map
-        fs[:, offset + 2 * self._S2: offset + 3 * self._S2] = privileged_map
-
-        full_state = fs  # [1, D_env + D_hack + D_goal]
-
-        # --- 2) 病毒环境推进 --- #
-        prev_infected = self.env.infected_map.clone()
-        prev_dur      = self.prev_dur.clone() if hasattr(self, "prev_dur") else torch.zeros_like(self.env.infected_duration_map)
-        prev_priv     = self.env.privilege_level.clone()
-        prev_vuln     = self.env.vulnerability.clone()
-        prev_fail     = self.env.login_failures.clone()
-
-        self.env.step()
+        # ——— 用私有方法代替之前那段“解包+推进环境” —— #
+        (
+            full_state,
+            prev_infected,
+            prev_dur,
+            prev_priv,
+            prev_vuln,
+            prev_fail
+        ) = self._prepare_and_step_env(input_tensor)
 
         if RF.use_shared_tx and self.current_step % RF.shared_tx_interval == 0:
             self._run_shared_transformer()
@@ -1416,8 +1502,12 @@ class ImmuneCogGraph(CogGraph):
         state_snapshot = full_state.detach().squeeze(0).to(self.device)
         prev_energies  = {u.id: u.energy for u in self.units}
 
+
+        # —— 如果当前处于静息模式，直接调用 _static_step 并 return —— #
         if self.static_mode:
-            return self._static_step(full_state)
+            # full_state 参数这里不实际用到，传 None 也可以
+            return self._static_step(None)
+
 
         self.tv_cached = self.target_vector.detach()
         self._rebuild_free_positions()
@@ -1426,81 +1516,19 @@ class ImmuneCogGraph(CogGraph):
         if self.current_step % 40 == 0:
             self.rebalance_cell_types()
 
-        # ——— 不再用 SensorMLP 训练，直接用阈值扫描 ———— #
-        thr = 0.04  # 阈值：只要 env.map > 0.04 就算“确实有感染/提权”
-        # ① 清空旧的 known_infections / known_hacks
-        self.known_infections.clear()
-        self.known_hacks.clear()
+        # ——— 用私有方法代替阈值扫描 ——— #
+        self._threshold_scan()
 
-        # ② 扫描真实感染格
-        inf_mask = (self.env.infected_map > thr)
-        ys_true, xs_true = torch.nonzero(inf_mask, as_tuple=True)
-        true_coords = [(int(x), int(y)) for x, y in zip(xs_true.tolist(), ys_true.tolist())]
-
-        # ③ 直接把这些坐标加入 known_infections 作为“预测结果”
-        for y, x in zip(ys_true.tolist(), xs_true.tolist()):
-            self.known_infections.add((int(x), int(y)))
-
-        # ④ 扫描真实提权格
-        hack_mask = (self.env.privilege_level > thr)
-        ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
-        for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
-            self.known_hacks.add((int(x), int(y)))
-
-        # ⑤ 打印真实 vs “预测”（此时二者会完全一致）
-        pred_coords = list(self.known_infections)
-        if self.current_step % 50 == 0:
-            logger.warning(f"[Step {self.current_step}] 真实感染坐标：{true_coords}")
-            logger.warning(f"[Step {self.current_step}] 预测感染坐标：{pred_coords}")
-        # ——— _run_sensor_scans 部分到此结束 ——— #
-
-        # —— 然后让各单元继续执行：分配目标、访问记录等 —— #
-        tensor_state = self.env.get_state_tensor()
-        for u in self.units:
-            if u.role == "emitter":
-                u.goal_vec = self.tv_cached
-
-            # 2) 所有单元做 metabolism + update，但 expected 输入维度按角色决定
-            if u.role == "sensor":
-                exp_in = full_state.shape[1]
-            elif u.role == "processor":
-                exp_in = self.processor_hidden_size
-            elif u.role == "emitter":
-                exp_in = self.emitter_hidden_size
-            else:
-                exp_in = self.processor_hidden_size
-
-            # 3) SpecialEmitter 独立执行 step
-            if isinstance(u, SpecialEmitter):
-                u.step(tensor_state)
-
-            # 4) 给 emitter 分配个人 goal 并更新访问记录
-            if u.role == "emitter" and hasattr(u, "position"):
-                self._assign_emitter_goal(u)
-                x, y = u.position
-                if 0 <= x < self.env.size and 0 <= y < self.env.size:
-                    self.env.visited_map[y, x] = True
-                    self.visit_age_map[y, x] = 0
-
-        # —— 发射动作 & A2C 更新 —— #
-        self._run_emitter_actions()
-
-        for u in self.units:
-            if u.role == "emitter":
-                u.goal_vec = self.tv_cached
-
-        # --- 4) 免疫识别 & 抗体响应（保持原来逻辑，若已注释可跳过） --- #
-        # （此处如果没有使用 ImmuneProcessor，则保持空或原本实现）
-
-        # 5) 收集 emitter 输出等
-        outs = self.collect_emitter_outputs()
-        emitter_outs = outs if outs is not None and isinstance(outs, list) and len(outs) > 0 else []
-
-        # 6) 应用防御奖励 & 惩罚
-        self._apply_defense_rewards(
-            prev_infected, prev_dur,
-            prev_priv, prev_vuln, prev_fail
+        # —— 用私有方法处理单元逻辑 & 防御奖励 —— #
+        emitter_outs = self._process_units_and_defense(
+            full_state,
+            prev_infected,
+            prev_dur,
+            prev_priv,
+            prev_vuln,
+            prev_fail
         )
+
 
         # --- 8) 记录长期记忆 --- #
         if self.current_step % 100 == 0:
@@ -1535,42 +1563,8 @@ class ImmuneCogGraph(CogGraph):
         self._maybe_report_by_stage()
 
         if self.current_step % 500 == 0:
-            batch_size = 10
-            if len(self.rl_buffer) < batch_size:
-                logger.warning(f"[PER 跳过] RL buffer 大小 {len(self.rl_buffer)} < {batch_size}")
-            else:
-                samples, indices, is_weights = self.rl_buffer.sample(batch_size, beta=0.4)
-
-                # --- 先 pad / truncate 保证同样长度 ---
-                feat_dim = self.replay_head.in_features
-                padded = []
-                for tr in samples:
-                    st = tr["state"]
-                    if st.shape[0] < feat_dim:
-                        pad = torch.zeros(feat_dim - st.shape[0], dtype=st.dtype, device=st.device)
-                        st = torch.cat([st, pad], dim=0)
-                    elif st.shape[0] > feat_dim:
-                        st = st[:feat_dim]
-                    padded.append(st)
-                states = torch.stack(padded, dim=0).to(self.device)
-
-                labels = torch.tensor([s["label"] for s in samples], device=self.device)
-                is_weights = is_weights.to(self.device)
-
-                self.optimizer.zero_grad()
-                logits = self.replay_head(states)  # (B,2)
-                per_loss = F.cross_entropy(logits, labels, reduction='none')
-                loss = (per_loss * is_weights).mean()
-                loss.backward()
-                self.optimizer.step()
-                self.scheduler.step()
-
-                # 更新 priority
-                with torch.no_grad():
-                    probs = torch.softmax(logits, dim=-1)
-                    logp = torch.log(probs[range(batch_size), labels] + 1e-6)
-                    td_errors = (per_loss.detach().cpu() + 1e-6).tolist()
-                self.rl_buffer.update_priorities(indices, td_errors)
+            # ——— 用私有方法处理 PER 训练 —— #
+            self._train_from_replay_buffer(batch_size=10, beta=0.4)
 
         # === meta-learning 更新 === #
         if self.current_step % 1000 == 0 and self.current_step > 1000:
@@ -1586,21 +1580,7 @@ class ImmuneCogGraph(CogGraph):
 
         # ——— 更新 target_weights ——— #
         if self.current_step % 5 == 0:
-            inf_mask = (self.env.infected_map > 0.04).float()
-            infected_intensity = (self.env.infected_map * inf_mask).sum().item()
-            hack_mask2 = (self.env.privilege_level > 0.04).float()
-            hack_intensity = (self.env.privilege_level * hack_mask2).sum().item()
-            total_area = self.env.size ** 2
-            w0 = 1.0
-            if infected_intensity == 0:
-                w1 = 0.0
-            else:
-                w1 = min(2.0, max(1.1, infected_intensity / total_area * 10))
-            if hack_intensity == 0:
-                w2 = 0.0
-            else:
-                w2 = min(2.0, max(1.2, hack_intensity / 5.0))
-            self.target_weights = torch.tensor([w0, w1, w2], device=self.device)
+            self._update_target_weights()
 
         # —— 打印击杀统计 & 单元数统计 —— #
         if self.current_step % 50 == 0:
@@ -1619,6 +1599,244 @@ class ImmuneCogGraph(CogGraph):
             self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
             self.hack_kill_stats.update(self_direct=0, guided=0)
 
+
+    def _update_target_weights(self):
+        """
+        根据当前 env.infected_map 和 env.privilege_level 计算
+        infected_intensity 和 hack_intensity 并更新 self.target_weights：
+          • w0 恒为 1.0
+          • w1 = 0               if 没有感染
+                 = clamp(infected_intensity/total_area*10, 1.1, 2.0)
+          • w2 = 0               if 没有 hack
+                 = clamp(hack_intensity/5, 1.2, 2.0)
+        """
+        # 1) 计算感染强度
+        inf_mask = (self.env.infected_map > 0.04).float()
+        infected_intensity = (self.env.infected_map * inf_mask).sum().item()
+
+        # 2) 计算黑客强度
+        hack_mask2 = (self.env.privilege_level > 0.04).float()
+        hack_intensity = (self.env.privilege_level * hack_mask2).sum().item()
+
+        total_area = self.env.size ** 2
+        w0 = 1.0
+
+        if infected_intensity == 0:
+            w1 = 0.0
+        else:
+            w1 = min(2.0, max(1.1, infected_intensity / total_area * 10))
+
+        if hack_intensity == 0:
+            w2 = 0.0
+        else:
+            w2 = min(2.0, max(1.2, hack_intensity / 5.0))
+
+        # 3) 更新 target_weights 张量
+        self.target_weights = torch.tensor([w0, w1, w2], device=self.device)
+
+    def _train_from_replay_buffer(self, batch_size: int = 10, beta: float = 0.4):
+        """
+        从 self.rl_buffer 中采样 batch_size 个样本，用 PER 更新 policy：
+          1) 检查 buffer 大小，如果不足就直接跳过并打印警告
+          2) sample(batch_size, beta)，得到 samples、indices、is_weights
+          3) 对每个样本的 'state' 做 pad/截断，保证维度等于 replay_head.in_features
+          4) 构造 labels、is_weights，计算交叉熵 loss，并反向更新 optimizer + scheduler
+          5) 用当前 batch 的 td_errors 更新 replay_buffer 的优先级
+        """
+        if len(self.rl_buffer) < batch_size:
+            logger.warning(f"[PER 跳过] RL buffer 大小 {len(self.rl_buffer)} < {batch_size}")
+            return
+
+        # 2) 采样
+        samples, indices, is_weights = self.rl_buffer.sample(batch_size, beta=beta)
+
+        # 3) pad / truncate 保证 state 维度一致
+        feat_dim = self.replay_head.in_features
+        padded_states = []
+        for tr in samples:
+            st = tr["state"]
+            if st.shape[0] < feat_dim:
+                pad = torch.zeros(feat_dim - st.shape[0], dtype=st.dtype, device=st.device)
+                st = torch.cat([st, pad], dim=0)
+            elif st.shape[0] > feat_dim:
+                st = st[:feat_dim]
+            padded_states.append(st)
+        states = torch.stack(padded_states, dim=0).to(self.device)  # [B, feat_dim]
+
+        labels = torch.tensor([s["label"] for s in samples], device=self.device)       # [B]
+        is_weights = is_weights.to(self.device)                                          # [B]
+
+        # 4) 计算 loss 并反向更新
+        self.optimizer.zero_grad()
+        logits = self.replay_head(states)                # [B, 2]
+        per_loss = F.cross_entropy(logits, labels, reduction='none')  # [B]
+        loss = (per_loss * is_weights).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+
+        # 5) 更新 priority
+        with torch.no_grad():
+            # 计算 td_errors = per_loss.detach().cpu() + 1e-6
+            td_errors = (per_loss.detach().cpu() + 1e-6).tolist()
+        self.rl_buffer.update_priorities(indices, td_errors)
+
+    def _process_units_and_defense(
+            self,
+            full_state: torch.Tensor,
+            prev_infected: torch.Tensor,
+            prev_dur: torch.Tensor,
+            prev_priv: torch.Tensor,
+            prev_vuln: torch.Tensor,
+            prev_fail: torch.Tensor
+    ):
+        """
+        1) 为所有单元分配目标并更新访问记录（SpecialEmitter 用 step() 处理）
+        2) 执行 _run_emitter_actions() → 发射动作 + A2C 更新
+        3) 再次把 goal_vec 同步给所有 emitter
+        4) 收集 emitter 输出
+        5) 调用 _apply_defense_rewards(...)，传入推进前的环境快照
+        返回：
+            emitter_outs: collect_emitter_outputs() 的结果（如果为空则为 []）
+        """
+        # —— 1) 给各单元分配目标、更新访问记录 —— #
+        tensor_state = self.env.get_state_tensor()
+        for u in self.units:
+            if u.role == "emitter":
+                # 同步最新的全局目标向量
+                u.goal_vec = self.tv_cached
+
+            # 计算本轮 expected 输入维度（虽然这里没真正用到 exp_in 做后续处理，但保留原注释意图）
+            if u.role == "sensor":
+                exp_in = full_state.shape[1]
+            elif u.role == "processor":
+                exp_in = self.processor_hidden_size
+            elif u.role == "emitter":
+                exp_in = self.emitter_hidden_size
+            else:
+                exp_in = self.processor_hidden_size
+
+            # 如果是 SpecialEmitter，则单独调用它的 step(tensor_state)
+            if isinstance(u, SpecialEmitter):
+                u.step(tensor_state)
+
+            # 如果是 emitter，就分配个人目标，并把访问 visited_map/visit_age_map 置零
+            if u.role == "emitter" and hasattr(u, "position"):
+                self._assign_emitter_goal(u)
+                x, y = u.position
+                if 0 <= x < self.env.size and 0 <= y < self.env.size:
+                    self.env.visited_map[y, x] = True
+                    self.visit_age_map[y, x] = 0
+
+        # —— 2) 发射动作 & A2C 更新 —— #
+        self._run_emitter_actions()
+
+        # —— 3) 再次把最新目标同步给所有 emitter —— #
+        for u in self.units:
+            if u.role == "emitter":
+                u.goal_vec = self.tv_cached
+
+        # —— 4) 收集 emitter 输出 —— #
+        outs = self.collect_emitter_outputs()
+        emitter_outs = outs if (outs is not None and isinstance(outs, list) and len(outs) > 0) else []
+
+        # —— 5) 应用防御奖励 & 惩罚 —— #
+        self._apply_defense_rewards(prev_infected, prev_dur, prev_priv, prev_vuln, prev_fail)
+
+        return emitter_outs
+
+    def _threshold_scan(self):
+        """
+        用传感器分片扫描（run_sensor_scans），然后再打印“真实 vs 预测”。
+        如果当前没有任何 role="sensor" 的单元，_run_sensor_scans() 会退化成原先的全图一次性阈值扫描。
+        """
+
+        # ——— 1) 先调用 _run_sensor_scans()，让各个传感器单元去负责自己那块扫描 ———
+        # 这样就把 self.known_infections / self.known_hacks 更新好了
+        self._run_sensor_scans()
+
+        # ——— 2) 清空一下原来的记录（这里只是演示，你也可以把“清空”逻辑挪到 run_sensor_scans 里） ———
+        #    如果你希望直接依赖 run_sensor_scans 里清空的逻辑，就不要重复清空。
+        #    下面两行可以注释掉或者删除：
+        # self.known_infections.clear()
+        # self.known_hacks.clear()
+        #
+        #    因为 _run_sensor_scans() 本身已经在一开始清空了两者，所以这里不用重清空。
+
+        # ——— 3) 打印“真实 vs 预测”的逻辑完全保留 ———
+        #     这里的“真实”就是直接从 env.infected_map / env.privilege_level 门槛筛选出来的
+        thr = 0.04
+        # 3.1 扫描真实感染格
+        inf_mask = (self.env.infected_map > thr)
+        ys_true, xs_true = torch.nonzero(inf_mask, as_tuple=True)
+        true_coords = [(int(x), int(y)) for x, y in zip(xs_true.tolist(), ys_true.tolist())]
+
+        # 3.2 扫描真实提权格
+        hack_mask = (self.env.privilege_level > thr)
+        ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
+        true_hack_coords = [(int(x), int(y)) for x, y in zip(xs_hack.tolist(), ys_hack.tolist())]
+
+        # 3.3 打印日志：真实 VS 预测
+        if self.current_step % 50 == 0:
+            logger.warning(f"[Step {self.current_step}] 真实感染坐标：{true_coords}")
+            logger.warning(f"[Step {self.current_step}] 预测感染坐标：{list(self.known_infections)}")
+            logger.warning(f"[Step {self.current_step}] 真实提权坐标：{true_hack_coords}")
+            logger.warning(f"[Step {self.current_step}] 预测提权坐标：{list(self.known_hacks)}")
+
+    def _prepare_and_step_env(self, input_tensor: torch.Tensor):
+        """
+        将以下逻辑打包：
+          1) 解包环境状态 + 目标向量 → 构造 full_state
+          2) 保存 prev_infected / prev_dur / prev_priv / prev_vuln / prev_fail
+          3) 推进环境 self.env.step()
+        返回：
+            full_state: [1, D_env + D_hack + D_goal] 的张量
+            prev_infected: 推进前的 self.env.infected_map.clone()
+            prev_dur: 推进前的 self.prev_dur.clone() 或全零张量
+            prev_priv: 推进前的 self.env.privilege_level.clone()
+            prev_vuln: 推进前的 self.env.vulnerability.clone()
+            prev_fail: 推进前的 self.env.login_failures.clone()
+        """
+        # 1) 解包环境状态 + 目标（未访问、感染、提权）
+        size = self.env.size
+        # env_dim = size * size * STATE_CHANNELS
+        env_dim = size * size * self._STATE_CHANNELS
+        env_state = input_tensor[:, :env_dim]  # 通道0～(_STATE_CHANNELS-1)
+
+        unvisited_map = self.target_vector[0].unsqueeze(0)    # [1, size²]
+        infected_map   = self.target_vector[1].unsqueeze(0)    # [1, size²]
+        privileged_map = self.target_vector[2].unsqueeze(0)    # [1, size²]
+
+        # 填充 full_state 缓冲区
+        fs = self._full_state_buf
+        fs[:, :self._D_env] = env_state
+        fs[:, self._D_env: self._D_env + self._D_hack] = self._hack_onehot
+
+        offset = self._D_env + self._D_hack
+        # unvisited → 通道0
+        fs[:, offset: offset + self._S2] = unvisited_map
+        # infected → 通道1
+        fs[:, offset + self._S2: offset + 2 * self._S2] = infected_map
+        # privileged → 通道2
+        fs[:, offset + 2 * self._S2: offset + 3 * self._S2] = privileged_map
+
+        full_state = fs  # [1, D_env + D_hack + D_goal]
+
+        # 2) 保存环境推进前的快照
+        prev_infected = self.env.infected_map.clone()
+        prev_dur      = (
+            self.prev_dur.clone()
+            if hasattr(self, "prev_dur")
+            else torch.zeros_like(self.env.infected_duration_map)
+        )
+        prev_priv = self.env.privilege_level.clone()
+        prev_vuln = self.env.vulnerability.clone()
+        prev_fail = self.env.login_failures.clone()
+
+        # 3) 推进环境
+        self.env.step()
+
+        return full_state, prev_infected, prev_dur, prev_priv, prev_vuln, prev_fail
 
     def _sample_meta_tasks(self, num_tasks=5, k_support=4, k_query=4):
         """
