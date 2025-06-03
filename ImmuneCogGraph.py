@@ -1758,7 +1758,7 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“扩散点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.4
+                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.1
 
                 weighted_hits = 0.0
                 for (_, _, virus_type) in all_to_clear:
@@ -1853,7 +1853,7 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“传播点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.4
+                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.1
 
                 weighted_hits = 0.0
                 for (_, _, hack_type) in all_to_clear:
@@ -2230,7 +2230,7 @@ class ImmuneCogGraph(CogGraph):
             cleared = len(getattr(u_k, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-                base_reward = 1
+                base_reward = 0.6
                 scale = 1.0 / (1.0 + curr_inf_count)
                 reward = base_reward * scale
                 if getattr(u_k, "guided_this_round", False):
@@ -2258,7 +2258,7 @@ class ImmuneCogGraph(CogGraph):
 
             # ==== NEW：hack 清理奖励（若 cleared_hack 属性存在）====
             if hasattr(u_k, "cleared_hack") and u_k.cleared_hack:
-                hack_r = 2
+                hack_r = 1.2
                 if getattr(u_k, "guided_this_round", False):
                     hack_r *= GUIDED_FACTOR
 
