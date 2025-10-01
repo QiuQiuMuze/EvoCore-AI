@@ -2003,6 +2003,7 @@ class ImmuneCogGraph(CogGraph):
         attacks_snapshot = {pos: info.get('type', 'virus') for pos, info in self.env.attacks.items()}
         hacks_snapshot = {pos: info.get('type', 'unknown') for pos, info in self.env.hacks.items()}
 
+
         upstream_processors = [
             self.unit_map.get(pid)
             for pid in self.reverse_connections.get(unit.id, ())
@@ -2020,6 +2021,7 @@ class ImmuneCogGraph(CogGraph):
 
             infected_before = orig_inf > infection_thr
             self.emitter_actions.perform(action)
+
 
             new_inf = self.env.infected_map.clone()
             infected_after = new_inf > infection_thr
@@ -2069,6 +2071,7 @@ class ImmuneCogGraph(CogGraph):
             outcome = "infection_clear" if reward > 0 else "infection_fail"
             hit = hits > 0
 
+
         elif action["type"] == ACTION_HACK_DEFENSE:
             x0, y0 = action["target"]
             target_idx = y0 * size + x0
@@ -2104,6 +2107,7 @@ class ImmuneCogGraph(CogGraph):
                     unit.cleared_hack.add((x, y))
             else:
                 unit.cleared_hack.clear()
+
 
             cleared_strength = float((orig_priv - new_priv).clamp(min=0).sum().item() +
                                       (orig_stealth - new_stealth).clamp(min=0).sum().item())
@@ -2157,8 +2161,8 @@ class ImmuneCogGraph(CogGraph):
         if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
             next_raw_state = self.env.get_state_tensor().to(self.device)
             next_state_tensor = next_raw_state.view(1, -1)
-            next_state_tensor = self._ensure_state_channel_capacity(next_state_tensor)
-            goal_flat_next = self.tv_cached.view(1, -1).to(self.device)
+
+            goal_flat_next = self.tv_cached.view(1, -1)
 
             hack_maps_after = []
             for t in self.env.attack_types:
