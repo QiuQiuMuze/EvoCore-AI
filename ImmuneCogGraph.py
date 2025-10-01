@@ -420,79 +420,92 @@ class ImmuneCogGraph(CogGraph):
         except:
             self._sensor_net = self.sensor_net
 
-    import math
-    import torch
-
     def _run_sensor_scans(self):
         """
-        将全局网格按当前所有 sensor 单元数量分段，让它们各自扫描自己负责的区间（可重合），
-        最后把扫描到的坐标统一写入 self.known_infections / self.known_hacks。
+        将全局网格按当前所有 sensor 单元数量分段，由它们基于噪声观测/网络输出推断威胁，
+        而非直接读取 ground-truth map。这样 emitters 必须依赖学习到的策略与 guidance。
         """
-        thr = 0.04  # 阈值：任何实际数值 > 0.04 就认为是感染（或提权）点
+        thr = self.detect_thresh
 
         # 先清空旧的记录
         self.known_infections.clear()
         self.known_hacks.clear()
 
-        # 找到所有 role=="sensor" 的单元
         sensors = [u for u in self.units if getattr(u, "role", None) == "sensor"]
-        num_sensors = len(sensors)
+        num_sensors = max(len(sensors), 1)
 
-        # 如果没有 sensor，就直接整表扫描（退回到原逻辑）
-        H, W = self.env.infected_map.shape
+        infected_map = self.env.infected_map
+        privilege_map = self.env.privilege_level
+        H, W = infected_map.shape
         total_cells = H * W
-        if num_sensors == 0:
-            # 感染阈值扫描
-            inf_mask = (self.env.infected_map > thr)  # [H, W] bool
-            ys_inf, xs_inf = torch.nonzero(inf_mask, as_tuple=True)
-            for y, x in zip(ys_inf.tolist(), xs_inf.tolist()):
-                self.known_infections.add((int(x), int(y)))
 
-            # 提权阈值扫描
-            hack_mask = (self.env.privilege_level > thr)
-            ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
-            for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
-                self.known_hacks.add((int(x), int(y)))
-            return
+        noise_scale = 0.08
+        signal_infected = torch.clamp(
+            infected_map + torch.randn_like(infected_map, generator=self._rng) * noise_scale,
+            0.0,
+            1.0,
+        )
+        signal_priv = torch.clamp(
+            privilege_map + torch.randn_like(privilege_map, generator=self._rng) * noise_scale,
+            0.0,
+            1.0,
+        )
 
-        # 否则，把所有格子按 num_sensors 均分给他们
-        inf_flat = self.env.infected_map.view(-1)  # [H*W]
-        hack_flat = self.env.privilege_level.view(-1)  # [H*W]
-        # 计算每个 sensor 负责的扁平索引区间大小
+        inf_flat = signal_infected.view(-1)
+        hack_flat = signal_priv.view(-1)
+
         chunk_size = math.ceil(total_cells / num_sensors)
 
-        for i in range(num_sensors):
-            start = i * chunk_size
-            end = min(start + chunk_size, total_cells)
+        def _sample_detection(segment: torch.Tensor, sensor_bias: float) -> torch.Tensor:
+            # sensor_bias 越大越敏感，但也有更高噪声
+            sensitivity = 1.0 + 0.35 * (sensor_bias - 1.0)
+            logits = (segment - thr) * (4.0 * sensitivity)
+            base_prob = torch.sigmoid(logits)
+            jitter = torch.rand_like(base_prob, generator=self._rng) * 0.25
+            return torch.rand_like(base_prob, generator=self._rng) < torch.clamp(base_prob + jitter - 0.1, 0.0, 1.0)
 
-            # 1) 当前 sensor 扫描自己负责区间内的“感染点”
-            segment_inf = inf_flat[start:end]  # [chunk_size]
-            # 在这段里找 > thr 的索引
-            idxs_local_inf = torch.nonzero(segment_inf > thr, as_tuple=True)[0]
-            for local_idx in idxs_local_inf.tolist():
+        for idx, sensor in enumerate(sensors or [None]):
+            start = idx * chunk_size
+            end = min(start + chunk_size, total_cells)
+            if start >= end:
+                continue
+
+            sensor_bias = 1.0
+            if sensor is not None:
+                gene = getattr(sensor, "gene", {})
+                if isinstance(gene, dict):
+                    sensor_bias = float(gene.get("sensor_bias", 1.0))
+
+            segment_inf = inf_flat[start:end]
+            mask_inf = _sample_detection(segment_inf, sensor_bias)
+            idxs_inf = torch.nonzero(mask_inf, as_tuple=True)[0]
+            for local_idx in idxs_inf.tolist():
                 flat_idx = local_idx + start
                 x = flat_idx % W
                 y = flat_idx // W
                 self.known_infections.add((int(x), int(y)))
 
-            # 2) 当前 sensor 扫描自己负责区间内的“提权点”
             segment_hack = hack_flat[start:end]
-            idxs_local_hack = torch.nonzero(segment_hack > thr, as_tuple=True)[0]
-            for local_idx in idxs_local_hack.tolist():
+            mask_hack = _sample_detection(segment_hack, sensor_bias)
+            idxs_hack = torch.nonzero(mask_hack, as_tuple=True)[0]
+            for local_idx in idxs_hack.tolist():
                 flat_idx = local_idx + start
                 x = flat_idx % W
                 y = flat_idx // W
                 self.known_hacks.add((int(x), int(y)))
 
-        # （可选）如果你希望“扫描可以重合”——
-        #  上面我们直接把网格均分给不同 sensor，间隙是不会重叠的。
-        #  如果你想让它们重叠几行/几列，只需把每个 [start:end] 的计算
-        #  改成稍微多取几格，比如：
-        #      overlap = 2  # 每段多留 2 个单元重叠
-        #      start = max(0, i*chunk_size - overlap)
-        #      end = min(total_cells, (i+1)*chunk_size + overlap)
-        #
-        #  然后再运行同样的局部扫描即可。
+        # 额外记录诊断日志：早期阶段传感器常常错过真实威胁
+        true_inf = (infected_map > thr).sum().item()
+        true_hack = (privilege_map > thr).sum().item()
+        if self.current_step < 50:
+            if true_inf > 0 and len(self.known_infections) == 0:
+                logger.info(
+                    f"[GuidanceDiagnostics] Step {self.current_step}: sensors未能定位 {true_inf} 个感染热点（等待学习/引导介入）。"
+                )
+            if true_hack > 0 and len(self.known_hacks) == 0:
+                logger.info(
+                    f"[GuidanceDiagnostics] Step {self.current_step}: sensors未能识别 {true_hack} 个提权点（等待学习/引导介入）。"
+                )
 
     def _handle_reward_and_penalty(self):
         """
@@ -1718,8 +1731,14 @@ class ImmuneCogGraph(CogGraph):
             if u.role == "emitter":
                 # 同步最新的全局目标向量
                 u.goal_vec = self.tv_cached
-                u.assignment_source = ASSIGNMENT_SELF
-                u.assignment_trace = None
+                if not hasattr(u, "assignment_source"):
+                    u.assignment_source = ASSIGNMENT_SELF
+                if u.assignment_source != ASSIGNMENT_LEARNED:
+                    u.assignment_trace = None
+                    if hasattr(u, "reached_guidance_goal"):
+                        u.reached_guidance_goal = None
+                elif not hasattr(u, "reached_guidance_goal"):
+                    u.reached_guidance_goal = None
 
             # 计算本轮 expected 输入维度（虽然这里没真正用到 exp_in 做后续处理，但保留原注释意图）
             if u.role == "sensor":
@@ -1738,6 +1757,9 @@ class ImmuneCogGraph(CogGraph):
             # 如果是 emitter，就分配个人目标，并把访问 visited_map/visit_age_map 置零
             if u.role == "emitter" and hasattr(u, "position"):
                 self._assign_emitter_goal(u)
+                if getattr(u, "assignment_source", ASSIGNMENT_SELF) != ASSIGNMENT_LEARNED:
+                    u.personal_goal = None
+                    u.goal_type = None
                 x, y = u.position
                 if 0 <= x < self.env.size and 0 <= y < self.env.size:
                     self.env.visited_map[y, x] = True
@@ -2635,79 +2657,30 @@ class ImmuneCogGraph(CogGraph):
             action_vec = unit.get_output()  # [3*seq_len]
             action = self._decode_action_from_output(unit, action_vec)
 
-            # 如果是 MOVE 动作：对所有 emitter 都走 5 步
+            # MOVE 只迈出“一步”，目标由策略选择；若存在 guidance，仅作为方向提示
             if action["type"] == "move":
-                # 目标位置：若有 personal_goal 则优先用它，否则用 action["target"]
-                bx, by = getattr(unit, "personal_goal", action["target"])
+                guided_move = (
+                    getattr(unit, "assignment_source", ASSIGNMENT_SELF) == ASSIGNMENT_LEARNED
+                    and getattr(unit, "personal_goal", None) is not None
+                )
+                if guided_move:
+                    target = unit.personal_goal
+                else:
+                    target = action.get("target")
 
-                # 走最多 5 步，途中若到达 (bx,by) 就立刻清理然后跳出
-                for _ in range(20):
-                    ux, uy = unit.position
+                if target is None:
+                    # 策略未提供目标时，留在原地防止越界异常
+                    nx, ny = unit.position
+                else:
+                    nx, ny = self._step_toward(unit.position, target)
 
-                    # 如果已经到达目标，立刻执行清理并退出循环
-                    if (ux, uy) == (bx, by):
-                        if getattr(unit, "goal_type", None) == "infection":
-                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, block_action)
-                            # 把 BLOCK 也当作一次 RL 训练样本
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 1 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
+                nx = max(0, min(nx, size - 1))
+                ny = max(0, min(ny, size - 1))
+                unit.position = (nx, ny)
 
-                        elif getattr(unit, "goal_type", None) == "hack":
-                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, hack_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 2 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        # 清空 personal_goal，避免重复
-                        unit.personal_goal = None
-                        unit.goal_type = None
-                        break
-
-                    # 还未到达目标，则按曼哈顿距离方向走一步
-                    if abs(bx - ux) >= abs(by - uy):
-                        nx = ux + (1 if bx > ux else -1)
-                        ny = uy
-                    else:
-                        nx = ux
-                        ny = uy + (1 if by > uy else -1)
-
-                    # 边界检查
-                    nx = max(0, min(nx, size - 1))
-                    ny = max(0, min(ny, size - 1))
-                    unit.position = (nx, ny)
-
-                    # 如果刚刚走到 (bx,by)，马上清理并退出循环
-                    if (nx, ny) == (bx, by):
-                        if getattr(unit, "goal_type", None) == "infection":
-                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, block_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 1 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        elif getattr(unit, "goal_type", None) == "hack":
-                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, hack_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 2 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        unit.personal_goal = None
-                        unit.goal_type = None
-                        break
-
-                # 无论是否在循环中清理过，都跳过本轮后续处理
+                if guided_move and (nx, ny) == unit.personal_goal:
+                    # 记录达到提示点，等待策略在后续决策中选择何种动作
+                    unit.reached_guidance_goal = self.current_step
                 continue
 
             # 如果是 BLOCK 或 HACK_DEFENSE：先算 reward，再收集到 batch
