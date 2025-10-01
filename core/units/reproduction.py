@@ -1,5 +1,5 @@
 import copy
-import inspect
+
 import random
 from collections import defaultdict
 
@@ -11,39 +11,6 @@ from env import logger
 from .constants import ROLE_SPLIT_RULE, SPLIT_HI_ES_TABLE, SPLIT_HI_P_TABLE, TOL_FRAC_SPLIT, _get_hi
 
 
-_CLONE_PARAM_ALIASES = {
-    "unit_id": "id",
-}
-
-
-def _resolve_missing_constructor_args(instance, constructor, init_kwargs):
-    """Populate required constructor kwargs from instance attributes when possible."""
-
-    signature = inspect.signature(constructor.__init__)
-    resolved = {}
-    for name, param in list(signature.parameters.items())[1:]:
-        if param.kind not in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ):
-            continue
-        if name in init_kwargs or param.default is not inspect.Parameter.empty:
-            continue
-        if hasattr(instance, name):
-            resolved[name] = getattr(instance, name)
-            continue
-        alias = _CLONE_PARAM_ALIASES.get(name)
-        if alias and hasattr(instance, alias):
-            resolved[name] = getattr(instance, alias)
-    added = False
-    if resolved:
-        # Only add values that were not already supplied.
-        for key, value in resolved.items():
-            if key not in init_kwargs:
-                init_kwargs[key] = value
-                added = True
-    return init_kwargs, added
 
 
 class ReproductionMixin:
@@ -106,26 +73,10 @@ class ReproductionMixin:
     ):
         role = role_override or self.role
         input_size = new_input_size if new_input_size is not None else self.input_size
-        init_kwargs = {
-            "input_size": input_size,
-            "hidden_size": self.hidden_size,
-            "role": role,
-            "env_size": self.env_size,
-        }
-        if hasattr(self, "get_clone_init_kwargs"):
-            extra_kwargs = self.get_clone_init_kwargs() or {}
-            if not isinstance(extra_kwargs, dict):
-                raise TypeError("get_clone_init_kwargs must return a dict of keyword arguments")
-            init_kwargs.update(extra_kwargs)
-        constructor = type(self)
-        init_kwargs, _ = _resolve_missing_constructor_args(self, constructor, init_kwargs)
-        try:
-            clone_unit = constructor(**init_kwargs)
-        except TypeError:
-            init_kwargs, added = _resolve_missing_constructor_args(self, constructor, init_kwargs)
-            if not added:
-                raise
-            clone_unit = constructor(**init_kwargs)
+
+
+        clone_unit = type(self)(input_size=input_size, hidden_size=self.hidden_size, role=role, env_size=self.env_size)
+
         clone_unit.visit_counts = defaultdict(int)
         if input_size == self.input_size:
             clone_unit.function = copy.deepcopy(self.function)
