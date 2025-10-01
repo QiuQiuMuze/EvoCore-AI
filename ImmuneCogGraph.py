@@ -32,6 +32,7 @@ from env import logger
 from torch.optim import AdamW
 from CogUnit import CogUnit
 from sensor_module import SensorMLP
+from adaptive_parameters import CellularLearningController
 
 
 HIT_THRESH = 0.15          # 越大越宽松
@@ -55,11 +56,13 @@ class ImmuneCogGraph(CogGraph):
 
     def __init__(self, rl_agent, device="cpu", env=None):
         self.device = device
-        self.target_weights = torch.tensor([1.0, 1.0, 1.0], device=self.device)  # [探索, 感染, 提权]
 
         # 环境替换
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
+
+        self.parameter_controller = CellularLearningController(env, device=device)
+        self.target_weights = self.parameter_controller.get_target_weights()
         self.last_flat_idx = 0
         # 自适应调度模块：通过学习选择目标而非硬编码指导
         super().__init__(rl_agent, device=device, env=env)
@@ -428,7 +431,8 @@ class ImmuneCogGraph(CogGraph):
         将全局网格按当前所有 sensor 单元数量分段，让它们各自扫描自己负责的区间（可重合），
         最后把扫描到的坐标统一写入 self.known_infections / self.known_hacks。
         """
-        thr = 0.04  # 阈值：任何实际数值 > 0.04 就认为是感染（或提权）点
+        infection_thr = self.parameter_controller.get_infection_threshold()
+        hack_thr = self.parameter_controller.get_hack_threshold()
 
         # 先清空旧的记录
         self.known_infections.clear()
@@ -443,13 +447,13 @@ class ImmuneCogGraph(CogGraph):
         total_cells = H * W
         if num_sensors == 0:
             # 感染阈值扫描
-            inf_mask = (self.env.infected_map > thr)  # [H, W] bool
+            inf_mask = (self.env.infected_map > infection_thr)  # [H, W] bool
             ys_inf, xs_inf = torch.nonzero(inf_mask, as_tuple=True)
             for y, x in zip(ys_inf.tolist(), xs_inf.tolist()):
                 self.known_infections.add((int(x), int(y)))
 
             # 提权阈值扫描
-            hack_mask = (self.env.privilege_level > thr)
+            hack_mask = (self.env.privilege_level > hack_thr)
             ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
             for y, x in zip(ys_hack.tolist(), xs_hack.tolist()):
                 self.known_hacks.add((int(x), int(y)))
@@ -468,7 +472,7 @@ class ImmuneCogGraph(CogGraph):
             # 1) 当前 sensor 扫描自己负责区间内的“感染点”
             segment_inf = inf_flat[start:end]  # [chunk_size]
             # 在这段里找 > thr 的索引
-            idxs_local_inf = torch.nonzero(segment_inf > thr, as_tuple=True)[0]
+            idxs_local_inf = torch.nonzero(segment_inf > infection_thr, as_tuple=True)[0]
             for local_idx in idxs_local_inf.tolist():
                 flat_idx = local_idx + start
                 x = flat_idx % W
@@ -477,7 +481,7 @@ class ImmuneCogGraph(CogGraph):
 
             # 2) 当前 sensor 扫描自己负责区间内的“提权点”
             segment_hack = hack_flat[start:end]
-            idxs_local_hack = torch.nonzero(segment_hack > thr, as_tuple=True)[0]
+            idxs_local_hack = torch.nonzero(segment_hack > hack_thr, as_tuple=True)[0]
             for local_idx in idxs_local_hack.tolist():
                 flat_idx = local_idx + start
                 x = flat_idx % W
@@ -513,7 +517,8 @@ class ImmuneCogGraph(CogGraph):
 
         # —— 2. 病毒痕迹触发唤醒——
         tensor_state = self.env.get_state_tensor()
-        infected_count = (tensor_state[0] > 0.04).sum().item()  # 通道0：是否感染
+        infected_thr = self.parameter_controller.get_infection_threshold()
+        infected_count = (tensor_state[0] > infected_thr).sum().item()  # 通道0：是否感染
         if self.static_mode and infected_count >= 1:
             logger.warning(f"[静息唤醒] 来敌人啦，快干他！检测到病毒痕迹，感染点数 = {infected_count}")
             self._exit_static_mode()
@@ -738,6 +743,8 @@ class ImmuneCogGraph(CogGraph):
         # new_H, new_W = self.env.size, self.env.size
         # self.learnable_sensor.resize(new_H, new_W)
 
+        self.parameter_controller.on_env_resize(self.env)
+
     def _update_hack_channels(self):
         """每 step 调用：检查 hack 点变化，更新 self._hack_onehot"""
         # 检查是否有新的黑客类型出现，若有则扩充 embedding
@@ -800,13 +807,22 @@ class ImmuneCogGraph(CogGraph):
         # 直接不做“距离 emitter ≤4”的局部过滤，只要 env.infected_map>0 就当感染
         if hasattr(self.env, "infected_map"):
             full_inf = self.env.infected_map.clone()  # (H, W)
-            infected = (full_inf > 0.04).float().view(1, -1)  # 只要 env.infected_map[y,x]>0.04 就算 1
+            inf_thr = self.parameter_controller.get_infection_threshold()
+            infected = torch.relu(full_inf - inf_thr)
+            infected = torch.clamp(
+                infected / max(inf_thr, 1e-5), 0.0, 1.0
+            ).view(1, -1)
         else:
             infected = torch.zeros_like(unvisited)
 
         # —— 2) 通道 2：提权点 —— #
         if hasattr(self.env, "privilege_level"):
-            privileged = torch.clamp(self.env.privilege_level * 2.0, 0.0, 1.0).view(1, -1)
+            hack_thr = self.parameter_controller.get_hack_threshold()
+            privilege_scale = self.parameter_controller.get_privilege_scale()
+            privileged = torch.relu(self.env.privilege_level - hack_thr)
+            privileged = torch.clamp(
+                privileged * privilege_scale, 0.0, 1.0
+            ).view(1, -1)
         else:
             privileged = torch.zeros_like(unvisited)
 
@@ -986,7 +1002,7 @@ class ImmuneCogGraph(CogGraph):
             probs = torch.softmax(logits, dim=-1)  # [1, seq_len]
 
             # 2.2) 给“黑客点”额外加权，让它更容易被选中
-            hack_bias = 2.0
+            hack_bias, infection_bias = self.parameter_controller.get_goal_biases()
             threat_probs = probs[0, indices].clone()  # [len(threat_list)]
             for idx_i, flat_i in enumerate(indices.tolist()):
                 cx = flat_i % size
@@ -997,14 +1013,6 @@ class ImmuneCogGraph(CogGraph):
             # ------------ 2.2-bis) 再给“感染点”做温和加权 -------
             #   • 当感染点稀疏时提高权重
             #   • 但始终保证 infection_bias ≤ hack_bias
-            infected_count = len(self.known_infections)
-            if infected_count == 0:
-                infection_bias = 0.0  # 不存在感染点
-            else:
-                # 越少越高，线性插到 1.6；再截断到 hack_bias×0.8
-                infection_bias = 1.2 + (max(0, 10 - infected_count) * 0.06)  # 1.0‥1.6
-                infection_bias = min(infection_bias, hack_bias * 0.8)  # ≤1.6 (如果 hack=2)
-
             for i, flat_i in enumerate(indices.tolist()):
                 cx, cy = flat_i % size, flat_i // size
                 if (cx, cy) in self.known_infections:
@@ -1013,7 +1021,10 @@ class ImmuneCogGraph(CogGraph):
 
             # 2.3) 从全部威胁点（已按得分高→低排序）中，
             #      为“当前这个 emitter”挑出 ≤5 个、尚未坐满 3 人的候选
-            max_k = 5
+            emitter_total = max(1, sum(1 for e in self.units if e.role == "emitter"))
+            max_k = self.parameter_controller.get_candidate_quota(
+                emitter_total, len(threat_list)
+            )
             sorted_probs, sorted_idxs_in_threat = torch.sort(threat_probs, descending=True)
 
             filtered_candidates = []  # 本 emitter 的候选池
@@ -1384,6 +1395,8 @@ class ImmuneCogGraph(CogGraph):
                 list(self.goal_net.parameters())
         )
 
+        self.parameter_controller.on_env_resize(self.env)
+
     def _check_enter_static_mode(self):
         """
         每一步在 step() 末尾调用：
@@ -1467,14 +1480,9 @@ class ImmuneCogGraph(CogGraph):
     def step(self, input_tensor: torch.Tensor):
         self.current_step += 1
 
-        # ----- Sensor 阈值 warm-up & 衰减 -----
-        warmup = 3000
-        start, end = 0.5, 0.5
-        if self.current_step < warmup:
-            ratio = self.current_step / warmup  # 0→1
-            self.detect_thresh = start * (1 - ratio) + end * ratio
-        else:
-            self.detect_thresh = end
+        # ----- 自适应检测阈值更新 -----
+        self.parameter_controller.observe(self.env, step=self.current_step)
+        self.detect_thresh = self.parameter_controller.get_detection_threshold(self.current_step)
         # --------------------------------------
 
         # 每 1000 步扩张环境
@@ -1623,29 +1631,8 @@ class ImmuneCogGraph(CogGraph):
           • w2 = 0               if 没有 hack
                  = clamp(hack_intensity/5, 1.2, 2.0)
         """
-        # 1) 计算感染强度
-        inf_mask = (self.env.infected_map > 0.04).float()
-        infected_intensity = (self.env.infected_map * inf_mask).sum().item()
-
-        # 2) 计算黑客强度
-        hack_mask2 = (self.env.privilege_level > 0.04).float()
-        hack_intensity = (self.env.privilege_level * hack_mask2).sum().item()
-
-        total_area = self.env.size ** 2
-        w0 = 1.0
-
-        if infected_intensity == 0:
-            w1 = 0.0
-        else:
-            w1 = min(2.0, max(1.1, infected_intensity / total_area * 10))
-
-        if hack_intensity == 0:
-            w2 = 0.0
-        else:
-            w2 = min(2.0, max(1.2, hack_intensity / 5.0))
-
-        # 3) 更新 target_weights 张量
-        self.target_weights = torch.tensor([w0, w1, w2], device=self.device)
+        self.parameter_controller.observe(self.env, step=self.current_step)
+        self.target_weights = self.parameter_controller.get_target_weights()
 
     def _train_from_replay_buffer(self, batch_size: int = 10, beta: float = 0.4):
         """
@@ -1780,14 +1767,15 @@ class ImmuneCogGraph(CogGraph):
 
         # ——— 3) 打印“真实 vs 预测”的逻辑完全保留 ———
         #     这里的“真实”就是直接从 env.infected_map / env.privilege_level 门槛筛选出来的
-        thr = 0.04
+        infection_thr = self.parameter_controller.get_infection_threshold()
+        hack_thr = self.parameter_controller.get_hack_threshold()
         # 3.1 扫描真实感染格
-        inf_mask = (self.env.infected_map > thr)
+        inf_mask = (self.env.infected_map > infection_thr)
         ys_true, xs_true = torch.nonzero(inf_mask, as_tuple=True)
         true_coords = [(int(x), int(y)) for x, y in zip(xs_true.tolist(), ys_true.tolist())]
 
         # 3.2 扫描真实提权格
-        hack_mask = (self.env.privilege_level > thr)
+        hack_mask = (self.env.privilege_level > hack_thr)
         ys_hack, xs_hack = torch.nonzero(hack_mask, as_tuple=True)
         true_hack_coords = [(int(x), int(y)) for x, y in zip(xs_hack.tolist(), ys_hack.tolist())]
 
@@ -1914,6 +1902,9 @@ class ImmuneCogGraph(CogGraph):
         orig_priv = self.env.privilege_level.clone()
         orig_stealth = self.env.hack_strength.clone()
 
+        infection_thr = self.parameter_controller.get_infection_threshold()
+        hack_thr = self.parameter_controller.get_hack_threshold()
+
         # --- 保存动作之前的状态，供 A2C 用 ---
         raw_state = self.env.get_state_tensor().cpu()
         state_tensor = raw_state.view(1, -1).to(self.device)
@@ -1952,7 +1943,7 @@ class ImmuneCogGraph(CogGraph):
                 for dx in (-1, 0, 1):
                     xx = cx0 + dx
                     yy = cy0 + dy
-                    if 0 <= xx < W and 0 <= yy < H and orig_inf[yy, xx] > 0.04:
+                    if 0 <= xx < W and 0 <= yy < H and orig_inf[yy, xx] > infection_thr:
                         seed_mask[yy, xx] = 1.0
 
             # —— ② 对 seed_mask 做一次 3×3 卷积 → neighbor_from_seed —— #
@@ -1960,7 +1951,7 @@ class ImmuneCogGraph(CogGraph):
             neighbor_from_seed = conv2d(seed_bin, kernel3, padding=1)[0, 0]    # [H,W]
 
             # —— ③ all_to_clear：只保留 (neighbor_from_seed>0 且 orig_inf>阈值) 的位置 —— #
-            mask_to_clear = (neighbor_from_seed > 0) & (orig_inf > 1e-5)  # [H,W] bool
+            mask_to_clear = (neighbor_from_seed > 0) & (orig_inf > infection_thr)  # [H,W] bool
             ys, xs = torch.nonzero(mask_to_clear, as_tuple=True)
             all_to_clear = []
             for y, x in zip(ys.tolist(), xs.tolist()):
@@ -1994,7 +1985,7 @@ class ImmuneCogGraph(CogGraph):
                     })
 
                 # —— ⑥ 统一奖励：根据“扩散点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
-                curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
+                curr_inf_count = int((self.env.infected_map > infection_thr).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
                 factor = LEARNED_FACTOR if src == ASSIGNMENT_LEARNED else 0.1
 
@@ -2033,7 +2024,7 @@ class ImmuneCogGraph(CogGraph):
                     self.adaptive_guidance.register_feedback(target_pos, reward, latency)
 
                 # —— ⑦ 距离 bonus & 上游 processor 分成 —— #
-                infected_points = torch.nonzero(self.env.infected_map > 0.04).tolist()
+                infected_points = torch.nonzero(self.env.infected_map > infection_thr).tolist()
                 if infected_points and hasattr(unit, "position"):
                     ux, uy = unit.position
                     dists = [math.hypot(ux - px, uy - py) for (py, px) in infected_points]
@@ -2060,7 +2051,7 @@ class ImmuneCogGraph(CogGraph):
                     xx = x0 + dx
                     yy = y0 + dy
                     if (0 <= xx < W and 0 <= yy < H and
-                        (orig_priv[yy, xx] > 0.04 or orig_stealth[yy, xx] > 0.04)):
+                        (orig_priv[yy, xx] > hack_thr or orig_stealth[yy, xx] > hack_thr)):
                         hack_seed[yy, xx] = 1.0
 
             # —— ② 对 hack_seed 做一次 3×3 卷积 → neighbor_hack —— #
@@ -2068,7 +2059,7 @@ class ImmuneCogGraph(CogGraph):
             neighbor_hack = conv2d(hack_seed_bin, kernel3, padding=1)[0, 0]     # [H,W]
 
             # —— ③ all_to_clear：只保留 (neighbor_hack>0 且 (orig_priv>阈值 或 orig_stealth>阈值)) 的点 —— #
-            valid_mask = (neighbor_hack > 0) & ((orig_priv > 0.04) | (orig_stealth > 0.04))
+            valid_mask = (neighbor_hack > 0) & ((orig_priv > hack_thr) | (orig_stealth > hack_thr))
             ys, xs = torch.nonzero(valid_mask, as_tuple=True)
             all_to_clear = []
             for y, x in zip(ys.tolist(), xs.tolist()):
@@ -2229,7 +2220,7 @@ class ImmuneCogGraph(CogGraph):
         # infected_after = env_clone.infected_map[y, x].item()
         #
         # # --- 5) 根据 before/after 判定 success ---
-        # success = (infected_before > 0.04 and infected_after == 0.0)
+        # success = (infected_before > infection_thr and infected_after == 0.0)
         # if success:
         #     self.antibody_success_count += 1
         # else:
@@ -2348,8 +2339,9 @@ class ImmuneCogGraph(CogGraph):
                 new[:h0, :w0] = old
                 self.true_inf_age_map = new
 
-        # “真实感染计时”更新：只要 env.infected_map[y,x] >0.04，就累加；否则清零
-        curr_inf_mask = (self.env.infected_map > 0.04)
+        # “真实感染计时”更新：只要 env.infected_map[y,x] 超过自适应阈值，就累加；否则清零
+        infection_thr = self.parameter_controller.get_infection_threshold()
+        curr_inf_mask = (self.env.infected_map > infection_thr)
         self.true_inf_age_map = torch.where(
             curr_inf_mask,
             self.true_inf_age_map + 1,
@@ -2358,7 +2350,7 @@ class ImmuneCogGraph(CogGraph):
         # =============================================================
 
         # ==== 连续 100（这里你改成200）步“感染格数为 0”时，全体 +0.5 能量奖励 ====
-        curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
+        curr_inf_count = int((self.env.infected_map > infection_thr).sum().item())
         if curr_inf_count == 0:
             self.zero_infection_counter += 1
         else:
@@ -2380,7 +2372,7 @@ class ImmuneCogGraph(CogGraph):
                 device=self.device, dtype=torch.float32
             )[:, [0, 1]]  # [M, 2]
 
-            virus_idx = torch.nonzero(self.env.infected_map > 0.04)
+            virus_idx = torch.nonzero(self.env.infected_map > infection_thr)
             if virus_idx.numel() > 0:
                 virus_xy = virus_idx[:, [1, 0]].to(torch.float32)  # [N, 2]
                 dists = torch.cdist(emit_pos, virus_xy, p=1)        # [M, N]
@@ -2468,19 +2460,19 @@ class ImmuneCogGraph(CogGraph):
         prev_vuln = align(prev_vuln, curr.shape)
         prev_fail = align(prev_fail, curr.shape)
 
-        new_inf = ((curr > 0) & (prev_infected == 0)).sum().item()
+        new_inf = ((curr > infection_thr) & (prev_infected <= infection_thr)).sum().item()
 
-        infected_points = torch.nonzero(curr).tolist()
+        infected_points = torch.nonzero(curr > infection_thr).tolist()
 
         # —— 3) 当前提权位置 —— #
         priv_positions = {
             (x.item(), y.item())
-            for y, x in torch.nonzero(self.env.privilege_level > 0.04)
+            for y, x in torch.nonzero(self.env.privilege_level > hack_thr)
         }
         penalty_per_node = 0.5
 
         total_cleared = 0
-        curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
+        curr_inf_count = int((self.env.infected_map > infection_thr).sum().item())
 
         # —— 4) 遍历所有 emitter，处理病毒奖励 & 黑客惩罚 —— #
         for u_k in [u for u in self.units if u.role == "emitter"]:
@@ -2560,7 +2552,7 @@ class ImmuneCogGraph(CogGraph):
                     u_k.energy -= 0.5
                     u_k.meta.record(action="loop_penalty", reward=-0.14)
         # —— 6) 全局黑客防御奖励 —— #
-        cleared_priv = (prev_priv > 0.04).sum() - (self.env.privilege_level > 0.04).sum()
+        cleared_priv = (prev_priv > hack_thr).sum() - (self.env.privilege_level > hack_thr).sum()
         reduced_vuln = (prev_vuln - self.env.vulnerability).clamp(min=0).sum()
         reduced_fail = (prev_fail - self.env.login_failures).clamp(min=0).sum()
         base_hack_reward = (
