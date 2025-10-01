@@ -5,6 +5,7 @@ import random
 from env import logger
 from collections import deque
 import torch.nn as nn
+import torch.nn.functional as F
 from collections import defaultdict
 from config_runtime import RF            # ★ 新增
 from contextlib import nullcontext       # ★ autocast fallback
@@ -14,7 +15,7 @@ from memory_unit import MemoryBuffer
 
 
 # ======== CogUnit 全局功能开关 ========
-ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
+ENABLE_MINI_LEARN = True  # ← 默认开启小批量学习，使细胞逐渐自我调整
 FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
 # 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
 MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
@@ -136,6 +137,7 @@ class CogUnit:
         self.is_permanent_explorer = False
         self.visit_counts = defaultdict(int)
         self.memory_buffer = MemoryBuffer(maxlen=200)
+        self.last_input = None
 
 
 
@@ -198,6 +200,42 @@ class CogUnit:
         L = min(n, self.output_history_tensor.size(0))
         idxs = [(self.output_history_ptr - i - 1) % L for i in reversed(range(L))]
         return [self.output_history_tensor[i] for i in idxs]
+
+    def remember_outcome(self, reward: float, outcome: str, action_idx: int | None = None):
+        """把最近一次输入与奖励写入记忆池，为离线复盘做准备。"""
+        if self.last_input is None:
+            return
+        try:
+            state = self.last_input.squeeze(0).detach().cpu().clone()
+        except Exception:
+            return
+        idx = int(action_idx) if action_idx is not None else -1
+        self.memory_buffer.add(state, idx, float(reward), outcome)
+
+    def reinforce_from_goal(self, reward: float, lr_scale: float = 1.0):
+        """根据当前目标向量执行一次有监督微调。"""
+        if not ENABLE_MINI_LEARN:
+            return
+        if self.last_input is None or getattr(self, "goal_vec", None) is None:
+            return
+
+        goal_flat = self.goal_vec.reshape(-1).to(self.device)
+        target_dim = self.last_output.numel()
+        if goal_flat.numel() < target_dim:
+            goal_flat = F.pad(goal_flat, (0, target_dim - goal_flat.numel()))
+        elif goal_flat.numel() > target_dim:
+            goal_flat = goal_flat[:target_dim]
+
+        if reward > 0:
+            desired = goal_flat
+        else:
+            desired = torch.zeros_like(goal_flat)
+
+        input_tensor = self.last_input.to(self.device)
+        desired = desired.to(self.device).unsqueeze(0)
+
+        lr = 0.001 * lr_scale
+        self.mini_learn(input_tensor, desired, lr=lr)
 
     def update(self, input_tensor: torch.Tensor):
         input_tensor = input_tensor.squeeze()  # ← 保证不是 3 维
@@ -323,6 +361,8 @@ class CogUnit:
         # —— 前向只用于推理时关闭 Autograd ——
         ctx = (torch.autocast("cuda", dtype=torch.float16)
                if (RF.use_fp16 and self.device.type == "cuda") else nullcontext())
+
+        self.last_input = input_tensor.detach().clone()
 
         with ctx, torch.inference_mode():
             raw_output = self.function(input_tensor)
