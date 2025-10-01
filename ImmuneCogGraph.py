@@ -470,11 +470,13 @@ class ImmuneCogGraph(CogGraph):
             if start >= end:
                 continue
 
+
             sensor_bias = 1.0
             if sensor is not None:
                 gene = getattr(sensor, "gene", {})
                 if isinstance(gene, dict):
                     sensor_bias = float(gene.get("sensor_bias", 1.0))
+
 
             segment_inf = inf_flat[start:end]
             mask_inf = _sample_detection(segment_inf, sensor_bias)
@@ -1736,6 +1738,7 @@ class ImmuneCogGraph(CogGraph):
                 if u.assignment_source != ASSIGNMENT_LEARNED:
                     u.assignment_trace = None
 
+
             # 计算本轮 expected 输入维度（虽然这里没真正用到 exp_in 做后续处理，但保留原注释意图）
             if u.role == "sensor":
                 exp_in = full_state.shape[1]
@@ -2660,13 +2663,16 @@ class ImmuneCogGraph(CogGraph):
                     and getattr(unit, "personal_goal", None) is not None
                 )
                 if guided_move:
+
                     bx, by = unit.personal_goal
                 else:
                     bx, by = action["target"]
 
-                # 走最多 5 步，途中若到达 (bx,by) 就立刻清理然后跳出
-                for _ in range(20):
-                    ux, uy = unit.position
+
+                nx = max(0, min(nx, size - 1))
+                ny = max(0, min(ny, size - 1))
+                unit.position = (nx, ny)
+
 
                     # 如果已经到达目标，立刻执行清理并退出循环
                     if (ux, uy) == (bx, by) and guided_move:
@@ -2732,6 +2738,7 @@ class ImmuneCogGraph(CogGraph):
                         break
 
                 # 无论是否在循环中清理过，都跳过本轮后续处理
+
                 continue
 
             # 如果是 BLOCK 或 HACK_DEFENSE：先算 reward，再收集到 batch
