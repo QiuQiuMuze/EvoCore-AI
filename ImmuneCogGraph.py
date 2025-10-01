@@ -879,36 +879,7 @@ class ImmuneCogGraph(CogGraph):
         self._hack_onehot[0].scatter_(0, flat_idxs, 1.0)
         self._last_hack_keys = new_keys
 
-    def _resize_full_state_dependents(
-        self,
-        seq_len: int,
-        state_channels: int | None = None,
-        hack_channels: int | None = None,
-    ) -> None:
-        """同步与平铺状态向量相关的网络层与缓冲区。"""
-        _resize_full_state_dependents_impl(
-            self,
-            seq_len,
-            state_channels=state_channels,
-            hack_channels=hack_channels,
-        )
 
-    def _align_flat_component(self, flat: torch.Tensor, target_dim: int) -> torch.Tensor:
-        """把任意二维平铺张量裁剪/填充到目标列数。"""
-        if flat.dim() == 1:
-            flat = flat.unsqueeze(0)
-
-        current = flat.shape[1] if flat.dim() > 1 else 0
-
-        if target_dim <= 0:
-            return flat[:, :0]
-
-        if current < target_dim:
-            flat = F.pad(flat, (0, target_dim - current))
-        elif current > target_dim:
-            flat = flat[:, :target_dim]
-
-        return flat
 
     def _ensure_state_channel_capacity(self, state_tensor: torch.Tensor) -> torch.Tensor:
         """保证网络和缓冲区适配当前环境状态通道数。"""
@@ -931,17 +902,69 @@ class ImmuneCogGraph(CogGraph):
         if actual_channels <= 0:
             return state_tensor
 
-        if (
-            actual_channels != self._STATE_CHANNELS
-            or seq_len != getattr(self, "_S2", seq_len)
-        ):
-            self._resize_full_state_dependents(
-                seq_len,
-                state_channels=actual_channels,
-                hack_channels=self._HACK_CHANNELS,
-            )
-        else:
-            self._resize_full_state_dependents(seq_len)
+
+        if actual_channels != self._STATE_CHANNELS:
+            self._STATE_CHANNELS = actual_channels
+            self._INPUT_CHANNELS = self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS
+
+            self._D_env = seq_len * self._STATE_CHANNELS
+            self._D_hack = seq_len * self._HACK_CHANNELS
+            self._D_goal = seq_len * N_GOAL_CHANNELS
+            total_dim = self._D_env + self._D_hack + self._D_goal
+
+            sensor_layer = self.sensor_net[0]
+            new_in = seq_len * self._INPUT_CHANNELS
+            if sensor_layer.in_features != new_in:
+                new_sensor = nn.Linear(new_in, sensor_layer.out_features, bias=(sensor_layer.bias is not None)).to(self.device)
+                with torch.no_grad():
+                    copy_cols = min(sensor_layer.in_features, new_in)
+                    new_sensor.weight[:, :copy_cols].copy_(sensor_layer.weight[:, :copy_cols])
+                    if sensor_layer.bias is not None:
+                        new_sensor.bias.copy_(sensor_layer.bias)
+                self.sensor_net[0] = new_sensor
+                try:
+                    self._sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
+                except Exception:
+                    self._sensor_net = self.sensor_net
+
+            if not hasattr(self, "_full_state_buf") or self._full_state_buf.shape[1] != total_dim:
+                old_buf = getattr(self, "_full_state_buf", None)
+                new_buf = torch.zeros(1, total_dim, device=self.device)
+                if old_buf is not None:
+                    copy_cols = min(old_buf.shape[1], total_dim)
+                    new_buf[:, :copy_cols] = old_buf[:, :copy_cols]
+                self._full_state_buf = new_buf
+
+            if getattr(self, "_hack_onehot", None) is None or self._hack_onehot.shape[1] != self._D_hack:
+                old_hack = getattr(self, "_hack_onehot", None)
+                new_hack = torch.zeros(1, self._D_hack, device=self.device)
+                if old_hack is not None:
+                    copy_cols = min(old_hack.shape[1], self._D_hack)
+                    new_hack[:, :copy_cols] = old_hack[:, :copy_cols]
+                self._hack_onehot = new_hack
+
+            old_value = self.value_head
+            if old_value.in_features != total_dim:
+                new_value = nn.Linear(total_dim, old_value.out_features, bias=(old_value.bias is not None)).to(self.device)
+                with torch.no_grad():
+                    copy_cols = min(old_value.in_features, total_dim)
+                    new_value.weight[:, :copy_cols].copy_(old_value.weight[:, :copy_cols])
+                    if old_value.bias is not None:
+                        new_value.bias.copy_(old_value.bias)
+                self.value_head = new_value
+                for group in self.value_optimizer.param_groups:
+                    group['params'] = list(self.value_head.parameters())
+
+            if hasattr(self, "policy_optimizer"):
+                self.policy_optimizer.param_groups[0]['params'] = (
+                    list(self.sensor_net.parameters())
+                    + list(self.processor_net.parameters())
+                    + list(self.emitter_net.parameters())
+                    + list(self.hack_type_embedding.parameters())
+                    + list(self.goal_net.parameters())
+                )
+
+
 
         target_env = seq_len * self._STATE_CHANNELS
         if state_tensor.shape[1] < target_env:
@@ -2071,15 +2094,13 @@ class ImmuneCogGraph(CogGraph):
         else:
             hack_flat = torch.zeros(1, 0, device=self.device)
 
-        hack_flat = self._align_flat_component(hack_flat, self._D_hack)
-        goal_flat = self._align_flat_component(goal_flat, self._D_goal)
-
         full_state = torch.cat([state_tensor, hack_flat, goal_flat], dim=1)
         with torch.no_grad():
             value_s = self.value_head(full_state).squeeze(0)
 
         attacks_snapshot = {pos: info.get('type', 'virus') for pos, info in self.env.attacks.items()}
         hacks_snapshot = {pos: info.get('type', 'unknown') for pos, info in self.env.hacks.items()}
+
 
         upstream_processors = [
             self.unit_map.get(pid)
@@ -2098,6 +2119,9 @@ class ImmuneCogGraph(CogGraph):
 
             infected_before = orig_inf > infection_thr
             self.emitter_actions.perform(action)
+
+
+
 
             new_inf = self.env.infected_map.clone()
             infected_after = new_inf > infection_thr
@@ -2131,6 +2155,7 @@ class ImmuneCogGraph(CogGraph):
             increased_strength = float((new_inf - orig_inf).clamp(min=0).sum().item())
             new_infections = int(new_mask.sum().item())
 
+
             reward = 0.0
             if hits > 0:
                 reward += HIT_BONUS * hits
@@ -2143,9 +2168,12 @@ class ImmuneCogGraph(CogGraph):
             if hits == 0 and reward == 0.0:
                 reward = -0.05
 
+
             total_reward = reward
             outcome = "infection_clear" if reward > 0 else "infection_fail"
             hit = hits > 0
+
+
 
         elif action["type"] == ACTION_HACK_DEFENSE:
             x0, y0 = action["target"]
@@ -2163,6 +2191,7 @@ class ImmuneCogGraph(CogGraph):
 
             cleared_coords = torch.nonzero(cleared_mask, as_tuple=False)
             unit.cleared_hack = set()
+
 
             src = getattr(unit, "assignment_source", ASSIGNMENT_SELF)
             hits = cleared_coords.size(0)
@@ -2182,6 +2211,8 @@ class ImmuneCogGraph(CogGraph):
                     unit.cleared_hack.add((x, y))
             else:
                 unit.cleared_hack.clear()
+
+
 
             cleared_strength = float((orig_priv - new_priv).clamp(min=0).sum().item() +
                                       (orig_stealth - new_stealth).clamp(min=0).sum().item())
@@ -2235,8 +2266,8 @@ class ImmuneCogGraph(CogGraph):
         if action["type"] in (ACTION_BLOCK, ACTION_HACK_DEFENSE):
             next_raw_state = self.env.get_state_tensor().to(self.device)
             next_state_tensor = next_raw_state.view(1, -1)
-            next_state_tensor = self._ensure_state_channel_capacity(next_state_tensor)
-            goal_flat_next = self.tv_cached.view(1, -1).to(self.device)
+
+            goal_flat_next = self.tv_cached.view(1, -1)
 
             hack_maps_after = []
             for t in self.env.attack_types:
@@ -2250,10 +2281,9 @@ class ImmuneCogGraph(CogGraph):
             else:
                 hack_flat_next = torch.zeros(1, 0, device=self.device)
 
-            hack_flat_next = self._align_flat_component(hack_flat_next, self._D_hack)
-            goal_flat_next = self._align_flat_component(goal_flat_next, self._D_goal)
 
             full_next_state = torch.cat([next_state_tensor, hack_flat_next, goal_flat_next], dim=1)
+
 
             with torch.no_grad():
                 D_in2 = full_next_state.size(1)
@@ -2713,8 +2743,7 @@ class ImmuneCogGraph(CogGraph):
             hack_maps.append(mask)
         hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)  # [1, D_hack]
         goal_flat = self.tv_cached.view(1, -1).to(self.device)  # [1, D_goal]
-        hack_flat = self._align_flat_component(hack_flat, self._D_hack)
-        goal_flat = self._align_flat_component(goal_flat, self._D_goal)
+
 
         # 收集所有需要批量更新的 emitter 及其 flat_idx 和 reward
         batch_units = []
