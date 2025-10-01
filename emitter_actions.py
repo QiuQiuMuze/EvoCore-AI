@@ -57,14 +57,9 @@ class EmitterActions:
                     continue
 
                 # 对 (nx, ny) 执行“黑客防御”单点清理
-                env.privilege_level[ny, nx] = 0.0
-                env.login_failures[ny, nx]  = 0.0
-                env.vulnerability[ny, nx]  *= 0.5
-                env.hack_strength[ny, nx]   = 0.0
-                env.hacks.pop((nx, ny), None)
+                env.clear_hack((nx, ny))
                 logger.info(f"[HACK_DEFENSE] 在 ({nx},{ny}) 执行黑客防御（3×3 范围）")
 
-                # 如果你维护了 hack_history，需要同步减一：
                 env.hack_history[ny, nx] = max(env.hack_history[ny, nx] - 1.0, 0.0)
 
 

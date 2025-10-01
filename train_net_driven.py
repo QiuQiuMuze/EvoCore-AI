@@ -53,13 +53,14 @@ def get_virus_type_stats(attacks: dict) -> str:
 
 def summarize_kills_by_type(kill_stats_by_type: dict) -> str:
     """
-    将 {"worm": {"self_direct": 3, "guided": 1}, ...} → "worm:4, trojan:1, ..."
+    将 {"worm": {"self_direct": 3, "learned": 1}, ...} → "worm:4, trojan:1, ..."
     """
-    return ", ".join(
-        f"{k}:{v['self_direct'] + v['guided']}"
-        for k, v in kill_stats_by_type.items()
-        if v["self_direct"] + v["guided"] > 0
-    ) or "None"
+    parts = []
+    for name, counters in kill_stats_by_type.items():
+        total = sum(counters.values())
+        if total > 0:
+            parts.append(f"{name}:{total}")
+    return ", ".join(parts) or "None"
 
 def main(cfg):
     global_step = 0
@@ -133,11 +134,11 @@ def main(cfg):
 
             # —— 1) 先记录“前一步”累计击杀数  —— #
             old_virus_kills = sum(
-                v["self_direct"] + v["guided"]
+                sum(v.values())
                 for v in graph.virus_kill_stats_by_type.values()
             )
             old_hack_kills = sum(
-                v["self_direct"] + v["guided"]
+                sum(v.values())
                 for v in graph.hack_kill_stats_by_type.values()
             )
 
@@ -149,11 +150,11 @@ def main(cfg):
 
             # —— 3) 紧接着记录“本步后”累计击杀数  —— #
             new_virus_kills = sum(
-                v["self_direct"] + v["guided"]
+                sum(v.values())
                 for v in graph.virus_kill_stats_by_type.values()
             )
             new_hack_kills = sum(
-                v["self_direct"] + v["guided"]
+                sum(v.values())
                 for v in graph.hack_kill_stats_by_type.values()
             )
 
