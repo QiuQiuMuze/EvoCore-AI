@@ -470,11 +470,13 @@ class ImmuneCogGraph(CogGraph):
             if start >= end:
                 continue
 
+
             sensor_bias = 1.0
             if sensor is not None:
                 gene = getattr(sensor, "gene", {})
                 if isinstance(gene, dict):
                     sensor_bias = float(gene.get("sensor_bias", 1.0))
+
 
             segment_inf = inf_flat[start:end]
             mask_inf = _sample_detection(segment_inf, sensor_bias)
@@ -1735,10 +1737,7 @@ class ImmuneCogGraph(CogGraph):
                     u.assignment_source = ASSIGNMENT_SELF
                 if u.assignment_source != ASSIGNMENT_LEARNED:
                     u.assignment_trace = None
-                    if hasattr(u, "reached_guidance_goal"):
-                        u.reached_guidance_goal = None
-                elif not hasattr(u, "reached_guidance_goal"):
-                    u.reached_guidance_goal = None
+
 
             # 计算本轮 expected 输入维度（虽然这里没真正用到 exp_in 做后续处理，但保留原注释意图）
             if u.role == "sensor":
@@ -2664,19 +2663,82 @@ class ImmuneCogGraph(CogGraph):
                     and getattr(unit, "personal_goal", None) is not None
                 )
                 if guided_move:
-                    # 引导只提供方向提示，具体落点仍由网络/当前位置信息决定
+
                     bx, by = unit.personal_goal
-                    nx, ny = self._step_toward(unit.position, (bx, by))
                 else:
-                    nx, ny = action["target"]
+                    bx, by = action["target"]
+
 
                 nx = max(0, min(nx, size - 1))
                 ny = max(0, min(ny, size - 1))
                 unit.position = (nx, ny)
 
-                if guided_move and (nx, ny) == unit.personal_goal:
-                    # 记录达到提示点，等待策略在后续决策中选择何种动作
-                    unit.reached_guidance_goal = self.current_step
+
+                    # 如果已经到达目标，立刻执行清理并退出循环
+                    if (ux, uy) == (bx, by) and guided_move:
+                        if getattr(unit, "goal_type", None) == "infection":
+                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
+                            total_reward = self._apply_and_reward(unit, block_action)
+                            # 把 BLOCK 也当作一次 RL 训练样本
+                            flat_idx_cell = by * size + bx
+                            flat_for_rl = 1 * seq_len + flat_idx_cell
+                            batch_units.append(unit)
+                            batch_flats.append(flat_for_rl)
+                            batch_rewards.append(total_reward)
+
+                        elif getattr(unit, "goal_type", None) == "hack":
+                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
+                            total_reward = self._apply_and_reward(unit, hack_action)
+                            flat_idx_cell = by * size + bx
+                            flat_for_rl = 2 * seq_len + flat_idx_cell
+                            batch_units.append(unit)
+                            batch_flats.append(flat_for_rl)
+                            batch_rewards.append(total_reward)
+
+                        # 清空 personal_goal，避免重复
+                        unit.personal_goal = None
+                        unit.goal_type = None
+                        break
+
+                    # 还未到达目标，则按曼哈顿距离方向走一步
+                    if abs(bx - ux) >= abs(by - uy):
+                        nx = ux + (1 if bx > ux else -1)
+                        ny = uy
+                    else:
+                        nx = ux
+                        ny = uy + (1 if by > uy else -1)
+
+                    # 边界检查
+                    nx = max(0, min(nx, size - 1))
+                    ny = max(0, min(ny, size - 1))
+                    unit.position = (nx, ny)
+
+                    # 如果刚刚走到 (bx,by)，马上清理并退出循环
+                    if (nx, ny) == (bx, by) and guided_move:
+                        if getattr(unit, "goal_type", None) == "infection":
+                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
+                            total_reward = self._apply_and_reward(unit, block_action)
+                            flat_idx_cell = by * size + bx
+                            flat_for_rl = 1 * seq_len + flat_idx_cell
+                            batch_units.append(unit)
+                            batch_flats.append(flat_for_rl)
+                            batch_rewards.append(total_reward)
+
+                        elif getattr(unit, "goal_type", None) == "hack":
+                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
+                            total_reward = self._apply_and_reward(unit, hack_action)
+                            flat_idx_cell = by * size + bx
+                            flat_for_rl = 2 * seq_len + flat_idx_cell
+                            batch_units.append(unit)
+                            batch_flats.append(flat_for_rl)
+                            batch_rewards.append(total_reward)
+
+                        unit.personal_goal = None
+                        unit.goal_type = None
+                        break
+
+                # 无论是否在循环中清理过，都跳过本轮后续处理
+
                 continue
 
             # 如果是 BLOCK 或 HACK_DEFENSE：先算 reward，再收集到 batch
