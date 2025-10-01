@@ -70,7 +70,9 @@ class ReproductionMixin:
     ):
         role = role_override or self.role
         input_size = new_input_size if new_input_size is not None else self.input_size
+
         clone_unit = type(self)(input_size=input_size, hidden_size=self.hidden_size, role=role, env_size=self.env_size)
+
         clone_unit.visit_counts = defaultdict(int)
         if input_size == self.input_size:
             clone_unit.function = copy.deepcopy(self.function)

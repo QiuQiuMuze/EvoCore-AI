@@ -38,6 +38,21 @@ class SpecialEmitter(CogUnit):
         self.success_count = 0
         self.clone_threshold = clone_threshold
 
+    def get_clone_init_kwargs(self):
+        """Provide additional constructor kwargs required during cloning."""
+        if hasattr(self.env, "next_special_id"):
+            new_unit_id = self.env.next_special_id()
+        else:
+            step_count = getattr(self.env, "step_count", 0)
+            new_unit_id = f"{self.id}_clone_{step_count}"
+        return {
+            "unit_id": new_unit_id,
+            "attack_type": self.attack_type,
+            "strategy": self.strategy,
+            "env": self.env,
+            "clone_threshold": self.clone_threshold,
+        }
+
     def step(self, state):
         """
         覆盖父类 step 流程：
