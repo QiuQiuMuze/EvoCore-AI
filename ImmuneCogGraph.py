@@ -2341,6 +2341,7 @@ class ImmuneCogGraph(CogGraph):
 
         # “真实感染计时”更新：只要 env.infected_map[y,x] 超过自适应阈值，就累加；否则清零
         infection_thr = self.parameter_controller.get_infection_threshold()
+
         curr_inf_mask = (self.env.infected_map > infection_thr)
         self.true_inf_age_map = torch.where(
             curr_inf_mask,
