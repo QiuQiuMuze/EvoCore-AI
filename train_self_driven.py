@@ -129,7 +129,7 @@ def main(cfg):
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
     init_state = env.get_state().float()
     proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 125
-    goal_dim = env.size * env.size * 2                               # 2 channels × env²
+    goal_dim = graph.target_vector.numel()                           # 动态目标通道 × env²
     full_dim = proc_dim + goal_dim                                   # e.g. 125+50=175
     agent = RLAgent(
         input_dim=full_dim,                                          # ← 用 full_dim
@@ -163,17 +163,15 @@ def main(cfg):
     state = env.get_state().float()
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
-    # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
+    # 构造一个固定长度 = proc_dim + goal_dim 的 init_feat
     init_sensor    = graph.sensor_forward(state)                      # (1, state_dim)
     init_processor = graph.processor_forward(init_sensor).squeeze(0)  # (proc_dim,)
-    # —— 标准化目标向量到 2×(env²) —— #
+    # —— 标准化目标向量后拼接 —— #
     tv = graph.target_vector.to(device)
     if tv.dim() == 1:
-        # 单通道→补第二通道全 0
-        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)          # (2, env²)
-    goal_vec = graph.target_vector.to(device).view(-1)  # 正好 2*env²
-    # (2*env²,)
-    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+2*env²,)
+        tv = tv.unsqueeze(0)
+    goal_vec = tv.reshape(-1)
+    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+goal_dim,)
     # --- 保守起见：若将来 proc_dim 变小，也对 init_feat 右补零 ---
     if init_feat.numel() < last_dim:  # last_dim 之前已经设为 full_dim
         init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
@@ -203,7 +201,7 @@ def main(cfg):
 
         # 如果 processor_hidden_size 变化，则同时更新到 full_dim
         proc_dim = graph.processor_hidden_size
-        goal_dim = env.size * env.size * 2
+        goal_dim = graph.target_vector.numel()
         new_full = proc_dim + goal_dim
         if new_full != last_dim:
             print(f"[Resize Input] dim: {last_dim} → {new_full}")
@@ -216,11 +214,11 @@ def main(cfg):
             history = deque(maxlen=history.maxlen)
             init_sensor    = graph.sensor_forward(state)
             init_processor = graph.processor_forward(init_sensor).squeeze(0)
-            # 同样标准化目标向量到 2×(env²)
+            # 同样标准化目标向量
             tv = graph.target_vector.to(device)
             if tv.dim() == 1:
-                tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-            goal_vec = tv.view(-1)
+                tv = tv.unsqueeze(0)
+            goal_vec = tv.reshape(-1)
             init_feat = torch.cat([init_processor, goal_vec], dim=-1)
             if init_feat.numel() < last_dim:  # new_full 已经赋给 last_dim
                 init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
@@ -236,7 +234,7 @@ def main(cfg):
         env.render()
 
         # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
-        # flatten 到一维（2*env²）
+        # flatten 到一维（goal_dim）
         # —— 更新历史 & 构造带目标的特征 —— #
         tv = graph.target_vector.to(device)
         if tv.dim() == 1:

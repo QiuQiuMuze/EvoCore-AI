@@ -29,8 +29,11 @@ from self_model import build_self_model
 HIT_THRESH = 0.15          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
-N_GOAL_CHANNELS = 3
+N_GOAL_CHANNELS = 2
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
+
+GOAL_RESOURCE_CHANNEL = 0
+GOAL_HAZARD_CHANNEL = 1
 
 
 def _align_vec(a: torch.Tensor, b: torch.Tensor, mode="pad"):
@@ -62,8 +65,8 @@ class TaskInjector:
     def encode_goal(self, env_size):
         """将目标位置编码成 one-hot 向量（与输入同维度）"""
         index = self.target_position[1] * env_size + self.target_position[0]
-        vec = torch.zeros(2, env_size * env_size)  # 2 通道
-        vec[0, index] = 1.0  # 资源层 one-hot
+        vec = torch.zeros(N_GOAL_CHANNELS, env_size * env_size)
+        vec[GOAL_RESOURCE_CHANNEL, index] = 1.0  # 资源层 one-hot
 
         return vec
 
@@ -196,7 +199,7 @@ class CogGraph:
         initial_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
-        self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
+        self.target_vector = torch.zeros((N_GOAL_CHANNELS, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
         self.max_total_energy = 250  # 初始最大总能量
         self.removed_hazards_by_reward = 0
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
@@ -208,7 +211,7 @@ class CogGraph:
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-        self._target_buf = torch.zeros((2, self.env_size * self.env_size),
+        self._target_buf = torch.zeros((N_GOAL_CHANNELS, self.env_size * self.env_size),
                                        device=self.device)
         self.steps_since_last_reward = 0
         self.static_mode = False
@@ -1804,9 +1807,8 @@ class CogGraph:
         env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
         batch = input_tensor
         env_state = batch[:, :env_dim]
-        res_map   = self.target_vector[0].unsqueeze(0)
-        hzd_map   = self.target_vector[1].unsqueeze(0)
-        full_state = torch.cat([env_state, torch.cat([res_map, hzd_map], dim=1)], dim=1)
+        goal_flat = self.target_vector.view(1, -1)
+        full_state = torch.cat([env_state, goal_flat], dim=1)
 
         # —— ⚙️ 静息模式下也要给 emitter 初始化 goal_vec —— #
         for u in self.units:
@@ -1884,12 +1886,10 @@ class CogGraph:
         env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]  # (1, env_dim)
 
-        # 提取目标向量：资源 + 陷阱各一张 env² 维度的 one-hot 图
-        res_map = self.target_vector[0].unsqueeze(0)
-        hzd_map = self.target_vector[1].unsqueeze(0)
-        goal_flat = torch.cat([res_map, hzd_map], dim=1)  # (1, 2·env²)
+        # 提取目标向量并压平成单通道
+        goal_flat = self.target_vector.view(1, -1)
 
-        # 拼成最终的全状态张量：共 6 通道（4 状态 + 2 目标）
+        # 拼成最终的全状态张量
         full_state = torch.cat([env_state, goal_flat], dim=1)
 
         # 存一份当前状态快照（用于奖励计算与记忆）
@@ -2079,9 +2079,9 @@ class CogGraph:
             old_size = self.env_size
             self.env_size = self.env.size
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-            full_state_dim = self.processor_hidden_size + 2 * (self.env_size * self.env_size)
+            full_state_dim = self.processor_hidden_size + self.target_vector.numel()
             self.rl_agent.resize_state_dim(full_state_dim)
-            self._target_buf = self._target_buf.new_zeros((2, self.env_size * self.env_size))
+            self._target_buf = self._target_buf.new_zeros((N_GOAL_CHANNELS, self.env_size * self.env_size))
             if RF.use_shared_tx:
                 self._init_shared_tx()
             logger.info(f"[Env Resize] {old_size}→{self.env_size}, synced CogGraph dims")
@@ -2099,11 +2099,11 @@ class CogGraph:
 
         if target_xy is not None:
             idx = target_xy[1] * self.env_size + target_xy[0]
-            target_vec[0, idx] = 1.0
+            target_vec[GOAL_RESOURCE_CHANNEL, idx] = 1.0
 
-        if nearest_hzd is not None:
+        if nearest_hzd is not None and N_GOAL_CHANNELS > GOAL_HAZARD_CHANNEL:
             hidx = nearest_hzd[1] * self.env_size + nearest_hzd[0]
-            target_vec[1, hidx] = 1.0
+            target_vec[GOAL_HAZARD_CHANNEL, hidx] = 1.0
 
         self.target_vector = target_vec
 
@@ -2425,7 +2425,7 @@ class CogGraph:
             self.env.resize(self.env_size)
 
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-            full_dim = self.processor_hidden_size + self.env_size * self.env_size * 2
+            full_dim = self.processor_hidden_size + self.target_vector.numel()
             self.rl_agent.resize_state_dim(full_dim)
 
             if RF.use_shared_tx:
@@ -2440,7 +2440,7 @@ class CogGraph:
 
             for u in self.units:
                 u.env_size = self.env_size
-            self._target_buf = self._target_buf.new_zeros((2, self.env_size * self.env_size))
+            self._target_buf = self._target_buf.new_zeros((N_GOAL_CHANNELS, self.env_size * self.env_size))
             for u in self.units:
                 u.memory_buffer.clear()
 
@@ -2476,7 +2476,9 @@ class CogGraph:
 
     def is_current_target_hazard(self) -> bool:
         """判断当前目标是否是陷阱（指向陷阱的 one-hot）"""
-        index = torch.argmax(self.target_vector[1]).item()
+        if N_GOAL_CHANNELS <= GOAL_HAZARD_CHANNEL:
+            return False
+        index = torch.argmax(self.target_vector[GOAL_HAZARD_CHANNEL]).item()
         x, y = index % self.env_size, index // self.env_size
         return (x, y) in self.env.hazards
 
