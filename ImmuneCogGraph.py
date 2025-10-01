@@ -95,8 +95,10 @@ def _resize_full_state_dependents_impl(
             new_hack[:, :copy_cols] = old_hack[:, :copy_cols]
         graph._hack_onehot = new_hack
 
+
     old_value = graph.value_head
     if old_value.in_features != total_dim:
+
         new_value = nn.Linear(
             total_dim,
             old_value.out_features,
@@ -108,8 +110,10 @@ def _resize_full_state_dependents_impl(
             if old_value.bias is not None:
                 new_value.bias.copy_(old_value.bias)
         graph.value_head = new_value
+
         for group in graph.value_optimizer.param_groups:
             group["params"] = list(graph.value_head.parameters())
+
 
     graph._STATE_CHANNELS = state_channels
     graph._HACK_CHANNELS = hack_channels
@@ -903,6 +907,7 @@ class ImmuneCogGraph(CogGraph):
             return state_tensor
 
 
+
         if actual_channels != self._STATE_CHANNELS:
             self._STATE_CHANNELS = actual_channels
             self._INPUT_CHANNELS = self._STATE_CHANNELS + self._HACK_CHANNELS + N_GOAL_CHANNELS
@@ -963,6 +968,7 @@ class ImmuneCogGraph(CogGraph):
                     + list(self.hack_type_embedding.parameters())
                     + list(self.goal_net.parameters())
                 )
+
 
 
 
@@ -2100,8 +2106,7 @@ class ImmuneCogGraph(CogGraph):
 
         attacks_snapshot = {pos: info.get('type', 'virus') for pos, info in self.env.attacks.items()}
         hacks_snapshot = {pos: info.get('type', 'unknown') for pos, info in self.env.hacks.items()}
-
-
+        
         upstream_processors = [
             self.unit_map.get(pid)
             for pid in self.reverse_connections.get(unit.id, ())
@@ -2119,9 +2124,6 @@ class ImmuneCogGraph(CogGraph):
 
             infected_before = orig_inf > infection_thr
             self.emitter_actions.perform(action)
-
-
-
 
             new_inf = self.env.infected_map.clone()
             infected_after = new_inf > infection_thr
@@ -2168,7 +2170,6 @@ class ImmuneCogGraph(CogGraph):
             if hits == 0 and reward == 0.0:
                 reward = -0.05
 
-
             total_reward = reward
             outcome = "infection_clear" if reward > 0 else "infection_fail"
             hit = hits > 0
@@ -2211,7 +2212,6 @@ class ImmuneCogGraph(CogGraph):
                     unit.cleared_hack.add((x, y))
             else:
                 unit.cleared_hack.clear()
-
 
 
             cleared_strength = float((orig_priv - new_priv).clamp(min=0).sum().item() +
@@ -2267,7 +2267,9 @@ class ImmuneCogGraph(CogGraph):
             next_raw_state = self.env.get_state_tensor().to(self.device)
             next_state_tensor = next_raw_state.view(1, -1)
 
+
             goal_flat_next = self.tv_cached.view(1, -1)
+
 
             hack_maps_after = []
             for t in self.env.attack_types:
@@ -2280,7 +2282,6 @@ class ImmuneCogGraph(CogGraph):
                 hack_flat_next = torch.stack(hack_maps_after, dim=0).view(1, -1)
             else:
                 hack_flat_next = torch.zeros(1, 0, device=self.device)
-
 
             full_next_state = torch.cat([next_state_tensor, hack_flat_next, goal_flat_next], dim=1)
 
