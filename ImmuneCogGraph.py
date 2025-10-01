@@ -2341,6 +2341,22 @@ class ImmuneCogGraph(CogGraph):
 
         # “真实感染计时”更新：只要 env.infected_map[y,x] 超过自适应阈值，就累加；否则清零
         infection_thr = self.parameter_controller.get_infection_threshold()
+        hack_thr = self.parameter_controller.get_hack_threshold()
+
+        target_weights = self.parameter_controller.get_target_weights()
+        base_weight = float(target_weights[0].item()) if target_weights.numel() > 0 else 1.0
+        infection_weight = float(target_weights[1].item()) if target_weights.numel() > 1 else base_weight
+        hack_weight = float(target_weights[2].item()) if target_weights.numel() > 2 else base_weight
+        privilege_scale = self.parameter_controller.get_privilege_scale()
+
+        focus_norm = max(1.0, base_weight)
+        infection_focus = infection_weight / focus_norm
+        hack_focus = hack_weight / focus_norm
+
+        virus_base_reward = 0.4 + 0.2 * math.tanh(infection_focus)
+        hack_base_reward = 0.8 + 0.4 * math.tanh(hack_focus * privilege_scale)
+        penalty_per_node = 0.3 + 0.2 * math.tanh(hack_focus * privilege_scale)
+        global_hack_multiplier = 0.5 + 0.5 * math.tanh(hack_focus)
 
         curr_inf_mask = (self.env.infected_map > infection_thr)
         self.true_inf_age_map = torch.where(
@@ -2470,8 +2486,6 @@ class ImmuneCogGraph(CogGraph):
             (x.item(), y.item())
             for y, x in torch.nonzero(self.env.privilege_level > hack_thr)
         }
-        penalty_per_node = 0.5
-
         total_cleared = 0
         curr_inf_count = int((self.env.infected_map > infection_thr).sum().item())
 
@@ -2481,7 +2495,7 @@ class ImmuneCogGraph(CogGraph):
             cleared = len(getattr(u_k, "cleared_positions", set()))
             if cleared > 0:
                 total_cleared += cleared
-                base_reward = 0.6
+                base_reward = virus_base_reward
                 scale = 1.0 / (1.0 + curr_inf_count)
                 reward = base_reward * scale
                 if getattr(u_k, "assignment_source", ASSIGNMENT_SELF) == ASSIGNMENT_LEARNED:
@@ -2509,7 +2523,7 @@ class ImmuneCogGraph(CogGraph):
 
             # ==== NEW：hack 清理奖励（若 cleared_hack 属性存在）====
             if hasattr(u_k, "cleared_hack") and u_k.cleared_hack:
-                hack_r = 1.2
+                hack_r = hack_base_reward
                 if getattr(u_k, "assignment_source", ASSIGNMENT_SELF) == ASSIGNMENT_LEARNED:
                     hack_r *= LEARNED_FACTOR
 
@@ -2564,7 +2578,7 @@ class ImmuneCogGraph(CogGraph):
         if base_hack_reward > 0:
             curr_hack_count = len(self.env.hacks)
             scale = 1.0 / (1 + curr_hack_count)
-            hack_reward = base_hack_reward * scale
+            hack_reward = base_hack_reward * scale * global_hack_multiplier
 
             self.energy_pool += hack_reward
             logger.warning(
