@@ -12,6 +12,11 @@ from memory_net_unit import MemoryNetUnit
 from processor_immune import ImmuneProcessor
 from special_emitter import SpecialEmitter
 from emitter_actions import ACTION_BLOCK, ACTION_QUARANTINE, ACTION_HACK_DEFENSE
+from immune_cog_graph.emitter_actions import (
+    argmax_position as _argmax_position_helper,
+    decode_action_from_output as _decode_action_helper,
+    run_emitter_actions as _run_emitter_actions_helper,
+)
 from adaptive_guidance import (
     AdaptiveGuidanceModule,
     ASSIGNMENT_LEARNED,
@@ -2601,225 +2606,13 @@ class ImmuneCogGraph(CogGraph):
         self.punished_map &= (self.env.infected_map > 0)
 
     def _run_emitter_actions(self):
-        size = self.env.size
-        seq_len = size * size
-
-        # 先把当前环境状态打平成 [1, D_env]，供后续 batch 更新使用
-        raw = self.env.get_state_tensor()  # [C, H, W]
-        state_tensor = raw.view(1, -1).to(self.device)  # [1, D_env]
-
-        # 构造 hack_flat 和 goal_flat
-        hack_maps = []
-        for t in self.env.attack_types:
-            mask = torch.zeros_like(self.env.privilege_level, dtype=torch.float32, device=self.device)
-            for (hx, hy), info in self.env.hacks.items():
-                if info.get('type') == t:
-                    mask[hy, hx] = 1.0
-            hack_maps.append(mask)
-        hack_flat = torch.stack(hack_maps, dim=0).view(1, -1)  # [1, D_hack]
-        goal_flat = self.tv_cached.view(1, -1)  # [1, D_goal]
-
-        # 收集所有需要批量更新的 emitter 及其 flat_idx 和 reward
-        batch_units = []
-        batch_flats = []
-        batch_rewards = []
-
-        for unit in self.units:
-            if unit.role != "emitter" or not hasattr(unit, "get_output"):
-                continue
-
-            if not hasattr(unit, "assignment_source"):
-                unit.assignment_source = ASSIGNMENT_SELF
-            if not hasattr(unit, "assignment_trace"):
-                unit.assignment_trace = None
-            action_vec = unit.get_output()  # [3*seq_len]
-            action = self._decode_action_from_output(unit, action_vec)
-
-            # 如果是 MOVE 动作：对所有 emitter 都走 5 步
-            if action["type"] == "move":
-                # 目标位置：若有 personal_goal 则优先用它，否则用 action["target"]
-                bx, by = getattr(unit, "personal_goal", action["target"])
-
-                # 走最多 5 步，途中若到达 (bx,by) 就立刻清理然后跳出
-                for _ in range(20):
-                    ux, uy = unit.position
-
-                    # 如果已经到达目标，立刻执行清理并退出循环
-                    if (ux, uy) == (bx, by):
-                        if getattr(unit, "goal_type", None) == "infection":
-                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, block_action)
-                            # 把 BLOCK 也当作一次 RL 训练样本
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 1 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        elif getattr(unit, "goal_type", None) == "hack":
-                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, hack_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 2 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        # 清空 personal_goal，避免重复
-                        unit.personal_goal = None
-                        unit.goal_type = None
-                        break
-
-                    # 还未到达目标，则按曼哈顿距离方向走一步
-                    if abs(bx - ux) >= abs(by - uy):
-                        nx = ux + (1 if bx > ux else -1)
-                        ny = uy
-                    else:
-                        nx = ux
-                        ny = uy + (1 if by > uy else -1)
-
-                    # 边界检查
-                    nx = max(0, min(nx, size - 1))
-                    ny = max(0, min(ny, size - 1))
-                    unit.position = (nx, ny)
-
-                    # 如果刚刚走到 (bx,by)，马上清理并退出循环
-                    if (nx, ny) == (bx, by):
-                        if getattr(unit, "goal_type", None) == "infection":
-                            block_action = {"type": ACTION_BLOCK, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, block_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 1 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        elif getattr(unit, "goal_type", None) == "hack":
-                            hack_action = {"type": ACTION_HACK_DEFENSE, "target": (bx, by)}
-                            total_reward = self._apply_and_reward(unit, hack_action)
-                            flat_idx_cell = by * size + bx
-                            flat_for_rl = 2 * seq_len + flat_idx_cell
-                            batch_units.append(unit)
-                            batch_flats.append(flat_for_rl)
-                            batch_rewards.append(total_reward)
-
-                        unit.personal_goal = None
-                        unit.goal_type = None
-                        break
-
-                # 无论是否在循环中清理过，都跳过本轮后续处理
-                continue
-
-            # 如果是 BLOCK 或 HACK_DEFENSE：先算 reward，再收集到 batch
-            if action["type"] == ACTION_BLOCK or action["type"] == ACTION_HACK_DEFENSE:
-                total_reward = self._apply_and_reward(unit, action)
-                bx, by = action["target"]
-                flat_idx_cell = by * size + bx
-                act_type = 1 if action["type"] == ACTION_BLOCK else 2
-                flat_for_rl = act_type * seq_len + flat_idx_cell
-                batch_units.append(unit)
-                batch_flats.append(flat_for_rl)
-                batch_rewards.append(total_reward)
-
-        # 如果没有任何 BLOCK/HACK_DEFENSE，就直接 return
-        if not batch_units:
-            return
-
-        # ==== 统一做一次 batch A2C 更新 ====
-        B = len(batch_units)
-        flat_tensor = torch.tensor(batch_flats, dtype=torch.long, device=self.device)  # [B]
-        reward_tensor = torch.tensor(batch_rewards, dtype=torch.float32, device=self.device)  # [B]
-
-        # 构造 full_state_batch: [B, D_env+D_hack+D_goal]
-        fs_env = state_tensor.expand(B, -1)  # [B, D_env]
-        fs_hack = hack_flat.expand(B, -1)  # [B, D_hack]
-        fs_goal = goal_flat.expand(B, -1)  # [B, D_goal]
-        full_state_batch = torch.cat([fs_env, fs_hack, fs_goal], dim=1)  # [B, total_dim]
-
-        # —— 1) 前向：Sensor → Processor → Emitter logits
-        sensor_out_b = self._sensor_net(full_state_batch)  # [B, H_s]
-        proc_out_b = self.processor_net(sensor_out_b)  # [B, H_p]
-        logits_b = self.emitter_net(proc_out_b)  # [B, 3*seq_len]
-        probs_b = torch.softmax(logits_b, dim=-1)  # [B, 3*seq_len]
-
-        # —— 2) 取出各自的 log π(a|s)
-        idx_batch = torch.arange(B, device=self.device)
-        logp_b = torch.log(probs_b[idx_batch, flat_tensor] + 1e-8)  # [B]
-
-        # —— 3) Critic：估计 V(s)
-        value_b = self.value_head(full_state_batch).squeeze(-1)  # [B]
-        advantage_b = reward_tensor - value_b.detach()  # [B]
-
-        # —— 4) 计算 loss
-        actor_loss_b = - (logp_b * advantage_b).mean()
-        critic_loss_b = torch.nn.functional.mse_loss(value_b, reward_tensor)
-        entropy_b = torch.distributions.Categorical(logits=logits_b).entropy().mean()
-
-        total_loss = actor_loss_b + 0.5 * critic_loss_b - self.entropy_coef * entropy_b
-
-        # —— 5) 反向更新
-        self.policy_optimizer.zero_grad()
-        self.value_optimizer.zero_grad()
-        total_loss.backward()
-        self.policy_optimizer.step()
-        self.value_optimizer.step()
+        _run_emitter_actions_helper(self)
 
     def _decode_action_from_output(self, unit, output_vec):
-        """
-        现在 output_vec.shape = (3*seq_len,)，我们把它视作
-          [ row 0: MOVE logits (seq_len),
-            row 1: BLOCK logits (seq_len),
-            row 2: HACK_DEFENSE logits (seq_len) ] 扁平拼接后得到的长度 3*seq_len。
-
-        1) argmax 得到 flat ∈ [0..3*seq_len)
-        2) act_type = flat // seq_len  （0=MOVE, 1=BLOCK, 2=HACK_DEFENSE）
-        3) flat_idx  = flat % seq_len  （格子索引）
-        4) (tx, ty) = (flat_idx % size, flat_idx // size)
-        5) 返回对应动作字典：
-           - MOVE → {"type":"move", "target":(nx,ny) 或 (tx,ty)}
-           - BLOCK → {"type":ACTION_BLOCK, "target":(tx,ty)}
-           - HACK_DEFENSE → {"type":ACTION_HACK_DEFENSE, "target":(tx,ty)}
-        """
-        size = self.env.size
-        seq_len = size * size
-        ux, uy = unit.position  # 当前 Emitter 所在坐标
-
-        # 1) 从 output_vec 中拆出动作类型和格子索引
-        flat = torch.argmax(output_vec).item()  # 介于 [0, 3*seq_len)
-        act_type = flat // seq_len  # 0=MOVE, 1=BLOCK, 2=HACK_DEFENSE
-        flat_idx = flat % seq_len  # 0..seq_len-1
-        tx = flat_idx % size
-        ty = flat_idx // size
-
-        # 2) 根据 act_type 决定返回哪个 action
-        if act_type == 0:
-            # MOVE：如果距离大于 1，就只能一步迈向 (tx,ty)；否则一步到位
-            if abs(tx - ux) + abs(ty - uy) > 1:
-                nx = ux + (1 if tx > ux else -1) if tx != ux else ux
-                ny = uy + (1 if ty > uy else -1) if ty != uy else uy
-                nx = max(0, min(nx, size - 1))
-                ny = max(0, min(ny, size - 1))
-                return {"type": "move", "target": (nx, ny)}
-            else:
-                return {"type": "move", "target": (tx, ty)}
-
-        elif act_type == 1:
-            # BLOCK：让环境在 (tx,ty) 做一次 3×3 範围内的病毒清理
-            return {"type": ACTION_BLOCK, "target": (tx, ty)}
-
-        else:
-            # HACK_DEFENSE：让环境在 (tx,ty) 做一次 3×3 範围内的黑客清理
-            return {"type": ACTION_HACK_DEFENSE, "target": (tx, ty)}
+        return _decode_action_helper(self, unit, output_vec)
 
     def _argmax_position(self, output_vec):
-        """
-        将输出向量转为 (x, y) 坐标
-        假设 output_vec 是 (size²,) one-hot 或 logits
-        """
-        flat_idx = torch.argmax(output_vec).item()
-        size = self.env.size
-        y, x = divmod(flat_idx, size)
-        return x, y
+        return _argmax_position_helper(self, output_vec)
 
     def _metabolism_and_death(self, full_state):
         """代谢、分裂准备、死亡清理"""

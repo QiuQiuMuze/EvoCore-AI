@@ -1,6 +1,6 @@
 # coggraph.py
 import uuid
-from CogUnit import CogUnit
+from CogUnit import CogUnit, SensorUnit, ProcessorUnit, EmitterUnit
 import torch
 import random
 from env import GridEnvironment
@@ -77,6 +77,11 @@ class TaskInjector:
 
 # 理想比例  emitter : processor : sensor = 1 : 2 : 1
 IDEAL_RATIO = {"emitter": 1, "processor": 2, "sensor": 1}
+ROLE_TO_UNIT_CLASS = {
+    "sensor": SensorUnit,
+    "processor": ProcessorUnit,
+    "emitter": EmitterUnit,
+}
 DENOM = sum(IDEAL_RATIO.values())      # =4
 
 # 每轮允许转换的最高比例（60%）
@@ -127,9 +132,9 @@ class CogGraph:
         expected_input = self.env.size * self.env.size * INPUT_CHANNELS
 
         # 1) 创建
-        sensors = [CogUnit(input_size=expected_input, role="sensor", env_size=self.env_size) for _ in range(n_sensor)]
-        processors = [CogUnit(input_size=expected_input, role="processor", env_size=self.env_size) for _ in range(n_processor)]
-        emitters = [CogUnit(input_size=expected_input, role="emitter", env_size=self.env_size) for _ in range(n_emitter)]
+        sensors = [SensorUnit(input_size=expected_input, env_size=self.env_size) for _ in range(n_sensor)]
+        processors = [ProcessorUnit(input_size=expected_input, env_size=self.env_size) for _ in range(n_processor)]
+        emitters = [EmitterUnit(input_size=expected_input, env_size=self.env_size) for _ in range(n_emitter)]
 
         # 2) 迁移到目标 device
         for u in sensors + processors + emitters:
@@ -625,10 +630,10 @@ class CogGraph:
                 # —— 1) 先计算当前期望输入维度
                 expected_input = self.env_size * self.env_size * INPUT_CHANNELS
                 # —— 2) 用父体的 hidden_size 保持隐层容量，并继承权重
-                merged = CogUnit(
+                unit_cls = ROLE_TO_UNIT_CLASS.get(u1.get_role(), CogUnit)
+                merged = unit_cls(
                     input_size=expected_input,
                     hidden_size=u1.hidden_size,
-                    role=u1.get_role(),
                     env_size=self.env_size
                 )
                 # 深拷贝 u1 的 network 权重到 merged
@@ -783,16 +788,14 @@ class CogGraph:
                     # 创建新单元
                     # 创建新单元（带上正确维度）
                     expected_input = self.env_size * self.env_size * INPUT_CHANNELS
-                    new_p = CogUnit(
+                    new_p = ProcessorUnit(
                         input_size=expected_input,
                         hidden_size=p1.hidden_size,  # 或融合 p1,p2 的 hidden_size
-                        role="processor",
                         env_size=self.env_size
                     )
-                    new_e = CogUnit(
+                    new_e = EmitterUnit(
                         input_size=expected_input,
                         hidden_size=e1.hidden_size,  # 或融合 e1,e2 的 hidden_size
-                        role="emitter",
                         env_size=self.env_size
                     )
                     # 如果要继承父权重：
