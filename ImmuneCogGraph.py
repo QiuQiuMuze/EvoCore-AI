@@ -25,7 +25,6 @@ from meta_trainer import MetaTrainer
 from types import MethodType
 import torch.nn.functional as F
 import torch.optim as optim
-import types, torch
 import torch.nn as nn
 from models.transformer_policy import TransformerPolicyNetwork
 from env import logger
@@ -33,6 +32,103 @@ from torch.optim import AdamW
 from CogUnit import CogUnit
 from sensor_module import SensorMLP
 from adaptive_parameters import CellularLearningController
+
+
+def _resize_full_state_dependents_impl(
+    graph: "ImmuneCogGraph",
+    seq_len: int,
+    state_channels: int | None = None,
+    hack_channels: int | None = None,
+) -> None:
+    """调整依赖于平铺状态向量的层、缓存和优化器引用。"""
+    if seq_len <= 0:
+        return
+
+    state_channels = (
+        state_channels if state_channels is not None else graph._STATE_CHANNELS
+    )
+    hack_channels = (
+        hack_channels if hack_channels is not None else graph._HACK_CHANNELS
+    )
+
+    total_channels = state_channels + hack_channels + N_GOAL_CHANNELS
+    input_dim = seq_len * total_channels
+    D_env = seq_len * state_channels
+    D_hack = seq_len * hack_channels
+    D_goal = seq_len * N_GOAL_CHANNELS
+    total_dim = D_env + D_hack + D_goal
+
+    sensor_layer = graph.sensor_net[0]
+    if sensor_layer.in_features != input_dim:
+        new_sensor = nn.Linear(
+            input_dim,
+            sensor_layer.out_features,
+            bias=sensor_layer.bias is not None,
+        ).to(graph.device)
+        with torch.no_grad():
+            copy_cols = min(sensor_layer.in_features, input_dim)
+            new_sensor.weight[:, :copy_cols].copy_(sensor_layer.weight[:, :copy_cols])
+            if sensor_layer.bias is not None:
+                new_sensor.bias.copy_(sensor_layer.bias)
+        graph.sensor_net[0] = new_sensor
+        try:
+            graph._sensor_net = torch.compile(graph.sensor_net, fullgraph=False, dynamic=True)
+        except Exception:
+            graph._sensor_net = graph.sensor_net
+
+    if (
+        getattr(graph, "_full_state_buf", None) is None
+        or graph._full_state_buf.shape[1] != total_dim
+    ):
+        old_buf = getattr(graph, "_full_state_buf", None)
+        new_buf = torch.zeros(1, total_dim, device=graph.device)
+        if old_buf is not None:
+            copy_cols = min(old_buf.shape[1], total_dim)
+            new_buf[:, :copy_cols] = old_buf[:, :copy_cols]
+        graph._full_state_buf = new_buf
+
+    if getattr(graph, "_hack_onehot", None) is None or graph._hack_onehot.shape[1] != D_hack:
+        old_hack = getattr(graph, "_hack_onehot", None)
+        new_hack = torch.zeros(1, D_hack, device=graph.device)
+        if old_hack is not None:
+            copy_cols = min(old_hack.shape[1], D_hack)
+            new_hack[:, :copy_cols] = old_hack[:, :copy_cols]
+        graph._hack_onehot = new_hack
+
+    old_value = graph.value_head
+    if old_value.in_features != total_dim:
+        new_value = nn.Linear(
+            total_dim,
+            old_value.out_features,
+            bias=old_value.bias is not None,
+        ).to(graph.device)
+        with torch.no_grad():
+            copy_cols = min(old_value.in_features, total_dim)
+            new_value.weight[:, :copy_cols].copy_(old_value.weight[:, :copy_cols])
+            if old_value.bias is not None:
+                new_value.bias.copy_(old_value.bias)
+        graph.value_head = new_value
+        for group in graph.value_optimizer.param_groups:
+            group["params"] = list(graph.value_head.parameters())
+
+    graph._STATE_CHANNELS = state_channels
+    graph._HACK_CHANNELS = hack_channels
+    graph._INPUT_CHANNELS = total_channels
+    graph._D_env = D_env
+    graph._D_hack = D_hack
+    graph._D_goal = D_goal
+    graph._S2 = seq_len
+
+    if hasattr(graph, "policy_optimizer"):
+        params = (
+            list(graph.sensor_net.parameters())
+            + list(graph.processor_net.parameters())
+            + list(graph.emitter_net.parameters())
+            + list(graph.hack_type_embedding.parameters())
+            + list(graph.goal_net.parameters())
+        )
+        for group in graph.policy_optimizer.param_groups:
+            group["params"] = params
 
 
 HIT_THRESH = 0.15          # 越大越宽松
@@ -104,6 +200,15 @@ class ImmuneCogGraph(CogGraph):
         # 用当前 env.size 构造一次全局网络
         seq_len = self.env.size * self.env.size
         self._build_global_nets(seq_len)
+        _resize_full_state_dependents_impl(
+            self,
+            seq_len,
+            state_channels=self._STATE_CHANNELS,
+            hack_channels=self._HACK_CHANNELS,
+        )
+        self._resize_full_state_dependents = MethodType(
+            _resize_full_state_dependents_impl, self
+        )
         self._dilate = nn.MaxPool2d(kernel_size=9, stride=1, padding=4).to(self.device)
 
         # —— 1.5) 单元网络共享开关 ——
@@ -306,24 +411,6 @@ class ImmuneCogGraph(CogGraph):
         self._last_seq_len = self.env.size * self.env.size
         self._last_hack_keys = set(self.env.hacks.keys())
 
-        size2 = self.env.size * self.env.size
-        self._D_env = size2 * self._STATE_CHANNELS
-        self._D_hack = size2 * self._HACK_CHANNELS
-        self._D_goal = size2 * N_GOAL_CHANNELS
-
-        self._S2 = size2
-        # 预分配一次性缓冲区
-        self._full_state_buf = torch.empty(1, self._D_env + self._D_hack + self._D_goal,
-                                           device=self.device)
-        self._hack_onehot = torch.zeros(1, self._D_hack, device=self.device)
-
-        # 预编译 sensor_net（只做一次），并预定义膨胀卷积
-        try:
-            self._sensor_net = torch.compile(self.sensor_net,
-                                             fullgraph=False, dynamic=True)
-        except:
-            self._sensor_net = self.sensor_net
-
         # 熵正则系数，用于 entropy bonus
         self.entropy_coef = max(0.01, 1.0 / (1 + self.current_step / 2000))
 
@@ -340,7 +427,7 @@ class ImmuneCogGraph(CogGraph):
 
         for u in self.units:
             if hasattr(u, "compute_self_reward"):
-                u.compute_self_reward = types.MethodType(_safe_compute, u)
+                u.compute_self_reward = MethodType(_safe_compute, u)
 
         _orig_clone = CogUnit.clone  # 备份原方法
 
@@ -422,9 +509,6 @@ class ImmuneCogGraph(CogGraph):
             self._sensor_net = torch.compile(self.sensor_net, fullgraph=False, dynamic=True)
         except:
             self._sensor_net = self.sensor_net
-
-    import math
-    import torch
 
     def _run_sensor_scans(self):
         """
@@ -796,6 +880,7 @@ class ImmuneCogGraph(CogGraph):
         self._last_hack_keys = new_keys
 
 
+
     def _ensure_state_channel_capacity(self, state_tensor: torch.Tensor) -> torch.Tensor:
         """保证网络和缓冲区适配当前环境状态通道数。"""
         if state_tensor is None:
@@ -816,6 +901,7 @@ class ImmuneCogGraph(CogGraph):
 
         if actual_channels <= 0:
             return state_tensor
+
 
         if actual_channels != self._STATE_CHANNELS:
             self._STATE_CHANNELS = actual_channels
@@ -877,6 +963,7 @@ class ImmuneCogGraph(CogGraph):
                     + list(self.hack_type_embedding.parameters())
                     + list(self.goal_net.parameters())
                 )
+
 
 
         target_env = seq_len * self._STATE_CHANNELS
@@ -2007,8 +2094,6 @@ class ImmuneCogGraph(CogGraph):
         else:
             hack_flat = torch.zeros(1, 0, device=self.device)
 
-
-
         full_state = torch.cat([state_tensor, hack_flat, goal_flat], dim=1)
         with torch.no_grad():
             value_s = self.value_head(full_state).squeeze(0)
@@ -2034,6 +2119,7 @@ class ImmuneCogGraph(CogGraph):
 
             infected_before = orig_inf > infection_thr
             self.emitter_actions.perform(action)
+
 
 
 
@@ -2194,6 +2280,7 @@ class ImmuneCogGraph(CogGraph):
                 hack_flat_next = torch.stack(hack_maps_after, dim=0).view(1, -1)
             else:
                 hack_flat_next = torch.zeros(1, 0, device=self.device)
+
 
             full_next_state = torch.cat([next_state_tensor, hack_flat_next, goal_flat_next], dim=1)
 
