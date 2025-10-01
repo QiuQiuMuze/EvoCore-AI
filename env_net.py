@@ -1,7 +1,10 @@
 import torch
 import random
 from collections import deque
+from typing import Tuple
 import torch.nn.functional as F
+
+from adaptive_threats import HackerEvolutionModel, VirusEvolutionModel
 
 class GridSecurityEnv:
     def __init__(self, size=10, device='cpu', difficulty_ramp=5000, spawn_interval=200):
@@ -38,6 +41,24 @@ class GridSecurityEnv:
 
         # 统计“随机更新”步数，用于降低频率
         self._rand_update_counter = 0
+
+        # —— 基础威胁模板 —— #
+        self._base_attack_templates = {
+            'worm':    {'spread_prob': 0.2, 'stealth': 0.0, 'burst': False, 'power': 1.0},
+            'trojan':  {'spread_prob': 0.05, 'stealth': 0.6, 'burst': False, 'power': 1.0},
+            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.4, 'burst_area': 3, 'power': 0.8},
+            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2, 'power': 1.2},
+            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4, 'power': 1.5},
+        }
+        self._base_hack_templates = {
+            'bruteforce':      {'spawn_prob': 0.02, 'max_fail': 5.0, 'impact': 0.8, 'stealth': 0.2},
+            'phishing':        {'spawn_prob': 0.01, 'stealth': 0.8, 'impact': 1.2, 'max_fail': 2.0},
+            'lateral_move':    {'spawn_prob': 0.005, 'stealth': 0.4, 'impact': 0.9, 'max_fail': 3.0},
+            'privilege_escalation': {'spawn_prob': 0.003, 'stealth': 0.6, 'impact': 1.5, 'max_fail': 4.0},
+        }
+
+        self.virus_model = VirusEvolutionModel(self._base_attack_templates, device=self.device)
+        self.hacker_model = HackerEvolutionModel(self._base_hack_templates, device=self.device)
 
         self.infected_duration_map = torch.zeros((self.size, self.size), dtype=torch.int32, device=self.device)
         self.reset()
@@ -82,22 +103,11 @@ class GridSecurityEnv:
         self.login_failures  = torch.zeros_like(self.infected_map)
 
         # 支持的攻击类型及参数
-        self.attack_types = {
-            'worm':    {'spread_prob': 0.2, 'stealth': 0.0, 'burst': False},
-            'trojan':  {'spread_prob': 0.05, 'stealth': 0.6, 'burst': False},
-            'scan':    {'spread_prob': 0.0, 'stealth': 1.0, 'burst': True,  'burst_chance': 0.4, 'burst_area': 3},
-            'ransom':  {'spread_prob': 0.1, 'stealth': 0.3, 'burst': True,  'burst_chance': 0.3, 'burst_area': 2},
-            'apt':     {'spread_prob': 0.15, 'stealth': 0.8, 'burst': True,  'burst_chance': 0.4, 'burst_area': 4},
-        }
+        self.attack_types = {k: dict(v) for k, v in self._base_attack_templates.items()}
 
         self.attacks = {}
         self.hack_spawn_interval = 20
-        self.hack_types = {
-            'bruteforce':      {'spawn_prob': 0.02, 'max_fail': 5},
-            'phishing':        {'spawn_prob': 0.01, 'stealth':0.8},
-            'lateral_move':    {'spawn_prob': 0.005},
-            'privilege_escalation': {'spawn_prob': 0.003}
-        }
+        self.hack_types = {k: dict(v) for k, v in self._base_hack_templates.items()}
         self.hacks = {}  # 当前活跃的黑客事件: dict[(x,y)]→{type,…}
         # if self.step_count >= 0:  # 比如只在后期才允许初始病毒出现
         #     self._spawn_attack(initial=True)
@@ -132,27 +142,40 @@ class GridSecurityEnv:
         - 会根据当前 step_count 决定允许的攻击类型（早期较弱）
         - 随机选择攻击类型与位置
         """
-        if self.step_count < self.difficulty_ramp * 0.3:
-            available = ['worm', 'trojan']
-        elif self.step_count < self.difficulty_ramp * 0.6:
-            available = ['worm', 'trojan', 'scan', 'ransom']
+        profile = self.virus_model.sample_profile(
+            step=self.step_count,
+            active_infections=int((self.infected_map > 0.04).sum().item()),
+            grid_size=self.size,
+        )
+        if profile.name not in self.attack_types:
+            self.attack_types[profile.name] = dict(profile.params)
+
+        params = self.attack_types[profile.name]
+
+        heat = (self.behavior_score + 0.5 * self.net_traffic + 0.1).clamp(min=0.0)
+        flat_heat = heat.view(-1)
+        if float(flat_heat.sum().item()) > 0:
+            idx = torch.multinomial(flat_heat / flat_heat.sum(), 1).item()
+            x = idx % self.size
+            y = idx // self.size
         else:
-            available = list(self.attack_types.keys())
+            x = random.randint(0, self.size - 1)
+            y = random.randint(0, self.size - 1)
 
-        attack_type = random.choice(available)
-        x = random.randint(0, self.size - 1)
-        y = random.randint(0, self.size - 1)
-        params = self.attack_types[attack_type]
-        self.attacks[(x, y)] = {'type': attack_type, 'power': params.get('power', 1.0)}
+        power = params.get('power', 1.0)
+        self.attacks[(x, y)] = {
+            'type': profile.name,
+            'power': power,
+            'profile_name': profile.name,
+            'spawn_step': self.step_count,
+        }
 
-        self.infected_map[y, x] = 1.0
-        self.infection_strength[y, x] = params.get('power', 1.0)
+        self.infected_map[y, x] = max(self.infected_map[y, x], power)
+        self.infection_strength[y, x] = power
 
-        # —— 新增：把 (x,y) 对应的扁平索引设为 attack_type 的序号 —— #
         flat_idx = y * self.size + x
-        type_idx = list(self.attack_types).index(attack_type)
+        type_idx = list(self.attack_types).index(profile.name)
         self._attack_type_flat[flat_idx] = type_idx
-        # 同时把新键加入 _last_attack_keys（如果 _spawn_attack 也可能在 step() 里调用多次，保证最终增量同步）
         self._last_attack_keys.add((x, y))
 
     def _expand_environment(self, growth: int = 2):
@@ -432,14 +455,37 @@ class GridSecurityEnv:
 
         # —— 调整：每 hack_spawn_interval 步才做一次 spawn —— #
         if self.step_count % self.hack_spawn_interval == 0:
-            for ht, params in self.hack_types.items():
-                if random.random() < params['spawn_prob']:
+            profiles = self.hacker_model.sample_batch(
+                step=self.step_count,
+                vulnerability=self.vulnerability,
+                login_failures=self.login_failures,
+                privilege=self.privilege_level,
+            )
+            difficulty = min(1.5, 0.5 + self.step_count / max(self.difficulty_ramp, 1))
+            for profile in profiles:
+                if profile.name not in self.hack_types:
+                    self.hack_types[profile.name] = dict(profile.params)
+                params = self.hack_types[profile.name]
+                spawn_prob = params.get('spawn_prob', 0.01) * difficulty
+                if random.random() >= spawn_prob:
+                    continue
+                if profile.target is not None:
+                    x, y = profile.target
+                else:
                     x, y = random.randrange(self.size), random.randrange(self.size)
-                    self.hacks[(x,y)] = {'type': ht, 'power': params.get('stealth',1.0)}
-                    # 马上标记一次
-                    self.hack_history[y,x]  += 1
-                    self.hack_strength[y,x]  = params.get('stealth',1.0)
-                    self.privilege_level[y, x] = 1.0
+                x = int(max(0, min(float(x), self.size - 1)))
+                y = int(max(0, min(float(y), self.size - 1)))
+                impact = params.get('impact', params.get('stealth', 1.0))
+                self.hacks[(x, y)] = {
+                    'type': profile.name,
+                    'power': impact,
+                    'profile_name': profile.name,
+                    'spawn_step': self.step_count,
+                }
+                self.hack_history[y, x] += 1
+                self.hack_strength[y, x] = impact
+                self.privilege_level[y, x] = min(1.0, self.privilege_level[y, x] + impact)
+                self.login_failures[y, x] = max(self.login_failures[y, x], params.get('max_fail', 3.0))
 
             # 传播 or 行动
             new_hacks = {}
@@ -455,16 +501,25 @@ class GridSecurityEnv:
                 dst = dst[:, free]
                 if dst.numel():
                     vul = self.vulnerability[dst[1], dst[0]]
-                    p = 0.1  # 可以根据 hack 类型决定
-                    keep = (torch.rand_like(vul) < vul * p)
+                    keep = (torch.rand_like(vul) < vul * 0.1)
                     dst = dst[:, keep]
                     self.hack_history.index_put_((dst[1], dst[0]),
                                                  torch.ones(dst.shape[1], device=self.device),
                                                  accumulate=True)
-                    self.hack_strength[dst[1], dst[0]] = p
-                    self.privilege_level[dst[1], dst[0]] = p
-                    for x, y in zip(dst[0].tolist(), dst[1].tolist()):
-                        self.hacks[(x, y)] = {'type': 'lateral_move', 'power': p}
+                    for dx, dy in zip(dst[0].tolist(), dst[1].tolist()):
+                        parent_key = random.choice(list(self.hacks.keys()))
+                        parent = self.hacks[parent_key]
+                        impact = parent.get('power', 0.5)
+                        self.hack_strength[dy, dx] = impact
+                        self.privilege_level[dy, dx] = max(self.privilege_level[dy, dx], impact)
+                        new_hacks[(dx, dy)] = {
+                            'type': parent.get('type', 'lateral_move'),
+                            'power': impact,
+                            'profile_name': parent.get('profile_name', parent.get('type', 'lateral_move')),
+                            'spawn_step': self.step_count,
+                        }
+            if new_hacks:
+                self.hacks.update(new_hacks)
 
         # —— 更新黑客 one-hot —— #
         new_keys = set(self.hacks.keys())
@@ -551,9 +606,16 @@ class GridSecurityEnv:
         emitter 执行 block 动作：清除该格子感染
         """
         x, y = pos
+        info = self.attacks.pop((x, y), None)
         self.infected_map[y, x] = 0.0
         self.infection_strength[y, x] = 0.0
-        self.attacks.pop((x, y), None)
+        if info is not None:
+            lifetime = max(1, self.step_count - info.get('spawn_step', self.step_count))
+            self.virus_model.register_feedback(
+                info.get('profile_name', info.get('type', 'unknown')),
+                reward=1.0,
+                lifetime=lifetime,
+            )
 
     def quarantine_zone(self, pos):
         """
@@ -561,6 +623,21 @@ class GridSecurityEnv:
         """
         x, y = pos
         self.is_quarantined[y, x] = 1.0
+
+    def clear_hack(self, pos: Tuple[int, int]) -> None:
+        x, y = pos
+        info = self.hacks.pop((x, y), None)
+        self.privilege_level[y, x] = 0.0
+        self.login_failures[y, x] = 0.0
+        self.vulnerability[y, x] *= 0.5
+        self.hack_strength[y, x] = 0.0
+        if info is not None:
+            lifetime = max(1, self.step_count - info.get('spawn_step', self.step_count))
+            self.hacker_model.register_feedback(
+                info.get('profile_name', info.get('type', 'unknown')),
+                reward=1.0,
+                lifetime=lifetime,
+            )
 
     def mark_suspicious(self, pos):
         """

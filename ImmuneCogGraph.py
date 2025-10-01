@@ -12,6 +12,11 @@ from memory_net_unit import MemoryNetUnit
 from processor_immune import ImmuneProcessor
 from special_emitter import SpecialEmitter
 from emitter_actions import ACTION_BLOCK, ACTION_QUARANTINE, ACTION_HACK_DEFENSE
+from adaptive_guidance import (
+    AdaptiveGuidanceModule,
+    ASSIGNMENT_LEARNED,
+    ASSIGNMENT_SELF,
+)
 from config_runtime import RF
 from typing import List
 import random
@@ -36,8 +41,7 @@ FLASH_ATTN_AVAILABLE = False
 MIN_PATROL_DIST = 3      # 巡逻目标与当前位置的最小曼哈顿距离
 HIT_BONUS       = 1.0     # 命中立刻奖励
 MISS_PENALTY    = 0.00    # 打空扣分
-GUIDED_FACTOR   = 0.3      # guided 奖励折扣
-MAX_GUIDED_DIST = 5
+LEARNED_FACTOR  = 0.3     # learned assignment reward bias
 
 class ImmuneCogGraph(CogGraph):
     """
@@ -57,7 +61,7 @@ class ImmuneCogGraph(CogGraph):
         if env is None:
             env = GridSecurityEnv(size=10, device=device)
         self.last_flat_idx = 0
-        # 混合策略控制：guided 的比例，逐步衰减到 0
+        # 自适应调度模块：通过学习选择目标而非硬编码指导
         super().__init__(rl_agent, device=device, env=env)
 
         # --- 1) 定义 hack channels 数量 & 总输入通道数 ---
@@ -123,8 +127,9 @@ class ImmuneCogGraph(CogGraph):
             self.env.infected_map, dtype=torch.float16, device=self.device
         )
         self._update_target_vector()
+        self.adaptive_guidance = AdaptiveGuidanceModule(self.env.size, device=self.device)
         self.last_report_stage = None
-        self.hack_kill_stats = {"self_direct": 0, "guided": 0}
+        self.hack_kill_stats = {ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0}
         # —— 新增：连续无感染计数器 —— #
         self.zero_infection_counter = 0
         # 追踪各黑客类型的击杀数
@@ -145,9 +150,7 @@ class ImmuneCogGraph(CogGraph):
         self.prev_priv = torch.zeros_like(self.env.privilege_level)
         self.prev_vuln = torch.zeros_like(self.env.vulnerability)
         self.prev_fail = torch.zeros_like(self.env.login_failures)
-        self.kill_stats = {"self_direct": 0, "guided": 0, "last_reset": 0}
-        self.guided_prob = 0.4
-        self.guided_decay = 0.0001  # 每 step 衰减量，可按需调整
+        self.kill_stats = {ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0, "last_reset": 0}
         seq_len = self.env.size * self.env.size
 
         # ─────────── 静息模式相关字段 ─────────── #
@@ -737,6 +740,19 @@ class ImmuneCogGraph(CogGraph):
 
     def _update_hack_channels(self):
         """每 step 调用：检查 hack 点变化，更新 self._hack_onehot"""
+        # 检查是否有新的黑客类型出现，若有则扩充 embedding
+        for hack_name in self.env.hack_types.keys():
+            if hack_name not in self.hack_type_to_idx:
+                new_idx = len(self.hack_types)
+                self.hack_types.append(hack_name)
+                self.hack_type_to_idx[hack_name] = new_idx
+                old_weight = self.hack_type_embedding.weight.data
+                new_embed = nn.Embedding(len(self.hack_types), 1).to(self.device)
+                with torch.no_grad():
+                    new_embed.weight[:-1].copy_(old_weight)
+                    new_embed.weight[-1].uniform_(-0.05, 0.05)
+                self.hack_type_embedding = new_embed
+                logger.info(f"[Hack类型扩展] 新增类型 {hack_name}，embedding size → {len(self.hack_types)}")
         new_keys = set(self.env.hacks.keys())
         if new_keys == self._last_hack_keys:
             return
@@ -1017,82 +1033,78 @@ class ImmuneCogGraph(CogGraph):
                 if len(filtered_candidates) == max_k:  # 凑够 5 个就停
                     break
 
-            # 走到这里：
-            #   • filtered_candidates 长度 ∈ [0, 5]
-            #   • 若 ==0 → 后续代码将 fallback 到 curiosity
-            #   • 若 1-5 → 后续代码会从中挑最近的一个作为 personal_goal
+            score_lookup = {indices[i].item(): float(threat_probs[i].item()) for i in range(indices.numel())}
 
-            # 2.4) 如果没有任何“未满 3 人”的威胁点，就退到好奇点
             if not filtered_candidates:
-                visited = self.env.visited_map
-                age_map = self.visit_age_map
-                never_visited_mask = ~visited
-                cooldown = getattr(u, "intrinsic_cooldown", 0)
-                long_time_mask = (age_map >= cooldown)
-                candidate_mask = never_visited_mask | long_time_mask
-                cand = torch.nonzero(candidate_mask)
-                if cand.numel() == 0:
-                    return
-                ex, ey = u.position
-                mask_far = []
-                for (yy, xx) in cand.tolist():
-                    mask_far.append(abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST)
-                mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
-                if mask_far.any():
-                    cand = cand[mask_far]
-                sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
-                ty, tx = cand[sel].tolist()
-                u.personal_goal = (tx, ty)
-                u.goal_type = "curiosity"
-                u._last_intrinsic_step = self.current_step
-                logger.info(f"[好奇点 fallback] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
+                self._assign_curiosity_goal(u)
                 return
 
-            # 2.5) 从这最多 max_k 个“未满员”候选里，选与当前 emitter 最近的一个
-            ux, uy = u.position
-            best_flat, best_dist = None, None
-            for flat_idx in filtered_candidates:
-                cx, cy = flat_idx % size, flat_idx // size
-                d = abs(cx - ux) + abs(cy - uy)
-                if best_dist is None or d < best_dist:
-                    best_dist, best_flat = d, flat_idx
+            choice, meta = self.adaptive_guidance.select_goal(
+                emitter_id=u.id,
+                emitter_pos=u.position,
+                candidates=filtered_candidates,
+                threat_scores=score_lookup,
+                step=self.current_step,
+            )
 
-            goal_x, goal_y = best_flat % size, best_flat // size
+            if choice is None:
+                self._assign_curiosity_goal(u)
+                return
 
-            # 2.6) 标记 goal_type 并赋给 emitter
+            goal_x, goal_y = choice % size, choice // size
+
             if (goal_x, goal_y) in self.known_hacks:
                 u.goal_type = "hack"
             else:
                 u.goal_type = "infection"
             u.personal_goal = (goal_x, goal_y)
+            u.assignment_source = ASSIGNMENT_LEARNED
+            u.assignment_trace = {
+                "pos": (goal_x, goal_y),
+                "step": self.current_step,
+                "meta": meta,
+                "source": ASSIGNMENT_LEARNED,
+            }
             u._last_intrinsic_step = self.current_step
-            logger.info(f"[学习+距离+Capacity] 给 emitter {u.id} 分配目标 → ({goal_x},{goal_y}), 距离={best_dist}")
+            logger.info(
+                f"[学习调度] emitter {u.id} 目标 → ({goal_x},{goal_y}), 策略={meta.get('strategy', 'exploit')}"
+            )
             return
 
         # —— ③ 如果没有任何威胁，或者前面都返回后，这里走“好奇点”逻辑 —— #
         if getattr(u, "goal_type", None) is None:
-            visited = self.env.visited_map
-            age_map = self.visit_age_map
-            never_visited_mask = ~visited
-            cooldown = getattr(u, "intrinsic_cooldown", 0)
-            long_time_mask = (age_map >= cooldown)
-            candidate_mask = never_visited_mask | long_time_mask
-            cand = torch.nonzero(candidate_mask)
-            if cand.numel() == 0:
-                return
-            ex, ey = u.position
-            mask_far = []
-            for (yy, xx) in cand.tolist():
-                mask_far.append(abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST)
-            mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
-            if mask_far.any():
-                cand = cand[mask_far]
-            sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
-            ty, tx = cand[sel].tolist()
-            u.personal_goal = (tx, ty)
-            u.goal_type = "curiosity"
-            u._last_intrinsic_step = self.current_step
-            logger.info(f"[好奇点] 给 emitter {u.id} 分配新好奇点：({tx},{ty})")
+            self._assign_curiosity_goal(u)
+
+    def _assign_curiosity_goal(self, unit):
+        visited = self.env.visited_map
+        age_map = self.visit_age_map
+        never_visited_mask = ~visited
+        cooldown = getattr(unit, "intrinsic_cooldown", 0)
+        long_time_mask = (age_map >= cooldown)
+        candidate_mask = never_visited_mask | long_time_mask
+        cand = torch.nonzero(candidate_mask)
+        if cand.numel() == 0:
+            return
+        ex, ey = unit.position
+        mask_far = []
+        for (yy, xx) in cand.tolist():
+            mask_far.append(abs(xx - ex) + abs(yy - ey) >= MIN_PATROL_DIST)
+        mask_far = torch.tensor(mask_far, dtype=torch.bool, device=cand.device)
+        if mask_far.any():
+            cand = cand[mask_far]
+        sel = torch.randint(0, cand.size(0), (1,), generator=self._rng).item()
+        ty, tx = cand[sel].tolist()
+        unit.personal_goal = (tx, ty)
+        unit.goal_type = "curiosity"
+        unit.assignment_source = ASSIGNMENT_SELF
+        unit.assignment_trace = {
+            "pos": (tx, ty),
+            "step": self.current_step,
+            "meta": {"strategy": "curiosity"},
+            "source": ASSIGNMENT_SELF,
+        }
+        unit._last_intrinsic_step = self.current_step
+        logger.info(f"[好奇点] 给 emitter {unit.id} 分配新好奇点：({tx},{ty})")
 
     def processor_forward(self, sensor_out: torch.Tensor):
         if sensor_out.dim() == 1:
@@ -1357,6 +1369,7 @@ class ImmuneCogGraph(CogGraph):
 
         # 7) 更新目标向量
         self._update_target_vector()
+        self.adaptive_guidance.resize(self.env.size)
 
         logger.warning(
             f"[Curriculum升级] 第 {self.current_step} 步："
@@ -1587,8 +1600,8 @@ class ImmuneCogGraph(CogGraph):
             span = self.current_step - self.kill_stats["last_reset"]
             logger.warning(
                 f"[击杀统计] 过去 {span} 步："
-                f"病毒-自主={self.kill_stats['self_direct']}, 病毒-指引={self.kill_stats['guided']} | "
-                f"Hack-自主={self.hack_kill_stats['self_direct']}, Hack-指引={self.hack_kill_stats['guided']}"
+                f"病毒-自主={self.kill_stats[ASSIGNMENT_SELF]}, 病毒-学习={self.kill_stats[ASSIGNMENT_LEARNED]} | "
+                f"Hack-自主={self.hack_kill_stats[ASSIGNMENT_SELF]}, Hack-学习={self.hack_kill_stats[ASSIGNMENT_LEARNED]}"
             )
             logger.warning(
                 f"Sensor 数量：{self.sensor_count}, Processor 数量：{self.processor_count}, "
@@ -1596,8 +1609,8 @@ class ImmuneCogGraph(CogGraph):
             )
 
         if self.current_step - self.kill_stats["last_reset"] >= 1000:
-            self.kill_stats.update(self_direct=0, guided=0, last_reset=self.current_step)
-            self.hack_kill_stats.update(self_direct=0, guided=0)
+            self.kill_stats.update({ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0, "last_reset": self.current_step})
+            self.hack_kill_stats.update({ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0})
 
 
     def _update_target_weights(self):
@@ -1705,6 +1718,8 @@ class ImmuneCogGraph(CogGraph):
             if u.role == "emitter":
                 # 同步最新的全局目标向量
                 u.goal_vec = self.tv_cached
+                u.assignment_source = ASSIGNMENT_SELF
+                u.assignment_trace = None
 
             # 计算本轮 expected 输入维度（虽然这里没真正用到 exp_in 做后续处理，但保留原注释意图）
             if u.role == "sensor":
@@ -1956,13 +1971,18 @@ class ImmuneCogGraph(CogGraph):
             # —— ④ 更新 kill_stats、virus_kill_stats_by_type、unit.cleared_positions —— #
             hits = len(all_to_clear)
             if hits > 0:
-                src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
+                src = getattr(unit, "assignment_source", ASSIGNMENT_SELF)
+                if src not in self.kill_stats:
+                    self.kill_stats[src] = 0
                 unit.cleared_positions = set()
                 for (x, y, virus_type) in all_to_clear:
                     self.kill_stats[src] += 1
                     bucket_v = self.virus_kill_stats_by_type.setdefault(
-                        virus_type, {"self_direct": 0, "guided": 0}
+                        virus_type,
+                        {ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0},
                     )
+                    if src not in bucket_v:
+                        bucket_v[src] = 0
                     bucket_v[src] += 1
                     unit.cleared_positions.add((x, y))
 
@@ -1976,7 +1996,7 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“扩散点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_inf_count = int((self.env.infected_map > 0.04).sum().item())
                 scale = 1.0 / (1 + curr_inf_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.1
+                factor = LEARNED_FACTOR if src == ASSIGNMENT_LEARNED else 0.1
 
                 weighted_hits = 0.0
                 for (_, _, virus_type) in all_to_clear:
@@ -1998,11 +2018,19 @@ class ImmuneCogGraph(CogGraph):
                 total_reward += reward
 
                 logger.warning(
-                    f"[清理奖励] 总权重 {weighted_hits:.2f}，"
+                    f"[清理奖励] 来源={src}，"
+                    f"learning倍率 {factor:.2f}，"
+                    f"总权重 {weighted_hits:.2f}，"
                     f"带名字点倍率 {multiplier}×，"
                     f"场上感染数 {curr_inf_count} → 缩放 {scale:.3f}，"
                     f"最终能量 {reward:.2f}"
                 )
+
+                trace = getattr(unit, "assignment_trace", None)
+                if trace and trace.get("source") == ASSIGNMENT_LEARNED:
+                    latency = self.current_step - trace.get("step", self.current_step)
+                    target_pos = trace.get("pos", getattr(unit, "personal_goal", (0, 0)))
+                    self.adaptive_guidance.register_feedback(target_pos, reward, latency)
 
                 # —— ⑦ 距离 bonus & 上游 processor 分成 —— #
                 infected_points = torch.nonzero(self.env.infected_map > 0.04).tolist()
@@ -2051,13 +2079,17 @@ class ImmuneCogGraph(CogGraph):
             # —— ④ 更新 hack_kill_stats、hack_kill_stats_by_type、unit.cleared_hack —— #
             hits = len(all_to_clear)
             if hits > 0:
-                src = "guided" if getattr(unit, "guided_this_round", False) else "self_direct"
+                src = getattr(unit, "assignment_source", ASSIGNMENT_SELF)
+                if src not in self.hack_kill_stats:
+                    self.hack_kill_stats[src] = 0
                 unit.cleared_hack = set()
                 for (x, y, hack_type) in all_to_clear:
                     self.hack_kill_stats[src] += 1
                     bucket_h = self.hack_kill_stats_by_type.setdefault(
-                        hack_type, {"self_direct": 0, "guided": 0}
+                        hack_type, {ASSIGNMENT_SELF: 0, ASSIGNMENT_LEARNED: 0}
                     )
+                    if src not in bucket_h:
+                        bucket_h[src] = 0
                     bucket_h[src] += 1
                     unit.cleared_hack.add((x, y))
 
@@ -2071,7 +2103,7 @@ class ImmuneCogGraph(CogGraph):
                 # —— ⑥ 统一奖励：根据“传播点=0.01；命名点=1.0”与“全命名点×5倍”计算 —— #
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
-                factor = GUIDED_FACTOR if getattr(unit, "guided_this_round", False) else 0.1
+                factor = LEARNED_FACTOR if src == ASSIGNMENT_LEARNED else 0.1
 
                 weighted_hits = 0.0
                 for (_, _, hack_type) in all_to_clear:
@@ -2093,11 +2125,19 @@ class ImmuneCogGraph(CogGraph):
                 total_reward += hack_reward
 
                 logger.warning(
-                    f"[黑客批量奖励] 总权重 {weighted_hits:.2f}，"
+                    f"[黑客批量奖励] 来源={src}，"
+                    f"learning倍率 {factor:.2f}，"
+                    f"总权重 {weighted_hits:.2f}，"
                     f"带名字点倍率 {multiplier}×，"
                     f"场上剩余 hack {curr_hack_count} → 缩放 {scale:.3f}，"
                     f"最终能量 {hack_reward:.2f}"
                 )
+
+                trace = getattr(unit, "assignment_trace", None)
+                if trace and trace.get("source") == ASSIGNMENT_LEARNED:
+                    latency = self.current_step - trace.get("step", self.current_step)
+                    target_pos = trace.get("pos", getattr(unit, "personal_goal", (0, 0)))
+                    self.adaptive_guidance.register_feedback(target_pos, hack_reward, latency)
 
                 # —— 距离 bonus & 上游 processor 分成 —— #
                 hack_positions = [(x, y) for (x, y, _) in all_to_clear]
@@ -2451,8 +2491,8 @@ class ImmuneCogGraph(CogGraph):
                 base_reward = 0.6
                 scale = 1.0 / (1.0 + curr_inf_count)
                 reward = base_reward * scale
-                if getattr(u_k, "guided_this_round", False):
-                    reward *= GUIDED_FACTOR
+                if getattr(u_k, "assignment_source", ASSIGNMENT_SELF) == ASSIGNMENT_LEARNED:
+                    reward *= LEARNED_FACTOR
 
                 u_k.energy += reward
                 u_k.meta.record(action="defense", reward=reward)
@@ -2477,8 +2517,8 @@ class ImmuneCogGraph(CogGraph):
             # ==== NEW：hack 清理奖励（若 cleared_hack 属性存在）====
             if hasattr(u_k, "cleared_hack") and u_k.cleared_hack:
                 hack_r = 1.2
-                if getattr(u_k, "guided_this_round", False):
-                    hack_r *= GUIDED_FACTOR
+                if getattr(u_k, "assignment_source", ASSIGNMENT_SELF) == ASSIGNMENT_LEARNED:
+                    hack_r *= LEARNED_FACTOR
 
                 curr_hack_count = len(self.env.hacks)
                 scale = 1.0 / (1 + curr_hack_count)
@@ -2588,7 +2628,10 @@ class ImmuneCogGraph(CogGraph):
             if unit.role != "emitter" or not hasattr(unit, "get_output"):
                 continue
 
-            unit.guided_this_round = False
+            if not hasattr(unit, "assignment_source"):
+                unit.assignment_source = ASSIGNMENT_SELF
+            if not hasattr(unit, "assignment_trace"):
+                unit.assignment_trace = None
             action_vec = unit.get_output()  # [3*seq_len]
             action = self._decode_action_from_output(unit, action_vec)
 
