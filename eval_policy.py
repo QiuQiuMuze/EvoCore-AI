@@ -34,38 +34,35 @@ import random
 import statistics
 from collections import deque
 
-import numpy as np
 import torch
 from env import GridEnvironment
 from coggraph import CogGraph, INPUT_CHANNELS
 from agents.rl_agent import RLAgent
 
 
-def pad_or_trunc(state_np: np.ndarray, target_len: int) -> np.ndarray:
-    """Flatten a state array and pad or truncate to target length"""
-    flat = state_np.ravel()
-    cur = flat.shape[0]
+def pad_or_trunc(state_tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Flatten a state tensor and pad or truncate to target length"""
+    flat = state_tensor.view(-1)
+    cur = flat.numel()
     if cur < target_len:
-        return np.concatenate([flat, np.zeros(target_len - cur, dtype=flat.dtype)])
+        pad = flat.new_zeros(target_len - cur)
+        return torch.cat([flat, pad], dim=0)
     return flat[:target_len]
 
 
-def build_feature(raw_state: np.ndarray, graph: CogGraph, raw_dim: int, device: str, saved_input_dim: int):
+def build_feature(raw_state: torch.Tensor, graph: CogGraph, raw_dim: int, device: str, saved_input_dim: int):
     """
-    Construct the input feature by running sensor->processor and appending goal vector.
-    Truncate or pad to saved_input_dim.
+    Construct the input feature by running sensor->processor. 目标向量不再透明提供，
+    因此直接依赖传感器/处理器输出即可。Truncate 或 pad 到 saved_input_dim。
     """
     flat = pad_or_trunc(raw_state, raw_dim)
-    inp = torch.from_numpy(flat).float().view(1, -1).to(device)
+    inp = flat.float().view(1, -1).to(device)
     s_out = graph.sensor_forward(inp)
-    p_out = graph.processor_forward(s_out).squeeze(0)
+    p_out = graph.processor_forward(s_out)
+    if p_out.dim() > 1:
+        p_out = p_out.squeeze(0)
 
-    tv = graph.target_vector
-    if tv.dim() == 1:
-        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-    goal = tv.view(-1).to(device)
-
-    feat = torch.cat([p_out, goal], dim=-1)
+    feat = p_out
     if feat.numel() < saved_input_dim:
         feat = torch.nn.functional.pad(feat, (0, saved_input_dim - feat.numel()))
     else:
@@ -95,7 +92,6 @@ def evaluate(ckpt_path: str, episodes: int, max_steps: int, device: str, seed: i
     # set random seeds
     if seed is not None:
         random.seed(seed)
-        np.random.seed(seed)
         torch.manual_seed(seed)
 
     # initialize environment and graph
@@ -149,7 +145,7 @@ def evaluate(ckpt_path: str, episodes: int, max_steps: int, device: str, seed: i
 
             # step graph to update target_vector
             raw_state = env.get_state()
-            graph.step(torch.from_numpy(pad_or_trunc(raw_state, raw_dim)).float().view(1, -1).to(device))
+            graph.step(pad_or_trunc(raw_state, raw_dim).float().view(1, -1).to(device))
 
             # execute action in environment
             next_raw, _, _, _ = env.step(action, cog_step=graph.current_step)

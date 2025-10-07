@@ -136,9 +136,8 @@ def main(cfg):
 
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
     init_state = env.get_state().float()
-    proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 125
-    goal_dim = env.size * env.size * 2                               # 2 channels × env²
-    full_dim = proc_dim + goal_dim                                   # e.g. 125+50=175
+    proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 175 (= env² × channels)
+    full_dim = proc_dim                                              # 由 processor 输出直接决定
     agent = RLAgent(
         input_dim=full_dim,                                          # ← 用 full_dim
         num_actions=4,
@@ -171,17 +170,12 @@ def main(cfg):
     state = env.get_state().float()
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
-    # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
-    init_sensor    = graph.sensor_forward(state)                      # (1, state_dim)
-    init_processor = graph.processor_forward(init_sensor).squeeze(0)  # (proc_dim,)
-    # —— 标准化目标向量到 2×(env²) —— #
-    tv = graph.target_vector.to(device)
-    if tv.dim() == 1:
-        # 单通道→补第二通道全 0
-        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)          # (2, env²)
-    goal_vec = graph.target_vector.to(device).view(-1)  # 正好 2*env²
-    # (2*env²,)
-    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+2*env²,)
+    # 构造一个固定长度 = processor 输出维度 的 init_feat
+    init_sensor    = graph.sensor_forward(state)
+    init_processor = graph.processor_forward(init_sensor)
+    if init_processor.dim() > 1:
+        init_processor = init_processor.squeeze(0)
+    init_feat = init_processor
     # --- 保守起见：若将来 proc_dim 变小，也对 init_feat 右补零 ---
     if init_feat.numel() < last_dim:  # last_dim 之前已经设为 full_dim
         init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
@@ -204,15 +198,13 @@ def main(cfg):
         logger.warning(f"\n==== Step {global_step} (within horizon step {step_in_horizon}) ====")
 
         # —— ② 构造 CogGraph.step() 的输入 ——
-        goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
         flat_state = state.view(-1)                                       # (env_size*env_size*C,)
         inp = state.view(1, -1).to(device)     # (1, D)
         graph.step(inp)
 
         # 如果 processor_hidden_size 变化，则同时更新到 full_dim
         proc_dim = graph.processor_hidden_size
-        goal_dim = env.size * env.size * 2
-        new_full = proc_dim + goal_dim
+        new_full = proc_dim
         if new_full != last_dim:
             print(f"[Resize Input] dim: {last_dim} → {new_full}")
             agent.resize_state_dim(new_full)
@@ -223,13 +215,10 @@ def main(cfg):
             # —— 隐藏维度变更时，重置 history —— #
             history = deque(maxlen=history.maxlen)
             init_sensor    = graph.sensor_forward(state)
-            init_processor = graph.processor_forward(init_sensor).squeeze(0)
-            # 同样标准化目标向量到 2×(env²)
-            tv = graph.target_vector.to(device)
-            if tv.dim() == 1:
-                tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-            goal_vec = tv.view(-1)
-            init_feat = torch.cat([init_processor, goal_vec], dim=-1)
+            init_processor = graph.processor_forward(init_sensor)
+            if init_processor.dim() > 1:
+                init_processor = init_processor.squeeze(0)
+            init_feat = init_processor
             if init_feat.numel() < last_dim:  # new_full 已经赋给 last_dim
                 init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
             for _ in range(history.maxlen):
@@ -239,18 +228,13 @@ def main(cfg):
 
 
         # —— ④ 拿 Transformer 输入 ——
-        sensor_out    = graph.sensor_forward(state)      # (1, state_dim)
+        sensor_out    = graph.sensor_forward(state)
         processor_out = graph.processor_forward(sensor_out)
         env.render()
 
-        # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
-        # flatten 到一维（2*env²） 或者你也可以只取资源通道 goal_vec = graph.target_vector[0]
-        # —— 更新历史 & 构造带目标的特征 —— #
-        tv = graph.target_vector.to(device)
-        if tv.dim() == 1:
-            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-        goal_vec  = tv.view(-1)
-        step_feat = torch.cat([processor_out.squeeze(0), goal_vec], dim=-1)
+        step_feat = processor_out
+        if step_feat.dim() > 1:
+            step_feat = step_feat.squeeze(0)
         if step_feat.numel() < last_dim:  # 防止 < last_dim
             step_feat = F.pad(step_feat, (0, last_dim - step_feat.numel()))
 
@@ -311,15 +295,11 @@ def main(cfg):
 
         # —— ⑩ 计算 Intrinsic Curiosity Reward —— #
         # 1) 下一个 Processor 特征
-        next_sensor = graph.sensor_forward(next_raw)  # (1, proc_dim)
-        next_processor = graph.processor_forward(next_sensor)  # (1, proc_dim)
-        # 2) 下一个 Goal 向量（双通道）
-        tv_next = graph.target_vector.to(device)
-        if tv_next.dim() == 1:
-            tv_next = torch.stack([tv_next, torch.zeros_like(tv_next)], dim=0)
-        goal_vec_next = tv_next.view(-1)  # (2*env²,)
-        # 3) 拼接成 full_dim 特征
-        next_feat = torch.cat([next_processor.squeeze(0), goal_vec_next], dim=-1)
+        next_sensor = graph.sensor_forward(next_raw)
+        next_processor = graph.processor_forward(next_sensor)
+        next_feat = next_processor
+        if next_feat.dim() > 1:
+            next_feat = next_feat.squeeze(0)
         if next_feat.numel() < last_dim:
             next_feat = F.pad(next_feat, (0, last_dim - next_feat.numel()))
         # 4) 用 step_feat (上面已构造) 和 next_feat 计算 IC 奖励

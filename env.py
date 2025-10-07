@@ -1,4 +1,3 @@
-import numpy as np
 import random
 import logging
 import torch
@@ -53,7 +52,7 @@ class GridEnvironment:
         # 计数和位置
         self.step_count = 0
         self.explored_cells_count = 0
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
 
         # 初始化探索标记和状态缓冲
         self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
@@ -92,7 +91,7 @@ class GridEnvironment:
 
     def reset(self):
         # 随机初始化 agent
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
         self.step_count = 0
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
@@ -201,9 +200,9 @@ class GridEnvironment:
         return buf.view(-1)
 
     def render(self):
-        grid = np.full((self.size, self.size), '.', dtype=str)
+        grid = [['.' for _ in range(self.size)] for _ in range(self.size)]
         x, y = self.agent_pos
-        grid[y, x] = 'A'
+        grid[y][x] = 'A'
         logger.debug('\n' + '\n'.join(' '.join(row) for row in grid) + '\n')
 
     def distance_to_nearest_danger(self, pos):
@@ -239,7 +238,7 @@ class GridEnvironment:
 
     def reset_with_size(self, new_size: int):
         self.size = new_size
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
         self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
         self._state_buf = torch.zeros((4, self.size, self.size), dtype=torch.float32, device=self.device)
         self.resources = Counter()
@@ -262,7 +261,7 @@ if __name__ == "__main__":
     env = GridEnvironment(size=10)
     env.render()
     for _ in range(5):
-        action = np.random.choice(4)
+        action = random.randrange(4)
         env.step(action)
         env.render()
         print("State vector:", env.get_state())

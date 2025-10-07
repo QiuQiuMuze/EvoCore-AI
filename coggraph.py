@@ -5,7 +5,6 @@ import torch
 import random
 from env import GridEnvironment
 import torch.nn.functional as F
-import numpy as np
 import gc, torch
 from collections import deque, Counter
 from env import logger
@@ -1366,7 +1365,8 @@ class CogGraph:
         if not all_scores:
             return  # 若没有评分数据，则跳过
 
-        score_threshold = np.percentile(all_scores, 90)  # 取前 10% 的分数为门槛
+        scores_tensor = torch.tensor(all_scores, dtype=torch.float32, device=self.device)
+        score_threshold = torch.quantile(scores_tensor, 0.9).item()  # 取前 10% 的分数为门槛
         candidates = []
 
         for u in self.units:
@@ -1760,9 +1760,13 @@ class CogGraph:
         env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
         batch = input_tensor
         env_state = batch[:, :env_dim]
-        res_map   = self.target_vector[0].unsqueeze(0)
-        hzd_map   = self.target_vector[1].unsqueeze(0)
-        full_state = torch.cat([env_state, torch.cat([res_map, hzd_map], dim=1)], dim=1)
+        extra_channels = max(INPUT_CHANNELS - N_STATE_CHANNELS, 0)
+        if extra_channels:
+            pad_len = self.env_size * self.env_size * extra_channels
+            zero_pad = env_state.new_zeros((1, pad_len))
+            full_state = torch.cat([env_state, zero_pad], dim=1)
+        else:
+            full_state = env_state
 
         # —— ⚙️ 静息模式下也要给 emitter 初始化 goal_vec —— #
         for u in self.units:
@@ -1834,12 +1838,13 @@ class CogGraph:
         env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]                    # (1, env_dim)
         # ---------- NEW: 把目标 one-hot 变成 2 个平面 ----------
-        res_map = self.target_vector[0].unsqueeze(0)  # (1, env²)  资源
-        hzd_map = self.target_vector[1].unsqueeze(0)  # (1, env²)  陷阱
-        goal_flat = torch.cat([res_map, hzd_map], dim=1)  # (1, 2·env²)
-
-        # 6 通道打包
-        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
+        extra_channels = max(INPUT_CHANNELS - N_STATE_CHANNELS, 0)
+        if extra_channels:
+            pad_len = self.env_size * self.env_size * extra_channels
+            zero_pad = env_state.new_zeros((1, pad_len))
+            full_state = torch.cat([env_state, zero_pad], dim=1)
+        else:
+            full_state = env_state
         # ─── 新增：长期记忆准备 ───
         # 1) 把 state snapshot 存下来（去掉 batch 维）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
