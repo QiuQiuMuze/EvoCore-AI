@@ -21,12 +21,15 @@ try:                                     # Flash-Attn / TE 优先
 except ImportError:
     HAS_TE = False
 import math
+from goal_generator import sample_unvisited, make_onehot
 from self_model import build_self_model
 
 
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
-N_STATE_CHANNELS = 4
-N_GOAL_CHANNELS = 3
+# 状态通道：自身位置、未知事件点、访问痕迹
+N_STATE_CHANNELS = 3
+# 目标通道仅保留单一平面，供细胞自主学习使用
+N_GOAL_CHANNELS = 1
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
 
@@ -39,7 +42,9 @@ class TaskInjector:
 
     def encode_goal(self, env_size):
         """将目标位置编码成 one-hot 向量（与输入同维度）"""
-        vec = torch.zeros(2, env_size * env_size)  # 2 通道（统一留空，避免泄露类型）
+        index = self.target_position[1] * env_size + self.target_position[0]
+        vec = torch.zeros(1, env_size * env_size)  # 单通道，不区分资源/陷阱
+        vec[0, index] = 1.0
         return vec
 
     def evaluate(self, env, emitter_outputs):
@@ -159,7 +164,7 @@ class CogGraph:
         initial_target = (random.randint(0, self.env_size - 1), random.randint(0, self.env_size - 1))
         self.task = TaskInjector(target_position=initial_target)
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
-        self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
+        self.target_vector = torch.zeros((1, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
         self.max_total_energy = 500  # 初始最大总能量
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
@@ -170,7 +175,7 @@ class CogGraph:
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-        self._target_buf = torch.zeros((2, self.env_size * self.env_size),
+        self._target_buf = torch.zeros((N_GOAL_CHANNELS, self.env_size * self.env_size),
                                        device=self.device)
         self.steps_since_last_reward = 0
         self.static_mode = False
@@ -1747,8 +1752,7 @@ class CogGraph:
         # —— ⚙️ 静息模式下也要给 emitter 初始化 goal_vec —— #
         for u in self.units:
             if u.get_role() == "emitter":
-                goal_dim = self.env_size * self.env_size
-                u.goal_vec = torch.zeros((N_GOAL_CHANNELS, goal_dim), device=self.device)
+                u.goal_vec = self.target_vector.clone()
 
         # upstream logic 重用 snapshot/prev_energies（如果需要 record_memory）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
@@ -1810,10 +1814,10 @@ class CogGraph:
         batch = input_tensor             # (1, env_dim+goal_dim)
         env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]                    # (1, env_dim)
-        goal_flat = self.target_vector.view(1, -1)        # (1, goal_dim)
+        # ---------- NEW: 把目标 one-hot 变成 2 个平面 ----------
+        goal_flat = self.target_vector.view(1, -1)
 
-        # 6 通道打包
-        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, total_dim)
+        full_state = torch.cat([env_state, goal_flat], dim=1)
         # ─── 新增：长期记忆准备 ───
         # 1) 把 state snapshot 存下来（去掉 batch 维）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
@@ -1971,9 +1975,9 @@ class CogGraph:
             old_size = self.env_size
             self.env_size = self.env.size
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-            full_state_dim = self.processor_hidden_size + 2 * (self.env_size * self.env_size)
+            full_state_dim = self.processor_hidden_size + N_GOAL_CHANNELS * (self.env_size * self.env_size)
             self.rl_agent.resize_state_dim(full_state_dim)
-            self._target_buf = self._target_buf.new_zeros((2, self.env_size * self.env_size))
+            self._target_buf = self._target_buf.new_zeros((N_GOAL_CHANNELS, self.env_size * self.env_size))
             if RF.use_shared_tx:
                 self._init_shared_tx()
             logger.info(f"[Env Resize] {old_size}→{self.env_size}, synced CogGraph dims")
@@ -1981,6 +1985,7 @@ class CogGraph:
     def _update_target_vector(self):
         target_vec = self._target_buf
         target_vec.zero_()
+        self.current_hazard_xy = None
         self.target_vector = target_vec
 
 
@@ -1989,9 +1994,8 @@ class CogGraph:
             self.expand_unit_dim(unit, expected_input)
 
         if unit.get_role() == "emitter":
-            goal_dim = self.env_size * self.env_size
-            if getattr(unit, "goal_vec", None) is None or unit.goal_vec.shape != (N_GOAL_CHANNELS, goal_dim):
-                unit.goal_vec = torch.zeros((N_GOAL_CHANNELS, goal_dim), device=self.device)
+            if getattr(unit, "goal_vec", None) is None or unit.goal_vec.numel() != self.env_size * self.env_size * N_GOAL_CHANNELS:
+                unit.goal_vec = torch.zeros(N_GOAL_CHANNELS, self.env_size * self.env_size, device=self.device)
 
         unit.global_emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
         incoming = self.reverse_connections.get(unit.id, ())
@@ -2025,75 +2029,59 @@ class CogGraph:
             return torch.zeros(unit.input_size).unsqueeze(0)
 
     def reward_emitter_grid_environment(self):
-        decay_threshold = 40  # 超过 30 步未奖励就开始衰减
-        decay_amount = 0.04  # 每步扣能量
-        """基于 emitter 输出，在网格环境中执行奖励与惩罚逻辑。"""
+        """根据 emitter 的输出位置给出奖惩，不提供显式类别信息。"""
         outputs = self.collect_emitter_outputs()
         if outputs is None:
             return
 
         emitters = [u for u in self.units if u.get_role() == "emitter"]
-        if not emitters:
-            return
+        for unit, out in zip(emitters, outputs):
+            aligned = self._align_to_goal_dim(out)
+            if aligned.numel() == 0:
+                continue
 
-        aligned_outputs = [self._align_to_goal_dim(out) for out in outputs]
+            pred_idx = torch.argmax(aligned).item()
+            px, py = pred_idx % self.env_size, pred_idx // self.env_size
 
-        env_signal = self.env.agent_energy_gain - self.env.agent_energy_penalty
-        agent_idx = self.env.agent_pos[1] * self.env_size + self.env.agent_pos[0]
+            unit.output_positions = getattr(unit, "output_positions", deque(maxlen=20))
+            unit.output_positions.append((px, py))
 
-        for unit, vec in zip(emitters, aligned_outputs):
-            probs = torch.softmax(vec, dim=0)
-            agent_prob = probs[agent_idx].item()
+            reward = 0.0
+            penalty = 0.0
 
-            upstream_processors = [
-                self.unit_map[pid]
-                for pid in self.reverse_connections.get(unit.id, set())
-                if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
-            ]
-
-            feedback = env_signal * agent_prob
-            if feedback != 0.0:
-                unit.energy += feedback
-                unit.meta.record(action=agent_idx, reward=feedback)
-
-                if upstream_processors:
-                    per_share = (feedback * 0.25) / len(upstream_processors)
-                    for p in upstream_processors:
-                        p.energy += per_share
-                        p.meta.record(action=agent_idx, reward=per_share)
-
+            if (px, py) in self.env.resources and self.env.resources[(px, py)] > 0:
+                reward = 1.0
+                self.env.resources[(px, py)] -= 1
+                if self.env.resources[(px, py)] == 0:
+                    del self.env.resources[(px, py)]
+                self.removed_resources_count += 1
                 unit.last_reward_step = self.current_step
-                unit.last_action_rewarded = feedback > 0
-                if feedback > 0:
-                    self.positive_feedback_count += 1
-                else:
-                    self.negative_feedback_count += 1
-            else:
-                unit.last_action_rewarded = False
-            if self.current_step > 1500:
-                last_step = getattr(unit, "last_reward_step", -1e9)
-                inactive_steps = self.current_step - last_step
-                if inactive_steps > decay_threshold:
-                    unit.energy -= decay_amount * 0.1
-                    unit.meta.record(action="round", reward=-(decay_amount * 0.1))
+                unit.last_action_rewarded = True
 
-            if (
-                hasattr(unit, "output_positions")
-                and len(unit.output_positions) >= 10
-                and self.current_step % 10 == 0
-            ):
-                start = unit.output_positions[0]
-                end = unit.output_positions[-1]
-                manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
-                if 3 <= manhattan < 5:
-                    unit.energy -= 0.08
-                    unit.meta.record(action="move less", reward=-0.08)
-                elif 6 <= manhattan < 8:
-                    unit.energy -= 0.10
-                    unit.meta.record(action="move less", reward=-0.1)
-                elif 9 <= manhattan <= 10:
-                    unit.energy -= 0.12
-                    unit.meta.record(action="move less", reward=-0.12)
+            if (px, py) in self.env.hazards and self.env.hazards[(px, py)] > 0:
+                penalty = 1.0
+                self.env.hazards[(px, py)] -= 1
+                if self.env.hazards[(px, py)] == 0:
+                    del self.env.hazards[(px, py)]
+                self.removed_hazards_count += 1
+                unit.last_action_rewarded = False
+
+            net = reward - penalty
+            if net != 0.0:
+                unit.energy += net
+                unit.meta.record(action=pred_idx, reward=net)
+                unit.inactive_steps = 0
+
+                upstream_processors = [
+                    self.unit_map[pid]
+                    for pid in self.reverse_connections.get(unit.id, set())
+                    if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
+                ]
+                for proc in upstream_processors:
+                    proc.energy += net * 0.25
+                    proc.meta.record(action=pred_idx, reward=net * 0.25)
+            else:
+                unit.inactive_steps = getattr(unit, "inactive_steps", 0) + 1
 
 
     def _expand_environment_curriculum(self):
@@ -2103,7 +2091,7 @@ class CogGraph:
             self.env.resize(self.env_size)
 
             self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
-            full_dim = self.processor_hidden_size + self.env_size * self.env_size * 2
+            full_dim = self.processor_hidden_size + self.env_size * self.env_size * N_GOAL_CHANNELS
             self.rl_agent.resize_state_dim(full_dim)
 
             if RF.use_shared_tx:
@@ -2118,7 +2106,7 @@ class CogGraph:
 
             for u in self.units:
                 u.env_size = self.env_size
-            self._target_buf = self._target_buf.new_zeros((2, self.env_size * self.env_size))
+            self._target_buf = self._target_buf.new_zeros((N_GOAL_CHANNELS, self.env_size * self.env_size))
             for u in self.units:
                 u.memory_buffer.clear()
 
@@ -2138,6 +2126,10 @@ class CogGraph:
                 pool.sort(key=lambda m: m["score"])
                 half = len(pool) // 2
                 del pool[:half]
+
+    def is_current_target_hazard(self) -> bool:
+        """单通道目标下默认视为未知类别。"""
+        return False
 
     def _align_to_goal_dim(self, tensor: torch.Tensor) -> torch.Tensor:
         """

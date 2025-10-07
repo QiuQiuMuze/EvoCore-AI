@@ -57,7 +57,8 @@ class GridEnvironment:
 
         # 初始化探索标记和状态缓冲
         self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
-        self._state_buf = torch.zeros((4, self.size, self.size), dtype=torch.float32, device=self.device)
+        # 状态通道：0=自身位置，1=未知类型的事件点（资源或危险），2=访问痕迹
+        self._state_buf = torch.zeros((3, self.size, self.size), dtype=torch.float32, device=self.device)
 
         # 初始化环境
         exclude = {tuple(self.agent_pos)}
@@ -97,7 +98,6 @@ class GridEnvironment:
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
 
-        # 最近距离初始化
         # 清空标记
         self.visited_map.fill_(False)
         self.explored_cells_count = 0
@@ -141,8 +141,9 @@ class GridEnvironment:
         if step_for_refresh % 1000 == 0 and step_for_refresh >= 1000:
             self.refresh_environment(step_for_refresh, self.explored_cells_count)
 
-        # 计算 reward（仅根据命中带来的能量增减与探索奖励）
+        # 计算 reward（仅依赖实际能量变化和探索）
         base = self.agent_energy_gain - self.agent_energy_penalty
+
         explore_bonus = 0.0
         if not self.visited_map[y, x]:
             self.visited_map[y, x] = True
@@ -173,17 +174,15 @@ class GridEnvironment:
 
         x, y = self.agent_pos
         buf[0, y, x] = 1.0
-        # 资源与危险点对代理不可区分：统一使用一个通道标记存在特殊事件的格子
-        for (rx, ry), cnt in self.resources.items():
-            if cnt > 0 and 0 <= rx < self.size and 0 <= ry < self.size:
-                buf[1, ry, rx] = 1.0
+        for (px, py), cnt in self.resources.items():
+            if cnt > 0 and 0 <= px < self.size and 0 <= py < self.size:
+                buf[1, py, px] = 1.0
 
-        for (hx, hy), cnt in self.hazards.items():
-            if cnt > 0 and 0 <= hx < self.size and 0 <= hy < self.size:
-                buf[1, hy, hx] = 1.0
+        for (px, py), cnt in self.hazards.items():
+            if cnt > 0 and 0 <= px < self.size and 0 <= py < self.size:
+                buf[1, py, px] = 1.0
 
-        buf[2].zero_()
-        buf[3].copy_(self.visited_map.to(torch.float32))
+        buf[2].copy_(self.visited_map.to(torch.float32))
 
         return buf.view(-1)
 
@@ -214,9 +213,9 @@ class GridEnvironment:
         self.visited_map = torch.zeros((new_size, new_size),
                                        dtype=torch.bool,
                                        device=self.device)
-        self._state_buf = torch.zeros((4, new_size, new_size),
-                                      dtype=torch.float32,
-                                      device=self.device)
+        self._state_buf = torch.zeros((3, new_size, new_size),
+                                       dtype=torch.float32,
+                                       device=self.device)
 
         x, y = self.agent_pos
         x = min(x, new_size - 1)
@@ -228,7 +227,7 @@ class GridEnvironment:
         self.size = new_size
         self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
         self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
-        self._state_buf = torch.zeros((4, self.size, self.size), dtype=torch.float32, device=self.device)
+        self._state_buf = torch.zeros((3, self.size, self.size), dtype=torch.float32, device=self.device)
         self.resources = Counter()
         self.hazards = Counter()
         self.step_count = 0
