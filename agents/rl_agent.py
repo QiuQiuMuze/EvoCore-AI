@@ -88,8 +88,14 @@ class RLAgent:
             R = r + self.gamma * R
             returns.insert(0, R)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        # 归一化，提升数值稳定性
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # 归一化，提升数值稳定性（注意样本过少时的数值安全）
+        if returns.numel() > 1:
+            mean = returns.mean()
+            std = returns.std(unbiased=False)
+            if std > 1e-8:
+                returns = (returns - mean) / (std + 1e-8)
+            else:
+                returns = returns - mean
         return returns
 
     def finish_episode(self) -> None:
@@ -99,9 +105,10 @@ class RLAgent:
 
         returns = self._compute_returns()  # (T,)
 
-        loss = -sum(lp * G for lp, G in zip(self.log_probs, returns))
+        log_probs = torch.stack(self.log_probs)
+        loss = -(log_probs * returns).sum()
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
 
