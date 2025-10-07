@@ -1590,7 +1590,8 @@ class CogGraph:
             reward = u.energy - prev_energies.get(u.id, 0.0)
             action = u.last_output.clone().detach() if hasattr(u, "last_output") else None
             outcome = "success" if reward > 0 else "fail"
-            u.record_memory(state_snapshot, action, reward, outcome)
+            unit_state = getattr(u, "last_input_snapshot", state_snapshot)
+            u.record_memory(unit_state, action, reward, outcome)
 
     def _maintain_explorer_emitter_ratio(self):
         emitters = [u for u in self.units if u.role == "emitter"]
@@ -1658,7 +1659,7 @@ class CogGraph:
 
         logger.debug("[代谢] %s var=%.3f conn_sum=%.2f", unit.id, var, conn_strength_sum)
 
-    def _finalize_unit_update(self, unit, state_snapshot, output_buffer, pending, allow_clone):
+    def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
             recs = unit.recall(state_snapshot, k=5, metric='cosine')
             if recs:
@@ -1670,7 +1671,7 @@ class CogGraph:
         except RuntimeError:
             pass
 
-        unit.update(unit.last_output if hasattr(unit, "last_output") else None)
+        unit.update(unit_input)
         if hasattr(self, "active_units"):
             self.active_units.add(unit)
         output_buffer[unit.id] = unit.get_output()
@@ -1924,7 +1925,7 @@ class CogGraph:
             unit_input = self._prepare_unit_before_update(unit, full_state, expected_input)
             unit_input = unit_input.to(self.device)
             self._apply_unit_metabolism(unit, unit_input)
-            self._finalize_unit_update(unit, state_snapshot, output_buffer, pending, allow_clone)
+            self._finalize_unit_update(unit, unit_input, state_snapshot, output_buffer, pending, allow_clone)
 
 
         if self.current_step > 0 and self.current_step % 50 == 0:
