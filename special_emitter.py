@@ -1,6 +1,6 @@
 # special_emitter.py
 
-from CogUnit import CogUnit
+from cogunit import CogUnit
 from emitter_actions import EmitterActions
 from typing import Tuple, Dict, List
 

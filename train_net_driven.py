@@ -15,7 +15,7 @@ import random
 from collections import deque
 
 from env_net import GridSecurityEnv
-from ImmuneCogGraph import ImmuneCogGraph
+from immune_cog_graph import ImmuneCogGraph
 from agents.rl_agent import RLAgent
 from contextlib import nullcontext
 

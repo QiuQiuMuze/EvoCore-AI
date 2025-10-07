@@ -1,204 +1,34 @@
-# cogunit.py
-import torch
-import uuid
+"""CogUnit mixin module generated from the legacy monolith."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .core import CogUnit
+
 import random
-from env import logger
-from collections import deque
-import torch.nn as nn
+from contextlib import nullcontext
 from collections import defaultdict
-from config_runtime import RF            # ★ 新增
-from contextlib import nullcontext       # ★ autocast fallback
-from meta_cognition import MetaCognition
-from memory_unit import MemoryBuffer
+
+import torch
+import torch.nn as nn
+
+from config_runtime import RF
+from env import logger
+
+from .settings import (
+    ENABLE_MINI_LEARN,
+    FOLLOW_INPUT_DEVICE,
+    ROLE_SPLIT_RULE,
+    SPLIT_HI_ES_TABLE,
+    SPLIT_HI_P_TABLE,
+    TOL_FRAC_SPLIT,
+    get_hi_threshold,
+)
 
 
-
-# ======== CogUnit 全局功能开关 ========
-ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
-FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
-# 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
-MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
-# ====================================
-
-
-
-# === Split-Gate 动态阈值表===========================
-# 比例 k_es：Emitter <-> Sensor   ／  k_p： 相对 Processor/2
-SPLIT_HI_ES_TABLE = { 50: 1.30, 200: 1.20, 500: 1.12, float("inf"): 1.05 }
-SPLIT_HI_P_TABLE  = { 50: 1.20, 200: 1.15, 500: 1.08, float("inf"): 1.03 }
-
-TOL_FRAC_SPLIT = 0.05      # 至少差值 Δ≥ceil(total×5 %) （且 ≥1）
-# ===============================================================
-
-def _get_hi(table, total):
-    """按照总细胞数返回当前阶段的 hi 阈值"""
-    for lim, val in table.items():
-        if total < lim:
-            return val
-    return table[float("inf")]
-
-
-
-# ── 角色分裂最低能量阈值 以及 最低调用频率 ────────────
-ROLE_SPLIT_RULE = {
-    "sensor":    {"min_e": 0.9, "min_calls": 0},   # 轻量，几乎不限制调用频率
-    "processor": {"min_e": 0.9, "min_calls": 1},   # 中等
-    "emitter":   {"min_e": 0.6, "min_calls": 0},
-}
-# ----------------------------------------------------
-
-
-
-class CogUnit:
-    """
-    CogUnit 是 EvoCore 的最小认知单元：
-    - 拥有独立状态、能量、年龄
-    - 可进行状态更新（update）与输出
-    - 可判断是否分裂（should_split）与死亡（should_die）
-    - 可克隆生成新单元（clone）
-    """
-
-    def __init__(self, input_size=50, hidden_size=16, role="processor",env_size=5, id=None, **kwargs):
-        self.is_elite = False
-        self.local_memory_pool = []  # 每个单元的私有记忆池
-
-        # 基因表达，表示对不同功能的偏好
-        self.gene = {
-            "sensor_bias": random.uniform(0.5, 1.5),
-            "processor_bias": random.uniform(0.5, 1.5),
-            "emitter_bias": random.uniform(0.5, 1.5),
-            "mutation_rate": 0.01 # 每次复制有1%概率突变
-        }
-
-        self.death_by_aging = False
-        self.subsystem_id = None  # 初始没有子系统归属
-        self.output_history = []  # ✅ 用于记录近几次输出，评估是否行为单一
-        self.call_history = []  # 记录最近几步的调用次数
-        self.call_window = 5  # 窗口长度，过去 5 步
-        self.inactive_steps = 0
-        # 位置总在 [0, env_size) 范围内随机
-        self.env_size = env_size
-        self.position = (
-            random.randint(0, env_size - 1),
-            random.randint(0, env_size - 1),
-        )
-        self.output_history_tensor = torch.zeros((5, input_size), device="cpu")
-        self.output_history_ptr = 0
-        # self._rebuild_safe_positions()
-        self.state_memory = []  # 记忆队列
-        self.memory_limit = 5
-        self.memory_pool_limit = 50
-        self.role = role
-        self.cleared_positions = set()
-        self.uuid = uuid.uuid4()
-        self.id = id or str(uuid.uuid4())
-        self.int_id = self.uuid.int & 0xFFFFFFFF
-        self.energy = 1.0               # 初始能量
-        self.age = 0                    # 生存步数
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.avg_recent_calls = 0.0
-        # 认知状态向量
-        self.state = torch.zeros(hidden_size)
-        self.output_positions = deque(maxlen=10)
-        self.is_hazard_confirmed = False
-        # 元认知记录器
-        self.meta = MetaCognition(history_len=100)
-        self.personal_goal = None            # 当前内在目标 (x,y)
-        self.visit_counts = {}               # {(x,y): 次数}
-        self.intrinsic_reward = 0.1        # 达到内在目标奖励能量
-        # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
-        self.intrinsic_cooldown = 0  # 冷却步数
-        self._last_intrinsic_step = -float("inf")
-
-        self.function = torch.nn.Sequential(
-            torch.nn.Linear(input_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, input_size)
-        )
-
-        self.last_output = torch.zeros(input_size)
-        # ---------- 加速格式 ---------- #
-        if RF.use_channels_last and torch.cuda.is_available():
-            self.function = self.function.to(memory_format=torch.channels_last)
-        if RF.use_fp16 and torch.cuda.is_available():
-            self.function = self.function.half()   # 权重转 FP16
-
-        if "mutation_rate" not in self.gene:
-            self.gene["mutation_rate"] = 0.05
-        self.device = torch.device("cpu")  # 默认跟随 CPU
-        self.last_action_rewarded = False
-        self.last_reward_step = 0  # 记录上次获得 env 奖励的 step
-        # ----- 资源点打转管控 -----
-        self.last_rewarded_target_idx = None   # 上一次领奖的资源索引
-        self.linger_steps             = 0      # 在同一目标附近逗留的帧数
-        self.latest_base_reward       = 0.0    # 上一次靠近时发的 base 奖励，用来扣回
-        self.is_permanent_explorer = False
-        self.visit_counts = defaultdict(int)
-        self.memory_buffer = MemoryBuffer(maxlen=200)
-
-
-
-    # ---------------- 新增 ----------------
-    def to(self, device):
-        """把内部权重 & 状态迁移到指定设备（cpu / cuda）"""
-        device = torch.device(device)
-        if device == getattr(self, "device", torch.device("cpu")):
-            return self  # 已在目标 device，直接返回
-        self.device = device
-        self.function.to(device)
-        self.state = self.state.to(device)
-        self.last_output = self.last_output.to(device)
-        # 若还有其他缓存张量，也一并 .to(device)
-        return self
-    # -------------------------------------
-
-
-    def get_position(self):
-        return self.position
-
-    def mini_learn(self, input_tensor, target_tensor, lr=0.001):
-        if input_tensor.dim() == 1:
-            input_tensor = input_tensor.unsqueeze(0)
-        if target_tensor.dim() == 1:
-            target_tensor = target_tensor.unsqueeze(0)
-
-        # Forward
-        output = self.function(input_tensor)
-
-        # Loss
-        loss = torch.nn.functional.mse_loss(output, target_tensor)
-
-        # Backward
-        self.function.zero_grad()
-        loss.backward()
-
-        # Manual parameter update
-        with torch.no_grad():
-            for param in self.function.parameters():
-                if param.grad is not None:
-                    param.copy_(param - lr * param.grad)
-
-
-        logger.debug(f"[Mini-Learn] {self.id} loss={loss.item():.4f} (lr={lr})")
-
-
-    def compute_self_reward(self, input_tensor, output_tensor):
-        """
-        简单 self-reward：如果输出能跟输入保持一致性，就获得小奖励
-        """
-        if input_tensor.shape != output_tensor.shape:
-            output_tensor = output_tensor[:, :input_tensor.shape[1]]  # 防止维度不同
-        error = torch.mean((input_tensor - output_tensor) ** 2)
-        reward = 0.01 * (self.input_size / 50) * (1.0 - error.item())  # error越小奖励越高
-        return max(reward, 0.0)  # 不让奖励为负数
-
-    def get_recent_outputs(self, n=5):
-        """按时间顺序返回最近 n 帧输出（张量列表）"""
-        L = min(n, self.output_history_tensor.size(0))
-        idxs = [(self.output_history_ptr - i - 1) % L for i in reversed(range(L))]
-        return [self.output_history_tensor[i] for i in idxs]
-
+class LifecycleMixin:
     def update(self, input_tensor: torch.Tensor):
         input_tensor = input_tensor.squeeze()  # ← 保证不是 3 维
 
@@ -432,13 +262,6 @@ class CogUnit:
             if ENABLE_MINI_LEARN:
                 self.mini_learn(input_tensor, input_tensor, lr=lr)
 
-    def get_output(self) -> torch.Tensor:
-        """返回给下游单元使用的输出 (shape=[1, input_size])"""
-        if MAX_OUTPUT_DIM is not None and self.last_output.numel() > MAX_OUTPUT_DIM:
-            return self.last_output[:MAX_OUTPUT_DIM]
-        return self.last_output
-
-
     def should_split(self):
 
 
@@ -468,8 +291,8 @@ class CogUnit:
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
         total = getattr(self, "global_unit_count", sensor_count + processor_count + emitter_count)
 
-        hi_es = _get_hi(SPLIT_HI_ES_TABLE, total)  # emitter <-> sensor
-        hi_p = _get_hi(SPLIT_HI_P_TABLE, total)  # 相对 processor/2
+        hi_es = get_hi_threshold(SPLIT_HI_ES_TABLE, total)  # emitter <-> sensor
+        hi_p = get_hi_threshold(SPLIT_HI_P_TABLE, total)  # 相对 processor/2
         half_p = processor_count / 2
 
         # 差值必须 ≥1 且 ≥ceil(total×TOL) 才算“真的多”
@@ -508,179 +331,6 @@ class CogUnit:
             return False
 
         return True
-
-    def evaluate_self(self, min_rate=0.3):
-        """
-        检查最近表现，若低于 min_rate 返回 True 表示需要变异/调整。
-        """
-        rate = self.meta.recent_success_rate()
-        if rate is None:
-            return False
-        return rate < min_rate
-
-    def request_upgrade(self, target_role=None, reason=""):
-        """
-        元认知评估后触发：记录一次升级意图，
-        CogGraph 后续可以检测到并执行真正的变异/重构。
-        """
-        # 1) 清空 MetaCognition 历史
-        self.meta = MetaCognition(history_len=self.meta.reward_trace.maxlen)
-        # 2) 基因轻扰动
-        for k in ["sensor_bias", "processor_bias", "emitter_bias"]:
-            self.gene[k] += random.gauss(0, 0.05)
-        # 3) 网络参数加小噪声
-        for p in self.function.parameters():
-            p.data += torch.randn_like(p) * 0.01
-        logger.info(f"[Meta-升级] {self.id}, {self.role} 因“{reason}”触发自我进化，开始思考赛博人生，觉得自己又行了。新gene={self.gene}")
-
-
-    def is_worthy_of_memory(self):
-        """根据不同角色，判断该细胞是否值得加入记忆池"""
-        if self.age < 100:
-            return False  # 太年轻的不记
-
-        if self.role == "sensor":
-            # 感知单元：至少要有两帧输出才能计算变化
-            if len(self.output_history) < 2:
-                return False
-
-            # 1) 计算 L1 变化量，先对齐到最小公共长度
-            changes = []
-            for prev, curr in zip(self.output_history, self.output_history[1:]):
-                p = prev.view(-1)
-                c = curr.view(-1)
-                L = min(p.numel(), c.numel())
-                changes.append((c[:L] - p[:L]).abs().sum().item())
-
-            if not changes:
-                return False
-
-            avg_change = sum(changes) / len(changes)
-            SENSOR_CHANGE_THRESHOLD = 5.0
-            return avg_change > SENSOR_CHANGE_THRESHOLD
-
-
-
-        elif self.role == "processor":
-            # 处理单元应关注调用频率 & 输出多样性
-            if getattr(self, "avg_recent_calls", 0) < 0.75:
-                return False
-            if len(self.output_history) < 2:
-                return False
-            total_diff = 0.0
-            count = 0
-            for prev, curr in zip(self.output_history, self.output_history[1:]):
-                # 只比较 shape 相同的
-                if prev.shape == curr.shape:
-                    total_diff += torch.norm(curr - prev).item()
-                    count += 1
-
-            if count == 0:
-                return False
-
-            variation = total_diff / count
-            return variation > 0.05  # 输出变化足够丰富
-
-
-        elif self.role == "emitter":
-            # 行为单元应关注任务完成情况和激活频率（活跃但非重复）
-            if self.avg_recent_calls < 2.0:
-                return False
-            if len(self.output_history) < 2:
-                return False
-            diff = sum(
-                torch.norm(self.output_history[i] - self.output_history[i + 1]).item()
-                for i in range(len(self.output_history) - 1)
-            ) / (len(self.output_history) - 1)
-            return 0.01 < diff < 0.5  # 太低代表退化，太高可能随机扰动
-
-
-        return False
-
-    def add_to_local_memory(self):
-        self.local_memory_pool = [m for m in self.local_memory_pool if "score" in m]
-        # —— 对齐 output_history 到同一长度 ——
-        import torch.nn.functional as F
-        aligned_history = None
-        if len(self.output_history) >= 3:
-            # 取最大元素数量
-            max_len = max(t.numel() for t in self.output_history)
-            aligned_history = []
-            for t in self.output_history:
-                vec = t.view(-1)  # 拉平
-                if vec.numel() < max_len:
-                    # 右侧补 0
-                    vec = F.pad(vec, (0, max_len - vec.numel()), value=0)
-                else:
-                    # 长则截断
-                    vec = vec[:max_len]
-                aligned_history.append(vec)
-
-        if self.role == "sensor":
-            if len(aligned_history) >= 2:
-                # 假设 output_history 至少有 2 帧
-                hist = [t.view(-1) for t in self.output_history]
-                diffs = []
-                for prev, curr in zip(self.output_history, self.output_history[1:]):
-                    p = prev.view(-1)
-                    c = curr.view(-1)
-                    L = min(p.numel(), c.numel())
-                    diffs.append((c[:L] - p[:L]).abs().sum().item())
-
-                variation = sum(diffs) / len(diffs)
-
-                score = variation
-            else:
-                score = 0
-
-        elif self.role == "processor":
-            # 处理：输出多样性 + 调用频率（已对齐）
-            if aligned_history:
-                diffs = [
-                    torch.norm(aligned_history[i] - aligned_history[i+1]).item()
-                    for i in range(len(aligned_history) - 1)
-                ]
-                diversity = sum(diffs) / len(diffs)
-            else:
-                diversity = 0
-            score = diversity * 0.5 + getattr(self, "avg_recent_calls", 0) * 0.3
-
-
-        elif self.role == "emitter":
-            # 输出：活跃性 + 输出稳定性（已对齐）
-            if aligned_history:
-                diffs = [
-                    torch.norm(aligned_history[i] - aligned_history[i+1]).item()
-                    for i in range(len(aligned_history) - 1)
-                ]
-                avg_diff = sum(diffs) / len(diffs)
-                stability = 1.0 if 0.01 < avg_diff < 0.5 else 0.0
-            else:
-                stability = 0
-            score = getattr(self, "avg_recent_calls", 0) * 0.5 + stability * 0.3
-
-
-        else:
-            score = self.energy + getattr(self, "avg_recent_calls", 0)
-
-        """将自身压缩为记忆格式，加入 local memory pool"""
-        mem = {
-            "gene": self.gene.copy(),
-            "output": self.last_output.clone(),
-            "role": self.role,
-            "age": self.age,
-            "hidden_size": self.hidden_size,
-            "score": score
-
-        }
-        self.local_memory_pool.append(mem)
-
-        # 控制最大记忆数量，移除最弱
-        if len(self.local_memory_pool) > self.memory_pool_limit:
-            self.local_memory_pool.sort(key=lambda m: m["score"])
-            self.local_memory_pool.pop(0)  # 移除最弱
-        logger.info(
-            f"[记忆加入] {self.id}（{self.role}，Age={self.age}）加入本地记忆池，评分={mem['score']:.2f}，当前共 {len(self.local_memory_pool)} 条")
 
     def should_die(self) -> bool:
         if self.role == "processor":
@@ -932,29 +582,3 @@ class CogUnit:
             clone_unit.visit_counts = self.visit_counts.copy()
 
         return clone_unit
-
-    def record_memory(self, state: torch.Tensor, action, reward: float, outcome: str):
-        """
-        外部在每步做完 reward 计算后调用：
-        state: 当时传入 update() 的输入张量（含 env+goal）
-        action: 本轮 emitter/processor 选的动作标识
-        reward: 本轮环境＋自我评价总 reward
-        outcome: 'success' or 'fail' or 自定义标签
-        """
-        self.memory_buffer.add(state, action, reward, outcome)
-
-    def recall(self, query_state: torch.Tensor, k: int = 5, metric: str = 'cosine'):
-        """
-        查历史经验，返回字典列表：
-        [{'state':…, 'action':…, 'reward':…, 'outcome':…}, …]
-        """
-        return self.memory_buffer.recall(query_state, k, metric)
-
-    def get_role(self):
-        return self.role
-
-    def __str__(self):
-        x, y = self.position
-        return f"CogUnit<{self.id}> Role:{self.role} Pos:({x},{y}) Age:{self.age} Energy:{self.energy:.2f} Gene:{self.gene}"
-
-

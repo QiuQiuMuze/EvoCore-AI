@@ -18,6 +18,7 @@ import torch
 
 from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
+from cogunit import CogUnit
 from agents.rl_agent import RLAgent
 from utils import IntrinsicCuriosityModule
 from collections import deque
@@ -122,8 +123,7 @@ def main(cfg):
     env = graph.env
 
     # ---- 新增 ----
-    import CogUnit
-    CogUnit.MAX_OUTPUT_DIM = graph.processor_hidden_size
+    CogUnit.configure_max_output_dim(graph.processor_hidden_size)
     # --------------------
 
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
