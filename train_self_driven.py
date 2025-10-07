@@ -25,7 +25,7 @@ import time
 import torch
 
 from env import GridEnvironment
-from coggraph import CogGraph          # 需确保已实现 forward 三接口
+from coggraph import CogGraph, N_GOAL_CHANNELS          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
 from utils import IntrinsicCuriosityModule
 from collections import deque
@@ -137,7 +137,7 @@ def main(cfg):
     # 2) 动态推断 processor 输出维度 + 显式拼接目标向量后 rebuild Agent
     init_state = env.get_state().float()
     proc_dim = _infer_input_dim(graph, init_state)                   # e.g. 125
-    goal_dim = env.size * env.size * 2                               # 2 channels × env²
+    goal_dim = env.size * env.size * N_GOAL_CHANNELS
     full_dim = proc_dim + goal_dim                                   # e.g. 125+50=175
     agent = RLAgent(
         input_dim=full_dim,                                          # ← 用 full_dim
@@ -171,17 +171,12 @@ def main(cfg):
     state = env.get_state().float()
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
-    # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
+    # 构造一个固定长度 = proc_dim + goal_dim 的 init_feat
     init_sensor    = graph.sensor_forward(state)                      # (1, state_dim)
     init_processor = graph.processor_forward(init_sensor).squeeze(0)  # (proc_dim,)
-    # —— 标准化目标向量到 2×(env²) —— #
     tv = graph.target_vector.to(device)
-    if tv.dim() == 1:
-        # 单通道→补第二通道全 0
-        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)          # (2, env²)
-    goal_vec = graph.target_vector.to(device).view(-1)  # 正好 2*env²
-    # (2*env²,)
-    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+2*env²,)
+    goal_vec = tv.view(-1)
+    init_feat = torch.cat([init_processor, goal_vec], dim=-1)
     # --- 保守起见：若将来 proc_dim 变小，也对 init_feat 右补零 ---
     if init_feat.numel() < last_dim:  # last_dim 之前已经设为 full_dim
         init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
@@ -211,7 +206,7 @@ def main(cfg):
 
         # 如果 processor_hidden_size 变化，则同时更新到 full_dim
         proc_dim = graph.processor_hidden_size
-        goal_dim = env.size * env.size * 2
+        goal_dim = env.size * env.size * N_GOAL_CHANNELS
         new_full = proc_dim + goal_dim
         if new_full != last_dim:
             print(f"[Resize Input] dim: {last_dim} → {new_full}")
@@ -224,10 +219,7 @@ def main(cfg):
             history = deque(maxlen=history.maxlen)
             init_sensor    = graph.sensor_forward(state)
             init_processor = graph.processor_forward(init_sensor).squeeze(0)
-            # 同样标准化目标向量到 2×(env²)
             tv = graph.target_vector.to(device)
-            if tv.dim() == 1:
-                tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
             goal_vec = tv.view(-1)
             init_feat = torch.cat([init_processor, goal_vec], dim=-1)
             if init_feat.numel() < last_dim:  # new_full 已经赋给 last_dim
@@ -243,12 +235,8 @@ def main(cfg):
         processor_out = graph.processor_forward(sensor_out)
         env.render()
 
-        # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
-        # flatten 到一维（2*env²） 或者你也可以只取资源通道 goal_vec = graph.target_vector[0]
-        # —— 更新历史 & 构造带目标的特征 —— #
+        # —— 新增：加上本轮目标向量（无类别提示）的位置编码 —— #
         tv = graph.target_vector.to(device)
-        if tv.dim() == 1:
-            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
         goal_vec  = tv.view(-1)
         step_feat = torch.cat([processor_out.squeeze(0), goal_vec], dim=-1)
         if step_feat.numel() < last_dim:  # 防止 < last_dim
@@ -274,50 +262,21 @@ def main(cfg):
         action = agent.select_action(state_seq)
         # ——— 使用 capture 形式执行一步环境，获取 raw_reward ———
 
-        # —— ⑥ Reward shaping ——
-        agent_pos   = tuple(env.agent_pos)
-        resources = env.resources
-        if resources:
-            # 用与最近资源的距离代替固定目标点
-            dists = [abs(agent_pos[0] - r[0]) + abs(agent_pos[1] - r[1]) for r in resources]
-            min_res_dist = min(dists)
-            proximity_bonus = 0.01 if min_res_dist <= 2 else 0.0
-        else:
-            proximity_bonus = 0.0
-
-        danger_dist = env.distance_to_nearest_danger(agent_pos)
-        if danger_dist <= 2:
-            danger_shaping = -0.05
-        elif danger_dist >= 3:
-            danger_shaping = 0.0
-
-        # —— ⑦ 用 env.step(...) 返回的 reward（含 base、resource_shaping、danger_shaping、explore_bonus）———
-        #    同时拿到下一状态和 done 标志
+        # —— ⑥ 与环境交互，获取原始奖励 ——
         next_state_np, raw_reward, done, _ = env.step(action, cog_step=graph.current_step)
 
-        # —— ⑧ 组合最终外在奖励 —— #
-        # raw_reward 已包含：
-        #   env.agent_energy_gain - env.agent_energy_penalty
-        # + resource_shaping (±0.01)
-        # + danger_shaping   (±0.2)
-        # + explore_bonus    (首次访问格子 +0.005)
-        # 这里再加上你原来的 proximity_bonus
-        ext_reward = raw_reward + proximity_bonus + danger_shaping
-        # —— ⑨ 下一状态转张量 —— #
-        # —— ⑧ 组合最终外在奖励 ——
-        ext_reward = raw_reward + proximity_bonus + danger_shaping
-        # —— ⑨ 下一状态转张量 ——
+        # —— ⑦ 组合最终外在奖励 —— #
+        ext_reward = raw_reward
+        # —— ⑧ 下一状态转张量 ——
         next_raw = next_state_np.float().to(device)
 
         # —— ⑩ 计算 Intrinsic Curiosity Reward —— #
         # 1) 下一个 Processor 特征
         next_sensor = graph.sensor_forward(next_raw)  # (1, proc_dim)
         next_processor = graph.processor_forward(next_sensor)  # (1, proc_dim)
-        # 2) 下一个 Goal 向量（双通道）
+        # 2) 下一个 Goal 向量
         tv_next = graph.target_vector.to(device)
-        if tv_next.dim() == 1:
-            tv_next = torch.stack([tv_next, torch.zeros_like(tv_next)], dim=0)
-        goal_vec_next = tv_next.view(-1)  # (2*env²,)
+        goal_vec_next = tv_next.view(-1)
         # 3) 拼接成 full_dim 特征
         next_feat = torch.cat([next_processor.squeeze(0), goal_vec_next], dim=-1)
         if next_feat.numel() < last_dim:
