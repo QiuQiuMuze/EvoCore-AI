@@ -125,7 +125,9 @@ def main(cfg):
         if hasattr(graph, "reset_state"):
             graph.reset_state()
 
+
         state = torch.as_tensor(state_np, dtype=torch.float32, device=device)
+
         ep_reward = 0.0
         episode_steps = 0
         energy_start, *_ = _energy_snapshot(graph)
