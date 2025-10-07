@@ -10,11 +10,12 @@ from config_runtime import RF            # ★ 新增
 from contextlib import nullcontext       # ★ autocast fallback
 from meta_cognition import MetaCognition
 from memory_unit import MemoryBuffer
+from torch.nn.utils import clip_grad_norm_
 
 
 
 # ======== CogUnit 全局功能开关 ========
-ENABLE_MINI_LEARN = False  # ← 关闭自编码训练
+ENABLE_MINI_LEARN = True  # ← 细胞允许在线学习
 FOLLOW_INPUT_DEVICE = True  # ← 自动把内部张量跟随输入 device（GPU/CPU）
 # 如想完全手动控制迁移，改成 False 并仅用 .to() 方法。
 MAX_OUTPUT_DIM = None       # ← 若设为 int，则 get_output() 强截断
@@ -119,10 +120,13 @@ class CogUnit:
 
         self.last_output = torch.zeros(input_size)
         # ---------- 加速格式 ---------- #
-        if RF.use_channels_last and torch.cuda.is_available():
-            self.function = self.function.to(memory_format=torch.channels_last)
-        if RF.use_fp16 and torch.cuda.is_available():
-            self.function = self.function.half()   # 权重转 FP16
+        self._apply_runtime_preferences()
+
+        self.base_lr = 1e-3
+        self.training_step = 0
+        self.last_training_loss = 0.0
+        self.optimizer = None
+        self._init_optimizer(self.base_lr)
 
         if "mutation_rate" not in self.gene:
             self.gene["mutation_rate"] = 0.05
@@ -149,6 +153,13 @@ class CogUnit:
         self.function.to(device)
         self.state = self.state.to(device)
         self.last_output = self.last_output.to(device)
+        if hasattr(self, "optimizer") and self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                group["params"] = [p for p in group["params"]]  # 强制刷新引用
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(device)
         # 若还有其他缓存张量，也一并 .to(device)
         return self
     # -------------------------------------
@@ -157,30 +168,124 @@ class CogUnit:
     def get_position(self):
         return self.position
 
-    def mini_learn(self, input_tensor, target_tensor, lr=0.001):
-        if input_tensor.dim() == 1:
-            input_tensor = input_tensor.unsqueeze(0)
-        if target_tensor.dim() == 1:
-            target_tensor = target_tensor.unsqueeze(0)
+    # ---------- 学习辅助工具 ---------- #
+    def _apply_runtime_preferences(self):
+        if RF.use_channels_last and torch.cuda.is_available():
+            self.function = self.function.to(memory_format=torch.channels_last)
+        if RF.use_fp16 and torch.cuda.is_available():
+            self.function = self.function.half()
 
-        # Forward
-        output = self.function(input_tensor)
+    def _init_optimizer(self, lr=None):
+        base = lr if lr is not None else getattr(self, "base_lr", 1e-3)
+        self.base_lr = base
+        self.optimizer = torch.optim.Adam(self.function.parameters(), lr=base)
 
-        # Loss
-        loss = torch.nn.functional.mse_loss(output, target_tensor)
+    def _ensure_optimizer(self):
+        if getattr(self, "optimizer", None) is None:
+            self._init_optimizer(self.base_lr)
 
-        # Backward
-        self.function.zero_grad()
+    def _param_dtype(self):
+        return next(self.function.parameters()).dtype
+
+    def _align_to_input_size(self, tensor):
+        if tensor is None:
+            return None
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        D = tensor.shape[-1]
+        if D < self.input_size:
+            tensor = torch.nn.functional.pad(tensor, (0, self.input_size - D))
+        elif D > self.input_size:
+            tensor = tensor[..., : self.input_size]
+        return tensor
+
+    def _train_step(self, inputs, targets, lr=None):
+        if inputs is None or targets is None:
+            return
+
+        self._ensure_optimizer()
+
+        inputs = inputs.detach()
+        targets = targets.detach()
+        inputs = self._align_to_input_size(inputs)
+        targets = self._align_to_input_size(targets)
+
+        dtype = self._param_dtype()
+        inputs = inputs.to(self.device, dtype=dtype)
+        targets = targets.to(self.device, dtype=dtype)
+
+        if lr is None:
+            lr = self.base_lr
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
+
+        ctx = (torch.autocast("cuda", dtype=torch.float16)
+               if (RF.use_fp16 and self.device.type == "cuda") else nullcontext())
+
+        self.function.train()
+        with ctx:
+            preds = self.function(inputs)
+            loss = torch.nn.functional.mse_loss(preds, targets)
+
+        self.optimizer.zero_grad()
         loss.backward()
+        clip_grad_norm_(self.function.parameters(), 1.0)
+        self.optimizer.step()
 
-        # Manual parameter update
-        with torch.no_grad():
-            for param in self.function.parameters():
-                if param.grad is not None:
-                    param.copy_(param - lr * param.grad)
+        self.last_training_loss = float(loss.detach().cpu())
+        self.training_step += 1
+        self.function.eval()
 
+        logger.debug(f"[Mini-Learn] {self.id} loss={self.last_training_loss:.4f} (lr={lr})")
 
-        logger.debug(f"[Mini-Learn] {self.id} loss={loss.item():.4f} (lr={lr})")
+    def _role_learning_rate(self):
+        bias_key = {
+            "sensor": "sensor_bias",
+            "processor": "processor_bias",
+            "emitter": "emitter_bias",
+        }.get(self.role, "processor_bias")
+        bias = self.gene.get(bias_key, 1.0)
+        base = 0.001 if self.role != "emitter" else 0.0008
+        rate = base * (2.0 - min(1.5, bias))
+        return max(rate, 1e-4)
+
+    def _build_immediate_target(self, input_tensor):
+        if self.role in ("sensor", "processor"):
+            return input_tensor
+        if self.role == "emitter" and hasattr(self, "goal_vec"):
+            goal = self.goal_vec.view(1, -1)
+            return self._align_to_input_size(goal)
+        return None
+
+    def learn_from_memory(self, batch_size=4, min_reward=0.05):
+        if getattr(self, "memory_buffer", None) is None:
+            return
+
+        records = [rec for rec in self.memory_buffer.buffer
+                   if rec.get("action") is not None and rec.get("reward", 0.0) >= min_reward]
+        if not records:
+            return
+
+        batch = random.sample(records, min(batch_size, len(records)))
+        inputs = []
+        targets = []
+        for rec in batch:
+            state = rec["state"].view(-1)
+            action = rec["action"].view(-1)
+            inputs.append(self._align_to_input_size(state.unsqueeze(0)))
+            targets.append(self._align_to_input_size(action.unsqueeze(0)))
+
+        if not inputs or not targets:
+            return
+
+        batch_inputs = torch.cat(inputs, dim=0)
+        batch_targets = torch.cat(targets, dim=0)
+
+        lr = self._role_learning_rate() * 0.5
+        self._train_step(batch_inputs, batch_targets, lr=lr)
+
+    def mini_learn(self, input_tensor, target_tensor, lr=0.001):
+        self._train_step(input_tensor, target_tensor, lr=lr)
 
 
     def compute_self_reward(self, input_tensor, output_tensor):
@@ -275,6 +380,8 @@ class CogUnit:
             # 重新组装 function，更新 input_size
             self.function = nn.Sequential(new_l1, nn.ReLU(), new_l2)
             self.input_size = current_input_size
+            self._apply_runtime_preferences()
+            self._init_optimizer(self.base_lr)
             self.output_history_tensor = torch.zeros((5, self.input_size), device="cpu")
             self.output_history_ptr = 0
 
@@ -302,8 +409,6 @@ class CogUnit:
             input_tensor = torch.nn.functional.pad(input_tensor, pad)
 
         # === Forward: 内部处理 ===
-        use_grad = ENABLE_MINI_LEARN
-        # —— 前向只用于推理时关闭 Autograd ——
         ctx = (torch.autocast("cuda", dtype=torch.float16)
                if (RF.use_fp16 and self.device.type == "cuda") else nullcontext())
 
@@ -312,6 +417,7 @@ class CogUnit:
 
         self.last_output = raw_output.detach().clone()  # ⚡ 关键：detach掉，避免污染计算图
         self.state = self.last_output.clone()
+        self.last_input_snapshot = input_tensor.detach().squeeze(0).cpu()
 
         # ✅ 存储输出历史，供行为质量判断用
         # ✅ 若升维后，output_history_tensor 的列数不一致，立即重建
@@ -401,19 +507,15 @@ class CogUnit:
                 self.is_hazard_confirmed = False
         # ---------- 新增结束 ---------------------------
 
-        if self.get_role() == "emitter":
-            bias = self.gene.get("emitter_bias", 1.0)
-            lr = 0.001 * (2.0 - min(1.5, bias))
-            if ENABLE_MINI_LEARN:
-                self.mini_learn(input_tensor, self.last_output.detach(), lr=lr)
+        if ENABLE_MINI_LEARN:
+            lr = self._role_learning_rate()
+            target = self._build_immediate_target(input_tensor.detach())
+            if target is not None:
+                self.mini_learn(input_tensor.detach(), target.detach(), lr=lr)
 
-        else:
-            # processor/sensor 仍是自编码式
-            bias = self.gene.get("processor_bias", 1.0) if self.role == "processor" else self.gene.get("sensor_bias",
-                                                                                                       1.0)
-            lr = 0.001 * (2.0 - min(1.5, bias))  # bias 越高，学习率越低，代表更“稳健”，越低则更易激动
-            if ENABLE_MINI_LEARN:
-                self.mini_learn(input_tensor, input_tensor, lr=lr)
+            step = getattr(self, "current_step", 0)
+            if step % 8 == 0:
+                self.learn_from_memory(batch_size=4)
 
     def get_output(self) -> torch.Tensor:
         """返回给下游单元使用的输出 (shape=[1, input_size])"""
@@ -776,6 +878,9 @@ class CogUnit:
                 new_l2
             )
 
+        clone_unit._apply_runtime_preferences()
+        clone_unit._init_optimizer(clone_unit.base_lr)
+
         # 🔬 基因复制（深拷贝）
         clone_unit.gene = {k: v for k, v in self.gene.items()}
 
@@ -905,6 +1010,10 @@ class CogUnit:
         # ✅ 最终兜底：如果前面没赋值 visit_counts，则继承父体记录
         if not hasattr(clone_unit, "visit_counts") or not clone_unit.visit_counts:
             clone_unit.visit_counts = self.visit_counts.copy()
+
+        clone_unit._apply_runtime_preferences()
+        clone_unit.to(self.device)
+        clone_unit._init_optimizer(clone_unit.base_lr)
 
         return clone_unit
 
