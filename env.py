@@ -98,9 +98,6 @@ class GridEnvironment:
         self.agent_energy_penalty = 0.0
 
         # 最近距离初始化
-        self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
-        self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
-
         # 清空标记
         self.visited_map.fill_(False)
         self.explored_cells_count = 0
@@ -143,28 +140,16 @@ class GridEnvironment:
         step_for_refresh = cog_step if cog_step is not None else self.step_count
         if step_for_refresh % 1000 == 0 and step_for_refresh >= 1000:
             self.refresh_environment(step_for_refresh, self.explored_cells_count)
-            self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
-            self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
 
-        # 计算 reward shaping
+        # 计算 reward（仅根据命中带来的能量增减与探索奖励）
         base = self.agent_energy_gain - self.agent_energy_penalty
-        dist_res = self.distance_to_nearest_resource(pos)
-        delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.001 if delta_res > 0 else (-0.001 if delta_res < 0 else 0.0)
-        self.prev_dist_resource = dist_res
-
-        danger_dist = self.distance_to_nearest_danger(pos)
-        delta_danger = self.prev_danger_dist - danger_dist
-        danger_shaping = 0.001 if delta_danger > 0 else (-0.001 if delta_danger < 0 else 0.0)
-        self.prev_danger_dist = danger_dist
-
         explore_bonus = 0.0
         if not self.visited_map[y, x]:
             self.visited_map[y, x] = True
             self.explored_cells_count += 1
             explore_bonus = 0.0001
 
-        reward = base + resource_shaping + danger_shaping + explore_bonus
+        reward = base + explore_bonus
         next_state = self.get_state()
 
         done = False
@@ -188,14 +173,16 @@ class GridEnvironment:
 
         x, y = self.agent_pos
         buf[0, y, x] = 1.0
+        # 资源与危险点对代理不可区分：统一使用一个通道标记存在特殊事件的格子
         for (rx, ry), cnt in self.resources.items():
-            # ← 边界检查，确保 0 <= rx,ry < size
             if cnt > 0 and 0 <= rx < self.size and 0 <= ry < self.size:
                 buf[1, ry, rx] = 1.0
 
         for (hx, hy), cnt in self.hazards.items():
             if cnt > 0 and 0 <= hx < self.size and 0 <= hy < self.size:
-                buf[2, hy, hx] = 1.0
+                buf[1, hy, hx] = 1.0
+
+        buf[2].zero_()
         buf[3].copy_(self.visited_map.to(torch.float32))
 
         return buf.view(-1)

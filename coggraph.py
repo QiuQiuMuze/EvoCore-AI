@@ -21,12 +21,9 @@ try:                                     # Flash-Attn / TE 优先
 except ImportError:
     HAS_TE = False
 import math
-from goal_generator import sample_unvisited, make_onehot
-from collections import Counter
 from self_model import build_self_model
 
 
-HIT_THRESH = 0.15          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
 N_STATE_CHANNELS = 4
 N_GOAL_CHANNELS = 3
@@ -42,18 +39,13 @@ class TaskInjector:
 
     def encode_goal(self, env_size):
         """将目标位置编码成 one-hot 向量（与输入同维度）"""
-        index = self.target_position[1] * env_size + self.target_position[0]
-        vec = torch.zeros(2, env_size * env_size)  # 2 通道
-        vec[0, index] = 1.0  # 资源层 one-hot
-        # vec[1] 先保持全 0（陷阱层以后再写）
+        vec = torch.zeros(2, env_size * env_size)  # 2 通道（统一留空，避免泄露类型）
         return vec
 
     def evaluate(self, env, emitter_outputs):
         if emitter_outputs is None:
             return False
-        pred_index = torch.argmax(emitter_outputs.mean(dim=0)).item()
-        x, y = pred_index % env.size, pred_index // env.size
-        return (x, y) in env.resources  # ✅ 只看是否落在资源点上
+        return False
 
 
 # 理想比例  emitter : processor : sensor = 1 : 2 : 1
@@ -120,20 +112,10 @@ class CogGraph:
         for u in sensors + processors + emitters:
             self.add_unit(u)
 
-        # --- 初始化内在目标状态 ---
-        # 保证初始 personal_goal 在不同 emitter 之间不重复
-        taken = set()
+        # --- 初始化内在状态 ---
         for e in emitters:
             e.visit_counts = Counter()
-            # 循环采样，直到拿到一个还没被占用的点
-            while True:
-                cand = sample_unvisited(self.env_size, e.visit_counts)
-                if cand not in taken:
-                    break
-            e.personal_goal = cand
-            e.visit_counts[cand] = 0
-            taken.add(cand)
-
+            e.personal_goal = None
             e.intrinsic_cooldown = 20  # 冷却 20 步
             e._last_intrinsic_step = -1e9  # 初始化为极早之前
 
@@ -179,12 +161,11 @@ class CogGraph:
         self.target_vector = self.task.encode_goal(self.env_size).to(self.device)
         self.target_vector = torch.zeros((2, self.env_size * self.env_size), device=self.device)  # 初始化为空目标
         self.max_total_energy = 500  # 初始最大总能量
-        self.removed_hazards_by_reward = 0
         self.connection_usage = {}  # {(from_id, to_id): last_used_step}
         self.current_step = 0
         self.units = []
-        self.removed_resources_count = 0
-        self.removed_hazards_count = 0
+        self.positive_feedback_count = 0
+        self.negative_feedback_count = 0
         self.active_units = set()
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
@@ -1760,17 +1741,14 @@ class CogGraph:
         env_dim = self.env_size * self.env_size * N_STATE_CHANNELS
         batch = input_tensor
         env_state = batch[:, :env_dim]
-        res_map   = self.target_vector[0].unsqueeze(0)
-        hzd_map   = self.target_vector[1].unsqueeze(0)
-        full_state = torch.cat([env_state, torch.cat([res_map, hzd_map], dim=1)], dim=1)
+        goal_flat = self.target_vector.view(1, -1)
+        full_state = torch.cat([env_state, goal_flat], dim=1)
 
         # —— ⚙️ 静息模式下也要给 emitter 初始化 goal_vec —— #
         for u in self.units:
             if u.get_role() == "emitter":
-                ext = self.target_vector.clone()            # [2, env²]
-                int_zero = torch.zeros(1, self.env_size*self.env_size, device=self.device)
-                u.goal_vec = torch.cat([ext, int_zero], dim=0)
-                u.current_hazard_xy = getattr(self, "current_hazard_xy", None)
+                goal_dim = self.env_size * self.env_size
+                u.goal_vec = torch.zeros((N_GOAL_CHANNELS, goal_dim), device=self.device)
 
         # upstream logic 重用 snapshot/prev_energies（如果需要 record_memory）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
@@ -1812,9 +1790,8 @@ class CogGraph:
     def step(self, input_tensor: torch.Tensor):
         if self.current_step % 1000 == 0:
             # 重置计数
-            self.removed_resources_count = 0
-            self.removed_hazards_count  = 0
-            self.removed_hazards_by_reward = 0
+            self.positive_feedback_count = 0
+            self.negative_feedback_count = 0
         if self.current_step % 200 == 0:
             self.active_units.clear()
 
@@ -1833,13 +1810,10 @@ class CogGraph:
         batch = input_tensor             # (1, env_dim+goal_dim)
         env_dim  = self.env_size * self.env_size * N_STATE_CHANNELS
         env_state = batch[:, :env_dim]                    # (1, env_dim)
-        # ---------- NEW: 把目标 one-hot 变成 2 个平面 ----------
-        res_map = self.target_vector[0].unsqueeze(0)  # (1, env²)  资源
-        hzd_map = self.target_vector[1].unsqueeze(0)  # (1, env²)  陷阱
-        goal_flat = torch.cat([res_map, hzd_map], dim=1)  # (1, 2·env²)
+        goal_flat = self.target_vector.view(1, -1)        # (1, goal_dim)
 
         # 6 通道打包
-        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, 6·env²)
+        full_state = torch.cat([env_state, goal_flat], dim=1)  # (1, total_dim)
         # ─── 新增：长期记忆准备 ───
         # 1) 把 state snapshot 存下来（去掉 batch 维）
         state_snapshot = full_state.clone().squeeze(0).detach().to(self.device)
@@ -1957,15 +1931,11 @@ class CogGraph:
 
         # —— 新增：周期性清理统计 ——
         if self.current_step % 50 == 0:
-            res_cleared = self.removed_resources_count
-            haz_by_reward = self.removed_hazards_by_reward
-            haz_cleared = self.removed_hazards_count
-            res_left = sum(self.env.resources.values())
-            haz_left = sum(self.env.hazards.values())
+            total_points = sum(self.env.resources.values()) + sum(self.env.hazards.values())
             logger.warning(
-                f"[清理统计] 已清理资源 {res_cleared} 个，"
-                f"已清理危险 {haz_cleared} 个，因资源奖励移除危险 {haz_by_reward} 个；"
-                f"剩余资源 {res_left} 个，剩余危险 {haz_left} 个"
+                f"[反馈统计] 正向反馈 {self.positive_feedback_count} 次，"
+                f"负向反馈 {self.negative_feedback_count} 次；"
+                f"当前未探索事件点共 {total_points} 个"
             )
 
 
@@ -2009,24 +1979,8 @@ class CogGraph:
             logger.info(f"[Env Resize] {old_size}→{self.env_size}, synced CogGraph dims")
 
     def _update_target_vector(self):
-        agent_pos = tuple(self.env.agent_pos)
-        nearest_res = self.env.get_nearest_resource_to(agent_pos)
-        nearest_hzd = self.env.get_nearest_danger_to(agent_pos)
-
-        target_xy = nearest_res
-        self.current_hazard_xy = nearest_hzd
-
         target_vec = self._target_buf
         target_vec.zero_()
-
-        if target_xy is not None:
-            idx = target_xy[1] * self.env_size + target_xy[0]
-            target_vec[0, idx] = 1.0
-
-        if nearest_hzd is not None:
-            hidx = nearest_hzd[1] * self.env_size + nearest_hzd[0]
-            target_vec[1, hidx] = 1.0
-
         self.target_vector = target_vec
 
 
@@ -2035,49 +1989,9 @@ class CogGraph:
             self.expand_unit_dim(unit, expected_input)
 
         if unit.get_role() == "emitter":
-            # === 判断使用最近资源 / 陷阱 / 好奇点 ===
-            use_curiosity = getattr(unit, "is_permanent_explorer", False) and self.current_step >= 2000
-
-            if not use_curiosity:
-                pos = unit.get_position()
-                nearest_res = self.env.get_nearest_resource_to(pos)
-                nearest_hzd = self.env.get_nearest_danger_to(pos)
-
-                if nearest_res is not None:
-                    unit.personal_goal = nearest_res
-                    unit.goal_type = "resource"
-                elif nearest_hzd is not None:
-                    unit.personal_goal = nearest_hzd
-                    unit.goal_type = "hazard"
-                else:
-                    use_curiosity = True
-
-            if use_curiosity:
-                unit.goal_type = "curiosity"
-                taken = {
-                    e.personal_goal for e in self.units
-                    if e is not unit and e.get_role() == "emitter" and e.personal_goal is not None
-                }
-                unit.visit_counts = getattr(unit, "visit_counts", Counter())
-                unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts, exclude=taken)
-                unit.visit_counts.setdefault(unit.personal_goal, 0)
-
-            # === 构造目标向量 ===
-            res_map = torch.zeros(1, self.env_size * self.env_size, device=self.device)
-            hz_map = torch.zeros_like(res_map)
-            cu_map = torch.zeros_like(res_map)
-
-            if unit.personal_goal is not None:
-                idx = unit.personal_goal[1] * self.env_size + unit.personal_goal[0]
-                if unit.goal_type == "resource":
-                    res_map[0, idx] = 1.0
-                elif unit.goal_type == "hazard":
-                    hz_map[0, idx] = 1.0
-                elif unit.goal_type == "curiosity":
-                    cu_map[0, idx] = 1.0
-
-            unit.goal_vec = torch.cat([res_map, hz_map, cu_map], dim=0)
-            unit.current_hazard_xy = getattr(self, "current_hazard_xy", None)
+            goal_dim = self.env_size * self.env_size
+            if getattr(unit, "goal_vec", None) is None or unit.goal_vec.shape != (N_GOAL_CHANNELS, goal_dim):
+                unit.goal_vec = torch.zeros((N_GOAL_CHANNELS, goal_dim), device=self.device)
 
         unit.global_emitter_count = sum(1 for u in self.units if u.get_role() == "emitter")
         incoming = self.reverse_connections.get(unit.id, ())
@@ -2113,65 +2027,23 @@ class CogGraph:
     def reward_emitter_grid_environment(self):
         decay_threshold = 40  # 超过 30 步未奖励就开始衰减
         decay_amount = 0.04  # 每步扣能量
-        """基于 emitter 输出，在网格环境中执行资源 / 陷阱 奖励与惩罚逻辑。"""
+        """基于 emitter 输出，在网格环境中执行奖励与惩罚逻辑。"""
         outputs = self.collect_emitter_outputs()
         if outputs is None:
             return
 
-        action_indices = [torch.argmax(out).item() for out in outputs]
         emitters = [u for u in self.units if u.get_role() == "emitter"]
+        if not emitters:
+            return
 
-        for idx, unit in enumerate(emitters):
-            out = outputs[idx]
-            pred = torch.argmax(self._align_to_goal_dim(out)).item()
-            px, py = pred % self.env_size, pred // self.env_size
-            if (px, py) == unit.personal_goal:
-                unit.energy += unit.intrinsic_reward
-                unit.meta.record(action="intrinsic", reward=+unit.intrinsic_reward)
-                logger.info("你达到了你好奇的地方，心中充满了决心")
-                unit.visit_counts.setdefault((px, py), 0)
-                unit.visit_counts[(px, py)] += 1
-                if not getattr(unit, "is_permanent_explorer", False):
-                    unit._last_intrinsic_step = self.current_step
-                unit.personal_goal = None
-                if getattr(unit, "goal_vec", None) is not None \
-                        and unit.goal_vec.dim() == 2 \
-                        and unit.goal_vec.size(0) >= 3:
-                    unit.goal_vec[2].zero_()
+        aligned_outputs = [self._align_to_goal_dim(out) for out in outputs]
 
-        for i, unit in enumerate(emitters):
-            out_vec = outputs[i]
-            pred = self._align_to_goal_dim(out_vec)
-            pred = torch.softmax(pred, dim=0)
+        env_signal = self.env.agent_energy_gain - self.env.agent_energy_penalty
+        agent_idx = self.env.agent_pos[1] * self.env_size + self.env.agent_pos[0]
 
-            if unit.goal_vec.dim() == 2 and unit.goal_vec.size(0) >= 2:
-                # 用 personal_goal 而不是全局最近资源
-                if unit.personal_goal is not None:
-                    idx = unit.personal_goal[1] * self.env_size + unit.personal_goal[0]
-                    res_vec = torch.zeros_like(unit.goal_vec[0])
-                    res_vec[idx] = 1.0
-                else:
-                    res_vec = unit.goal_vec[0]
-
-                hz_vec = unit.goal_vec[1]
-            else:
-                res_vec = unit.goal_vec.view(-1) if unit.goal_vec.dim() == 1 else unit.goal_vec[0]
-                hz_vec = torch.zeros_like(res_vec)
-
-            goal_vec = res_vec
-            res_dist = float((pred - res_vec).pow(2).mean().sqrt())
-            is_res_hit = res_dist < HIT_THRESH
-            is_res_near = HIT_THRESH <= res_dist <= 1.5
-            cur_idx = torch.argmax(res_vec).item()
-
-            hazard = getattr(unit, "current_hazard_xy", None)
-            if hazard is not None:
-                hx, hy = hazard
-                hazard_idx = hy * self.env_size + hx
-                pred_idx = torch.argmax(pred).item()
-                is_hz_hit = (pred_idx == hazard_idx)
-            else:
-                is_hz_hit = False
+        for unit, vec in zip(emitters, aligned_outputs):
+            probs = torch.softmax(vec, dim=0)
+            agent_prob = probs[agent_idx].item()
 
             upstream_processors = [
                 self.unit_map[pid]
@@ -2179,165 +2051,49 @@ class CogGraph:
                 if pid in self.unit_map and self.unit_map[pid].get_role() == "processor"
             ]
 
-            # === 靠近陷阱后又撤退，触发好奇点切换 ===
-            if getattr(unit, "goal_type", "") == "hazard" and hazard is not None:
-                px, py = torch.argmax(pred).item() % self.env_size, torch.argmax(pred).item() // self.env_size
-                hz_dist = math.hypot(px - hx, py - hy)
+            feedback = env_signal * agent_prob
+            if feedback != 0.0:
+                unit.energy += feedback
+                unit.meta.record(action=agent_idx, reward=feedback)
 
-                prev_dist = getattr(unit, "_last_hazard_dist", float("inf"))
-                unit._last_hazard_dist = hz_dist  # 更新距离记录
-
-                if prev_dist <= 3.0 and hz_dist > 4.0:
-                    unit.goal_type = "curiosity"
-                    unit.personal_goal = sample_unvisited(self.env_size, unit.visit_counts)
-                    unit.visit_counts[unit.personal_goal] = 0
-                    logger.info(f"[目标切换] emitter {unit.id} 接近陷阱后撤退，发现不对劲，有歹徒要害我！ → 切换为好奇点 {unit.personal_goal}")
-
-            if is_hz_hit and (hx, hy) in self.env.hazards:
-                unit.energy -= 0.50
-                unit.meta.record(action=pred_idx, reward=-0.5)
-                for p in upstream_processors:
-                    p.energy -= 0.4
-                    p.meta.record(action=pred_idx, reward=-0.125)
-                unit.is_hazard_confirmed = True
-                unit.last_action_rewarded = False
-                if self.env.hazards[(hx, hy)] > 0:
-                    self.env.hazards[(hx, hy)] -= 1
-                    if self.env.hazards[(hx, hy)] == 0:
-                        del self.env.hazards[(hx, hy)]
-                self.removed_hazards_count += 1
-                unit.goal_vec[1, hazard_idx] = 0.0
-                # —— 吃完这个资源之后，重新选最近的资源和惩罚点 —— #
-                if getattr(unit, "is_permanent_explorer", False):
-                    continue  # 永久探索者不应被重设为资源目标
-
-                next_res = self.env.get_nearest_resource_to(unit.get_position())
-                if next_res is not None:
-                    ridx = next_res[1] * self.env_size + next_res[0]
-                    unit.goal_vec[0].zero_()
-                    unit.goal_vec[0, ridx] = 1.0
-                next_hz = self.env.get_nearest_danger_to(unit.get_position())
-                if next_hz is not None:
-                    hidx = next_hz[1] * self.env_size + next_hz[0]
-                    unit.goal_vec[1].zero_()
-                    unit.goal_vec[1, hidx] = 1.0
-
-                continue
-
-            hz_dist = float("inf")
-            if hazard is not None:
-                px, py = torch.argmax(pred).item() % self.env_size, torch.argmax(pred).item() // self.env_size
-                hz_dist = math.hypot(px - hx, py - hy)
-
-            if unit.is_hazard_confirmed and hz_dist > 3.0:
-                unit.energy += 0.04
-                unit.meta.record(action=pred_idx, reward=+0.04)
-                unit.is_hazard_confirmed = False
-                unit.last_reward_step = self.current_step
-                unit.last_action_rewarded = True
-
-            x_res, y_res = cur_idx % self.env_size, cur_idx // self.env_size
-            if (x_res, y_res) not in self.env.resources:
-                continue
-
-            if (unit.last_rewarded_target_idx != cur_idx) and (is_res_hit or is_res_near):
-                base_r = max(0.02 * (1.0 - res_dist), 0.0)
-                unit.energy += base_r
-                unit.meta.record(action=cur_idx, reward=+base_r)
-                for p in upstream_processors:
-                    p.energy += base_r * 0.25
-                    p.meta.record(action=cur_idx, reward=+(base_r * 0.25))
-
-                if is_res_hit:
-                    unit.energy += 1.2
-                    unit.meta.record(action=cur_idx, reward=+1.2)
-                    if self.env.resources[(x_res, y_res)] > 0:
-                        self.env.resources[(x_res, y_res)] -= 1
-                        if self.env.resources[(x_res, y_res)] == 0:
-                            del self.env.resources[(x_res, y_res)]
-                    self.removed_resources_count += 1
-                    # 2) 因资源奖励，额外删一个最远的坑
-                    if self.env.hazards:
-                        # 最远距离可以根据当前 (x_res,y_res) 算，也可以随意取
-                        far = max(
-                            self.env.hazards.keys(),
-                            key=lambda p: (p[0] - x_res) ** 2 + (p[1] - y_res) ** 2
-                        )
-                        del self.env.hazards[far]
-                        self.removed_hazards_by_reward += 1
-                    if getattr(unit, "is_permanent_explorer", False):
-                        continue  # 永久探索者不应被重设为资源目标
-
-                    # —— 吃完资源后，重新选最近的资源&惩罚点 —— #
-                    next_res = self.env.get_nearest_resource_to(unit.get_position())
-                    if next_res is not None:
-                        ridx = next_res[1] * self.env_size + next_res[0]
-                        unit.goal_vec[0].zero_()
-                        unit.goal_vec[0, ridx] = 1.0
-                    next_hz = self.env.get_nearest_danger_to(unit.get_position())
-                    if next_hz is not None:
-                        hidx = next_hz[1] * self.env_size + next_hz[0]
-                        unit.goal_vec[1].zero_()
-                        unit.goal_vec[1, hidx] = 1.0
-
-                    unit.last_rewarded_target_idx = None
-                    unit.linger_steps = 0
-                    unit.last_reward_amount = 0.0
+                if upstream_processors:
+                    per_share = (feedback * 0.25) / len(upstream_processors)
                     for p in upstream_processors:
-                        p.energy += 0.9
-                        p.meta.record(action="cur_idx", reward=+0.9)
+                        p.energy += per_share
+                        p.meta.record(action=agent_idx, reward=per_share)
 
-                unit.last_rewarded_target_idx = cur_idx
-                unit.last_reward_amount = base_r
-                unit.linger_steps = 0
                 unit.last_reward_step = self.current_step
-                unit.last_action_rewarded = True
-                continue
-
-            if (unit.last_rewarded_target_idx == cur_idx) and res_dist <= 2.0 and self.current_step >= 1500:
-                unit.linger_steps = min(unit.linger_steps + 1, 20)
-                if unit.linger_steps > 3:
-                    unit.energy -= 0.01
-                    unit.meta.record(action=cur_idx, reward=-0.01)
-                continue
-
-            if (unit.last_rewarded_target_idx == cur_idx) and res_dist > 4.0:
-                unit.energy -= unit.last_reward_amount
-                unit.meta.record(action=cur_idx, reward=-unit.last_reward_amount)
-                unit.last_rewarded_target_idx = None
-                unit.linger_steps = 0
-                unit.last_reward_amount = 0.0
-
-            if len(action_indices) >= 3:
-                most_common = max(set(action_indices), key=action_indices.count)
-                if action_indices.count(most_common) > len(action_indices) * 0.9:
-                    unit.energy -= 0.05
-                    unit.meta.record(action="diversity_penalty", reward=-0.05)
-                elif len(set(action_indices)) > len(action_indices) * 0.6:
-                    unit.energy += 0.05
-                    unit.meta.record(action="diversity_penalty", reward=+0.05)
-
+                unit.last_action_rewarded = feedback > 0
+                if feedback > 0:
+                    self.positive_feedback_count += 1
+                else:
+                    self.negative_feedback_count += 1
+            else:
+                unit.last_action_rewarded = False
             if self.current_step > 1500:
-                inactive_steps = self.current_step - unit.last_reward_step
+                last_step = getattr(unit, "last_reward_step", -1e9)
+                inactive_steps = self.current_step - last_step
                 if inactive_steps > decay_threshold:
                     unit.energy -= decay_amount * 0.1
                     unit.meta.record(action="round", reward=-(decay_amount * 0.1))
 
-                if (hasattr(unit, "output_positions")
-                        and len(unit.output_positions) >= 10
-                        and self.current_step % 10 == 0):
-                    start = unit.output_positions[0]
-                    end = unit.output_positions[-1]
-                    manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
-                    if 3 <= manhattan < 5:
-                        unit.energy -= 0.08
-                        unit.meta.record(action="move less", reward=-0.08)
-                    elif 6 <= manhattan < 8:
-                        unit.energy -= 0.10
-                        unit.meta.record(action="move less", reward=-0.1)
-                    elif 9 <= manhattan <= 10:
-                        unit.energy -= 0.12
-                        unit.meta.record(action="move less", reward=-0.12)
+            if (
+                hasattr(unit, "output_positions")
+                and len(unit.output_positions) >= 10
+                and self.current_step % 10 == 0
+            ):
+                start = unit.output_positions[0]
+                end = unit.output_positions[-1]
+                manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
+                if 3 <= manhattan < 5:
+                    unit.energy -= 0.08
+                    unit.meta.record(action="move less", reward=-0.08)
+                elif 6 <= manhattan < 8:
+                    unit.energy -= 0.10
+                    unit.meta.record(action="move less", reward=-0.1)
+                elif 9 <= manhattan <= 10:
+                    unit.energy -= 0.12
+                    unit.meta.record(action="move less", reward=-0.12)
 
 
     def _expand_environment_curriculum(self):
@@ -2382,12 +2138,6 @@ class CogGraph:
                 pool.sort(key=lambda m: m["score"])
                 half = len(pool) // 2
                 del pool[:half]
-
-    def is_current_target_hazard(self) -> bool:
-        """判断当前目标是否是陷阱（指向陷阱的 one-hot）"""
-        index = torch.argmax(self.target_vector[1]).item()
-        x, y = index % self.env_size, index // self.env_size
-        return (x, y) in self.env.hazards
 
     def _align_to_goal_dim(self, tensor: torch.Tensor) -> torch.Tensor:
         """
