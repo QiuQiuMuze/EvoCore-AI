@@ -1,4 +1,3 @@
-import numpy as np
 import random
 import logging
 import torch
@@ -41,10 +40,11 @@ logger.addHandler(console_handler)
 class GridEnvironment:
     action_space_n = 4  # 上/下/左/右
 
-    def __init__(self, size=5, max_steps: int | None = None):
+    def __init__(self, size=5, max_steps: int | None = None, sensor_range: int = 2):
         self.size = size
         self.max_steps = max_steps
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sensor_range = max(0, sensor_range)
 
         # 经验点和危险点
         self.resources = Counter()
@@ -53,11 +53,10 @@ class GridEnvironment:
         # 计数和位置
         self.step_count = 0
         self.explored_cells_count = 0
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
 
         # 初始化探索标记和状态缓冲
-        self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
-        self._state_buf = torch.zeros((4, self.size, self.size), dtype=torch.float32, device=self.device)
+        self._init_buffers()
 
         # 初始化环境
         exclude = {tuple(self.agent_pos)}
@@ -66,6 +65,15 @@ class GridEnvironment:
 
         self.reward_hit_count = 0
         self.danger_hit_count = 0
+
+    def _init_buffers(self):
+        shape = (self.size, self.size)
+        self.visited_map = torch.zeros(shape, dtype=torch.bool, device=self.device)
+        self.known_map = torch.zeros(shape, dtype=torch.bool, device=self.device)
+        self.detected_resources_map = torch.zeros(shape, dtype=torch.bool, device=self.device)
+        self.detected_hazards_map = torch.zeros(shape, dtype=torch.bool, device=self.device)
+        self._state_buf = torch.zeros((5, self.size, self.size), dtype=torch.float32, device=self.device)
+        self.explored_cells_count = 0
 
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
@@ -88,22 +96,98 @@ class GridEnvironment:
 
         # 清空探索标记
         self.visited_map.fill_(False)
+        self.known_map.fill_(False)
+        self.detected_resources_map.fill_(False)
+        self.detected_hazards_map.fill_(False)
         self.explored_cells_count = 0
+        self._sense_environment()
+        self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
+        self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
+
+    def _in_bounds(self, x: int, y: int) -> bool:
+        return 0 <= x < self.size and 0 <= y < self.size
+
+    def _sense_environment(self):
+        """更新感知范围内的资源 / 危险信息到探测图。"""
+        ax, ay = self.agent_pos
+        rng = self.sensor_range
+        for dx in range(-rng, rng + 1):
+            for dy in range(-rng, rng + 1):
+                nx, ny = ax + dx, ay + dy
+                if not self._in_bounds(nx, ny):
+                    continue
+                self.known_map[ny, nx] = True
+                self.detected_resources_map[ny, nx] = bool(self.resources[(nx, ny)] > 0)
+                self.detected_hazards_map[ny, nx] = bool(self.hazards[(nx, ny)] > 0)
+
+    def update_known_cell(self, pos: tuple[int, int]):
+        """当资源 / 危险状态变化时，刷新已知网格的感知记录。"""
+        x, y = pos
+        if not self._in_bounds(x, y):
+            return
+        if not self.known_map[y, x]:
+            return
+        self.detected_resources_map[y, x] = bool(self.resources[(x, y)] > 0)
+        self.detected_hazards_map[y, x] = bool(self.hazards[(x, y)] > 0)
+
+    def get_known_resource_positions(self) -> list[tuple[int, int]]:
+        mask = (self.detected_resources_map & self.known_map).nonzero(as_tuple=False)
+        if mask.numel() == 0:
+            return []
+        coords = mask.cpu().tolist()
+        return [(int(x), int(y)) for y, x in coords]
+
+    def get_known_hazard_positions(self) -> list[tuple[int, int]]:
+        mask = (self.detected_hazards_map & self.known_map).nonzero(as_tuple=False)
+        if mask.numel() == 0:
+            return []
+        coords = mask.cpu().tolist()
+        return [(int(x), int(y)) for y, x in coords]
+
+    def get_nearest_known_resource(self, pos: tuple[int, int]) -> tuple[int, int] | None:
+        known = self.get_known_resource_positions()
+        if not known:
+            return None
+        return min(known, key=lambda r: abs(r[0] - pos[0]) + abs(r[1] - pos[1]))
+
+    def get_nearest_known_danger(self, pos: tuple[int, int]) -> tuple[int, int] | None:
+        known = self.get_known_hazard_positions()
+        if not known:
+            return None
+        return min(known, key=lambda r: abs(r[0] - pos[0]) + abs(r[1] - pos[1]))
+
+    def distance_to_nearest_known_resource(self, pos):
+        nearest = self.get_nearest_known_resource(pos)
+        if nearest is None:
+            return float("inf")
+        return abs(pos[0] - nearest[0]) + abs(pos[1] - nearest[1])
+
+    def distance_to_nearest_known_danger(self, pos):
+        nearest = self.get_nearest_known_danger(pos)
+        if nearest is None:
+            return float("inf")
+        return abs(pos[0] - nearest[0]) + abs(pos[1] - nearest[1])
 
     def reset(self):
         # 随机初始化 agent
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
         self.step_count = 0
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
 
-        # 最近距离初始化
-        self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
-        self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
-
         # 清空标记
         self.visited_map.fill_(False)
+        self.known_map.fill_(False)
+        self.detected_resources_map.fill_(False)
+        self.detected_hazards_map.fill_(False)
         self.explored_cells_count = 0
+
+        # 执行一次感知，初始化局部知识
+        self._sense_environment()
+
+        # 最近距离初始化（基于已感知的知识）
+        self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
+        self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
 
         # 清空命中统计
         self.reward_hit_count = 0
@@ -138,22 +222,25 @@ class GridEnvironment:
         else:
             self.agent_energy_penalty = 0.0
 
+        # 感知更新（移动后立即刷新可见区域）
+        self._sense_environment()
+
         # 更新步数
         self.step_count += 1
         step_for_refresh = cog_step if cog_step is not None else self.step_count
         if step_for_refresh % 1000 == 0 and step_for_refresh >= 1000:
             self.refresh_environment(step_for_refresh, self.explored_cells_count)
-            self.prev_dist_resource = self.distance_to_nearest_resource(tuple(self.agent_pos))
-            self.prev_danger_dist = self.distance_to_nearest_danger(tuple(self.agent_pos))
+            self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
+            self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
 
         # 计算 reward shaping
         base = self.agent_energy_gain - self.agent_energy_penalty
-        dist_res = self.distance_to_nearest_resource(pos)
+        dist_res = self.distance_to_nearest_known_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
         resource_shaping = 0.001 if delta_res > 0 else (-0.001 if delta_res < 0 else 0.0)
         self.prev_dist_resource = dist_res
 
-        danger_dist = self.distance_to_nearest_danger(pos)
+        danger_dist = self.distance_to_nearest_known_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
         danger_shaping = 0.001 if delta_danger > 0 else (-0.001 if delta_danger < 0 else 0.0)
         self.prev_danger_dist = danger_dist
@@ -188,22 +275,17 @@ class GridEnvironment:
 
         x, y = self.agent_pos
         buf[0, y, x] = 1.0
-        for (rx, ry), cnt in self.resources.items():
-            # ← 边界检查，确保 0 <= rx,ry < size
-            if cnt > 0 and 0 <= rx < self.size and 0 <= ry < self.size:
-                buf[1, ry, rx] = 1.0
-
-        for (hx, hy), cnt in self.hazards.items():
-            if cnt > 0 and 0 <= hx < self.size and 0 <= hy < self.size:
-                buf[2, hy, hx] = 1.0
-        buf[3].copy_(self.visited_map.to(torch.float32))
+        buf[1].copy_(self.detected_resources_map.to(buf.dtype))
+        buf[2].copy_(self.detected_hazards_map.to(buf.dtype))
+        buf[3].copy_(self.known_map.to(buf.dtype))
+        buf[4].copy_(self.visited_map.to(buf.dtype))
 
         return buf.view(-1)
 
     def render(self):
-        grid = np.full((self.size, self.size), '.', dtype=str)
+        grid = [['.' for _ in range(self.size)] for _ in range(self.size)]
         x, y = self.agent_pos
-        grid[y, x] = 'A'
+        grid[y][x] = 'A'
         logger.debug('\n' + '\n'.join(' '.join(row) for row in grid) + '\n')
 
     def distance_to_nearest_danger(self, pos):
@@ -223,13 +305,7 @@ class GridEnvironment:
 
     def resize(self, new_size: int):
         self.size = new_size
-        # 2. 重新分配 visited_map 和 状态缓冲，保证和新 size 匹配
-        self.visited_map = torch.zeros((new_size, new_size),
-                                       dtype=torch.bool,
-                                       device=self.device)
-        self._state_buf = torch.zeros((4, new_size, new_size),
-                                      dtype=torch.float32,
-                                      device=self.device)
+        self._init_buffers()
 
         x, y = self.agent_pos
         x = min(x, new_size - 1)
@@ -239,9 +315,8 @@ class GridEnvironment:
 
     def reset_with_size(self, new_size: int):
         self.size = new_size
-        self.agent_pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
-        self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
-        self._state_buf = torch.zeros((4, self.size, self.size), dtype=torch.float32, device=self.device)
+        self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
+        self._init_buffers()
         self.resources = Counter()
         self.hazards = Counter()
         self.step_count = 0
@@ -253,16 +328,22 @@ class GridEnvironment:
     def inject_reward_map(self, reward_points: list[tuple[int,int]], punishment_points: list[tuple[int,int]]):
         self.resources = Counter(reward_points)
         self.hazards = Counter(punishment_points)
-        self.visited_map = torch.zeros((self.size, self.size), dtype=torch.bool, device=self.device)
+        self.visited_map.fill_(False)
+        self.known_map.fill_(False)
+        self.detected_resources_map.fill_(False)
+        self.detected_hazards_map.fill_(False)
         self.explored_cells_count = 0
         self.reward_hit_count = 0
         self.danger_hit_count = 0
+        self._sense_environment()
+        self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
+        self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
 
 if __name__ == "__main__":
     env = GridEnvironment(size=10)
     env.render()
     for _ in range(5):
-        action = np.random.choice(4)
+        action = random.randrange(4)
         env.step(action)
         env.render()
         print("State vector:", env.get_state())

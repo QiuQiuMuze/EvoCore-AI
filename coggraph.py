@@ -5,7 +5,6 @@ import torch
 import random
 from env import GridEnvironment
 import torch.nn.functional as F
-import numpy as np
 import gc, torch
 from collections import deque, Counter
 from env import logger
@@ -28,12 +27,27 @@ from self_model import build_self_model
 
 HIT_THRESH = 0.15          # 越大越宽松
 MAX_CONNECTIONS = 4  # 每个单元最多连接 4 个下游
-N_STATE_CHANNELS = 4
+N_STATE_CHANNELS = 5
 N_GOAL_CHANNELS = 3
 INPUT_CHANNELS = N_STATE_CHANNELS + N_GOAL_CHANNELS
 
 
 
+
+
+def _percentile(values, q):
+    """轻量级百分位计算，避免依赖 numpy。"""
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * (q / 100.0)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return float(sorted_vals[int(k)])
+    lower = sorted_vals[f]
+    upper = sorted_vals[c]
+    return float(lower * (c - k) + upper * (k - f))
 
 
 class TaskInjector:
@@ -1366,7 +1380,7 @@ class CogGraph:
         if not all_scores:
             return  # 若没有评分数据，则跳过
 
-        score_threshold = np.percentile(all_scores, 90)  # 取前 10% 的分数为门槛
+        score_threshold = _percentile(all_scores, 90)  # 取前 10% 的分数为门槛
         candidates = []
 
         for u in self.units:
@@ -2010,8 +2024,8 @@ class CogGraph:
 
     def _update_target_vector(self):
         agent_pos = tuple(self.env.agent_pos)
-        nearest_res = self.env.get_nearest_resource_to(agent_pos)
-        nearest_hzd = self.env.get_nearest_danger_to(agent_pos)
+        nearest_res = self.env.get_nearest_known_resource(agent_pos)
+        nearest_hzd = self.env.get_nearest_known_danger(agent_pos)
 
         target_xy = nearest_res
         self.current_hazard_xy = nearest_hzd
@@ -2040,8 +2054,8 @@ class CogGraph:
 
             if not use_curiosity:
                 pos = unit.get_position()
-                nearest_res = self.env.get_nearest_resource_to(pos)
-                nearest_hzd = self.env.get_nearest_danger_to(pos)
+                nearest_res = self.env.get_nearest_known_resource(pos)
+                nearest_hzd = self.env.get_nearest_known_danger(pos)
 
                 if nearest_res is not None:
                     unit.personal_goal = nearest_res
@@ -2205,18 +2219,19 @@ class CogGraph:
                     self.env.hazards[(hx, hy)] -= 1
                     if self.env.hazards[(hx, hy)] == 0:
                         del self.env.hazards[(hx, hy)]
+                self.env.update_known_cell((hx, hy))
                 self.removed_hazards_count += 1
                 unit.goal_vec[1, hazard_idx] = 0.0
                 # —— 吃完这个资源之后，重新选最近的资源和惩罚点 —— #
                 if getattr(unit, "is_permanent_explorer", False):
                     continue  # 永久探索者不应被重设为资源目标
 
-                next_res = self.env.get_nearest_resource_to(unit.get_position())
+                next_res = self.env.get_nearest_known_resource(unit.get_position())
                 if next_res is not None:
                     ridx = next_res[1] * self.env_size + next_res[0]
                     unit.goal_vec[0].zero_()
                     unit.goal_vec[0, ridx] = 1.0
-                next_hz = self.env.get_nearest_danger_to(unit.get_position())
+                next_hz = self.env.get_nearest_known_danger(unit.get_position())
                 if next_hz is not None:
                     hidx = next_hz[1] * self.env_size + next_hz[0]
                     unit.goal_vec[1].zero_()
@@ -2255,6 +2270,7 @@ class CogGraph:
                         self.env.resources[(x_res, y_res)] -= 1
                         if self.env.resources[(x_res, y_res)] == 0:
                             del self.env.resources[(x_res, y_res)]
+                    self.env.update_known_cell((x_res, y_res))
                     self.removed_resources_count += 1
                     # 2) 因资源奖励，额外删一个最远的坑
                     if self.env.hazards:
@@ -2264,17 +2280,18 @@ class CogGraph:
                             key=lambda p: (p[0] - x_res) ** 2 + (p[1] - y_res) ** 2
                         )
                         del self.env.hazards[far]
+                        self.env.update_known_cell(far)
                         self.removed_hazards_by_reward += 1
                     if getattr(unit, "is_permanent_explorer", False):
                         continue  # 永久探索者不应被重设为资源目标
 
                     # —— 吃完资源后，重新选最近的资源&惩罚点 —— #
-                    next_res = self.env.get_nearest_resource_to(unit.get_position())
+                    next_res = self.env.get_nearest_known_resource(unit.get_position())
                     if next_res is not None:
                         ridx = next_res[1] * self.env_size + next_res[0]
                         unit.goal_vec[0].zero_()
                         unit.goal_vec[0, ridx] = 1.0
-                    next_hz = self.env.get_nearest_danger_to(unit.get_position())
+                    next_hz = self.env.get_nearest_known_danger(unit.get_position())
                     if next_hz is not None:
                         hidx = next_hz[1] * self.env_size + next_hz[0]
                         unit.goal_vec[1].zero_()

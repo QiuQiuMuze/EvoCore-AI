@@ -31,19 +31,19 @@ EvoCore 并非传统意义的 AI 模型，而是一个具备 **生命周期、�
 
 ##  新版本重要变更一览
 
-1. **目标向量二通道化**
+1. **目标向量多通道融合**
 
    * `TaskInjector.encode_goal()` 现返回 **`(2, env²)`** 的 one‑hot：<br>  `vec[0]` = 资源层，`vec[1]` = 陷阱层。
-   * `INPUT_CHANNELS = 4 (state) + 2 (goal) = 6`，全链路已对齐。
+   * CogGraph 中会额外拼接好奇心目标，共形成 **5 (状态) + 3 (目标) = 8** 个输入通道。
    * `coggraph.step()` 顶部旧的 `goal_tensor = ...` 已删除，避免混淆。
 2. **共享 Transformer 头数自适应**
 
    * 通过 `math.gcd(embed_dim, RF.shared_tx_heads)` 计算可整除的 **最大公因数** 作为实际多头数。
    * 若请求的头数无法整除，则自动降到满足整除的最接近值，并给出 warning。
-   * 默认在 6 通道 \* env² 的 embed\_dim 下，往往得到 **2 头** —— 不是硬编码，而是 GCD 恰好为 2。
+   * 默认在 8 通道 \* env² 的 embed\_dim 下，往往得到 **2 头** —— 不是硬编码，而是 GCD 恰好为 2。
 3. **环境扩容内存占用说明**
 
-   * 每 1000 步触发一次 curriculum：`env_size += 5`，同时 **input\_size = env² × 6** 线性暴涨。
+   * 每 1000 步触发一次 curriculum：`env_size += 5`，同时 **input\_size = env² × 8** 线性暴涨。
    * 为保持“细胞不降维”，`upscale_old_units()` 会 **复制旧权重并 zero‑pad 新维度**，导致显存/内存瞬时增加。
    * 可通过调小 `max_total_energy` 或延长扩容间隔来减缓内存高峰。
 
@@ -173,19 +173,19 @@ It is an *organism‑like* agent equipped with **life‑cycle, structural evolut
 
 ##  What’s New
 
-1. **Two‑Channel Goal Map**
+1. **Goal Map with Curiosity Fusion**
 
    * `TaskInjector.encode_goal()` now returns **`(2, env²)` one‑hot**: channel‑0 resource, channel‑1 hazard.
-   * `INPUT_CHANNELS = 4 (state) + 2 (goal) = 6` everywhere.
+   * CogGraph appends a curiosity layer, yielding **5 (state) + 3 (goal) = 8** total channels.
    * Legacy `goal_tensor` var in `coggraph.step()` is gone.
 2. **Head‑count Auto‑Tuning** for shared Transformer
 
    * We pick the **greatest common divisor** between embed\_dim and the requested `RF.shared_tx_heads`.
    * If not divisible, we gracefully downgrade (with a warning).
-   * With 6·env² dims the gcd often equals **2**, hence the observed "2 heads" — it is *data‑driven*, not hard‑coded.
+   * With 8·env² dims the gcd often equals **2**, hence the observed "2 heads" — it is *data‑driven*, not hard‑coded.
 3. **Memory Spikes on Curriculum Expansions**
 
-   * Every 1000 steps the grid grows (+5), thus **input\_size = env² × 6** inflates quadratically.
+   * Every 1000 steps the grid grows (+5), thus **input\_size = env² × 8** inflates quadratically.
    * `upscale_old_units()` keeps all historic params via zero‑padding → sudden RAM/GPU peaks.
    * Mitigate by lowering `max_total_energy` or stretching the expansion interval.
 
