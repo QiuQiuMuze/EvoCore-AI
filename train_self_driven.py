@@ -6,11 +6,7 @@ train_self_driven.py
 启动自驱动强化学习训练：
     GridEnvironment  ←→  CogGraph  ←→  RLAgent (TransformerPolicyNetwork)
 
-❖ 主要假设
-- env.step(action) **原实现不返回** 新状态 / 奖励 / done，所以：
-    • 执行 env.step(action) 后，直接用 env.get_state() 取下一状态；
-    • 奖励 = env.agent_energy_gain - env.agent_energy_penalty（env.step 内已更新）；
-    • 每个 episode 固定 MAX_STEPS 步视为终止。
+- env.step(action) 返回 (next_state, reward, done, info)，在训练循环中直接使用返回值并在 done=True 时提前结束回合。
 - CogGraph 需要你补充 sensor_forward / processor_forward / emitter_forward。
   若暂未实现，则脚本会 fallback：直接把环境状态张量当作 sensor / processor 输出。
 
@@ -97,12 +93,12 @@ def main(cfg):
     reward_history = []
     for ep in range(1, cfg.episodes + 1):
 
-        env.reset()
+        state_np = env.reset()
         # 如 graph 有 reset_state() 请调用；否则新建实例或跳过
         if hasattr(graph, "reset_state"):
             graph.reset_state()
 
-        state = torch.from_numpy(env.get_state()).float().to(cfg.device)
+        state = torch.from_numpy(state_np).to(device)
         ep_reward = 0.0
 
         for t in range(cfg.max_steps):
@@ -118,20 +114,30 @@ def main(cfg):
                 sensor_out = processor_out = state
 
             # --- 构造 transformer 输入 ---
-            state_seq = torch.stack([sensor_out, processor_out], dim=0)  # (seq_len=2, dim)
-            state_seq = state_seq.unsqueeze(0).to(device)                # (1, 2, dim)
+            if isinstance(sensor_out, torch.Tensor):
+                sensor_tensor = sensor_out.to(device)
+            else:
+                sensor_tensor = torch.as_tensor(sensor_out, dtype=torch.float32, device=device)
+
+            if isinstance(processor_out, torch.Tensor):
+                processor_tensor = processor_out.to(device)
+            else:
+                processor_tensor = torch.as_tensor(processor_out, dtype=torch.float32, device=device)
+
+            state_seq = torch.stack([sensor_tensor, processor_tensor], dim=0)  # (seq_len=2, dim)
+            state_seq = state_seq.unsqueeze(0)                                 # (1, 2, dim)
 
             # --- 选动作 & 环境交互 ---
             action = agent.select_action(state_seq)
-            env.step(action)
-
-            # 奖励：环境内部字段决定
-            reward = getattr(env, "agent_energy_gain", 0.0) - getattr(env, "agent_energy_penalty", 0.0)
+            next_state_np, reward, done, _ = env.step(action)
             agent.store_reward(reward)
             ep_reward += reward
 
             # 更新下一状态
-            state = torch.from_numpy(env.get_state()).float().to(cfg.device)
+            state = torch.from_numpy(next_state_np).to(device)
+
+            if done:
+                break
 
         # --- Episode 结束：策略更新 ---
         agent.finish_episode()
@@ -157,7 +163,6 @@ def main(cfg):
 # -------------------------------------------------------------------------- #
 if __name__ == "__main__":
     cfg = get_cfg()
-    main(cfg)
     t0 = time.time()
     main(cfg)
     print(f"Total runtime: {time.time() - t0:.1f} s")
@@ -166,8 +171,8 @@ if __name__ == "__main__":
 关键点说明
 位置	说明
 input_dim 自动推断	通过 graph.sensor_forward() 探测输出维度；若接口未实现，则退化为环境 state 大小。
-Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEPS（可通过 --max-steps 调整）。
-奖励计算	直接使用环境在 step() 内更新的 agent_energy_gain / agent_energy_penalty 字段。
+Episode 终止	使用 env.step 返回的 done 信号提前截断，否则最多执行 --max-steps 步。
+奖励计算	直接采用 env.step 返回的 reward。
 断点续训	--save-every 控制周期性保存，文件包含网络参数 + 优化器状态。
 
 下一步
