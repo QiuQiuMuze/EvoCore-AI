@@ -2339,6 +2339,8 @@ class CogGraph:
             cur_idx = torch.argmax(res_vec).item()
             pred_idx = torch.argmax(pred).item()
 
+            pred_idx = torch.argmax(pred).item()
+
             hazard = getattr(unit, "current_hazard_xy", None)
             if hazard is not None:
                 hx, hy = hazard
