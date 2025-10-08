@@ -225,7 +225,8 @@ class CogGraph:
         }
         self._emitter_input_rms_cap = 1.25
         self._emitter_input_value_cap = 3.5
-        self._emitter_metabolic_scalar = 0.08
+        self._emitter_metabolic_scalar_bounds = (0.11, 0.18)
+        self._role_emergency_floor = {"sensor": 8, "processor": 16, "emitter": 8}
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1654,28 +1655,52 @@ class CogGraph:
         freq = unit.avg_recent_calls
         conn = unit.connection_count
         call_density = freq / (conn + 1)
-        conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
+
+        outgoing = self.connections.get(unit.id, {})
+        conn_strength_sum = 0.0
+        if outgoing:
+            conn_strength_sum = sum(outgoing.values()) / max(len(outgoing), 1)
+
+        affinity = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+        affinity = max(0.5, min(1.5, affinity))
+        trait_factor = math.pow(affinity, -0.6)
 
         if unit.role == "emitter" and raw_var > 0.0:
-            adjusted_var = math.sqrt(raw_var)
+            adjusted_var = 0.6 * math.sqrt(raw_var) + 0.4 * raw_var
         else:
             adjusted_var = raw_var
 
-        dim_scale = 1.0 # if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
-        #     1.0 + 0.5 * ((self.current_step - 3000) / 3000)
+        reward_gap = max(0, self.current_step - getattr(unit, "last_reward_step", self.current_step))
+        reward_factor = 1.0 + min(0.45, reward_gap / 600.0)
 
-        bias_factor = unit.gene.get(f"{unit.role}_bias", 1.0)
+        age_factor = 1.0 + min(0.35, unit.age / 1500.0)
+
+        reserve_factor = 0.75 + 0.35 * math.tanh(unit.energy - 1.0)
+        reserve_factor = max(0.45, min(1.15, reserve_factor))
+
+        base_decay = (
+            adjusted_var * 0.34
+            + call_density * 0.18
+            + conn_strength_sum * 0.12
+        )
+        base_decay = max(base_decay, 0.0)
+
+        decay = base_decay * trait_factor * reward_factor * age_factor * reserve_factor
+
         step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
         unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
+        decay *= step_factor * unit_factor
 
-        decay = (adjusted_var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
-                * dim_scale * bias_factor * step_factor * unit_factor
-        # honor 单元自己的 metabolic_rate
         base_factor = 0.015 if self.current_step < 1000 else 0.030
         metabolic_rate = getattr(unit, "metabolic_rate", 1.0)
         drain = decay * base_factor * metabolic_rate
         if unit.role == "emitter":
-            drain *= self._emitter_metabolic_scalar
+            low, high = self._emitter_metabolic_scalar_bounds
+            span = max(high - low, 1e-6)
+            interp = (1.5 - affinity) / 1.0
+            interp = max(0.0, min(1.0, interp))
+            role_scalar = low + span * interp
+            drain *= role_scalar
 
         unit.energy -= drain
 
@@ -1692,6 +1717,20 @@ class CogGraph:
         )
 
         logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
+
+    def _needs_emergency_repopulation(self, unit: CogUnit) -> bool:
+        floor = self._role_emergency_floor.get(unit.role)
+        if floor is None:
+            return False
+        if unit.role == "sensor":
+            current = self.sensor_count
+        elif unit.role == "processor":
+            current = self.processor_count
+        elif unit.role == "emitter":
+            current = self.emitter_count
+        else:
+            return False
+        return current <= floor
 
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
@@ -1716,10 +1755,16 @@ class CogGraph:
             self.connections[uid][unit.id] *= 1.05
             self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
 
-        if allow_clone and unit.should_split():
-            pending[unit.role].append(unit)
-        elif not allow_clone:
-            logger.debug(f"[系统保护] 总能量过高，禁止 {unit.id} 分裂")
+        wants_split = unit.should_split()
+        if wants_split:
+            emergency_split = self._needs_emergency_repopulation(unit)
+            if allow_clone or emergency_split:
+                if emergency_split and not allow_clone:
+                    logger.info(
+                        f"[紧急补员] {unit.id} 触发 {unit.role} 紧缺增殖，越过能量上限执行复制")
+                pending[unit.role].append(unit)
+            else:
+                logger.debug(f"[系统保护] 总能量过高，暂缓 {unit.id} 分裂")
 
         if unit.should_die():
             logger.debug(f"[死亡] {unit.id} 被移除")
