@@ -209,6 +209,7 @@ class CogGraph:
         self.static_mode = False
         self._orig_metabolic = {}   # 存储进入静吸模式前的速率
         self.static_mode_allowed = False
+        self._static_mode_forbid_step = 0
         # —— 缓存最近一次各角色的原始输出，供拓扑加权聚合使用 ——
         self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
@@ -1853,6 +1854,8 @@ class CogGraph:
 
     # —— 2) 判断是否进入静吸模式 —— #
     def _check_enter_static_mode(self):
+        if self.current_step == self._static_mode_forbid_step:
+            return
         if self.current_step >= 1000 and self.steps_since_last_reward >= 100 and not self.static_mode:
             self._enter_static_mode()
 
@@ -1979,8 +1982,18 @@ class CogGraph:
     def _perform_system_maintenance(self):
         self.supply_energy_from_pool()
 
-        if self.debug and self.current_step % 40 == 0:
+        if self.current_step > 0 and self.current_step % 40 == 0:
             self.rebalance_cell_types()
+
+    def _ensure_minimum_population(self):
+        if self.units:
+            return
+        if self.static_mode:
+            self._exit_static_mode()
+        logger.warning("[紧急增殖] 细胞数量降为 0，触发紧急补种")
+        self._init_seed_units(n_sensor=6, n_processor=12, n_emitter=6, device=self.device)
+        self.steps_since_last_reward = 0
+        self._static_mode_forbid_step = self.current_step
 
 
     def step(self, input_tensor: torch.Tensor):
@@ -1993,6 +2006,11 @@ class CogGraph:
             self.active_units.clear()
 
         self.current_step += 1
+        if self.current_step % 1000 == 0:
+            self.steps_since_last_reward = 0
+            self._static_mode_forbid_step = self.current_step
+            if self.static_mode:
+                self._exit_static_mode()
         self._update_global_counts()
 
         # === Transformer 一网打尽 ===
@@ -2089,6 +2107,8 @@ class CogGraph:
 
         if self.current_step > 0 and self.current_step % 50 == 0:
             self.finalize_deaths()
+
+        self._ensure_minimum_population()
 
         self.auto_connect()
 
