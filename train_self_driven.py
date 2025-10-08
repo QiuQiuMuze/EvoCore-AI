@@ -23,12 +23,14 @@ import argparse
 import os
 import time
 import torch
+import json
 
 from env import GridEnvironment
 from coggraph import CogGraph          # 需确保已实现 forward 三接口
 from agents.rl_agent import RLAgent
 from utils import IntrinsicCuriosityModule
 from collections import deque
+from dataclasses import dataclass
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -193,6 +195,68 @@ def main(cfg):
 
     print(f"[Init] transformer input_dim = {full_dim}, device = {device}")
 
+    @dataclass
+    class HorizonMetricTracker:
+        resource_hits: int = 0
+        hazard_hits: int = 0
+        energy_gained: float = 0.0
+        energy_spent: float = 0.0
+        steps: int = 0
+        _prev_env_resource: int = 0
+        _prev_env_hazard: int = 0
+
+        def reset(self, env: GridEnvironment) -> None:
+            self.resource_hits = 0
+            self.hazard_hits = 0
+            self.energy_gained = 0.0
+            self.energy_spent = 0.0
+            self.steps = 0
+            self._prev_env_resource = env.reward_hit_count
+            self._prev_env_hazard = env.danger_hit_count
+
+        def update_step(self, env: GridEnvironment) -> tuple[int, int, float, float]:
+            gain = float(env.agent_energy_gain)
+            penalty = float(env.agent_energy_penalty)
+
+            env_res = env.reward_hit_count
+            env_haz = env.danger_hit_count
+            res_delta = max(env_res - self._prev_env_resource, 0)
+            haz_delta = max(env_haz - self._prev_env_hazard, 0)
+
+            self.resource_hits += res_delta
+            self.hazard_hits += haz_delta
+            self.energy_gained += gain
+            self.energy_spent += penalty
+            self.steps += 1
+
+            self._prev_env_resource = env_res
+            self._prev_env_hazard = env_haz
+
+            return res_delta, haz_delta, gain, penalty
+
+        def summarize(self) -> dict[str, float]:
+            total_contacts = self.resource_hits + self.hazard_hits
+            accuracy = (self.resource_hits / total_contacts) if total_contacts else 0.0
+
+            total_energy = self.energy_gained + self.energy_spent
+            if total_energy > 0:
+                efficiency_balance = (self.energy_gained - self.energy_spent) / total_energy
+            else:
+                efficiency_balance = 0.0
+
+            composite = 0.6 * accuracy + 0.4 * ((efficiency_balance + 1.0) * 0.5)
+
+            return {
+                "accuracy": accuracy,
+                "efficiency_balance": efficiency_balance,
+                "composite_score": composite,
+                "resource_hits": float(self.resource_hits),
+                "hazard_hits": float(self.hazard_hits),
+                "energy_gained": self.energy_gained,
+                "energy_spent": self.energy_spent,
+                "steps": float(self.steps),
+            }
+
     # 3) 训练循环 —— 伪 Episode 截断（环境只 reset 一次，每隔 max_steps 步做一次更新）
     reward_history = []
     # 只做一次环境初始化
@@ -204,8 +268,18 @@ def main(cfg):
     history = deque(maxlen=4)
     _reset_history(state, history, last_dim)
 
+    metric_tracker = HorizonMetricTracker()
+    metric_tracker.reset(env)
+    horizon_summaries: list[dict[str, float]] = []
 
-
+    def _finalize_horizon(tag: str) -> None:
+        summary = metric_tracker.summarize()
+        horizon_index = float(len(horizon_summaries) + 1)
+        horizon_summaries.append({"horizon": horizon_index, **summary})
+        logger.info(
+            f"[{tag}] Horizon summary → score={summary['composite_score']:.3f}, accuracy={summary['accuracy']:.3f}, "
+            f"efficiency={summary['efficiency_balance']:.3f}, hits(R/H)={summary['resource_hits']:.0f}/{summary['hazard_hits']:.0f}"
+        )
 
     ep_reward = 0.0
     step_in_horizon = 0
@@ -284,11 +358,10 @@ def main(cfg):
         # + resource_shaping (±0.01)
         # + danger_shaping   (±0.2)
         # + explore_bonus    (首次访问格子 +0.005)
-        # 这里再加上你原来的 proximity_bonus
-        ext_reward = raw_reward + proximity_bonus + danger_shaping
-        # —— ⑨ 下一状态转张量 —— #
-        # —— ⑧ 组合最终外在奖励 ——
-        ext_reward = raw_reward + proximity_bonus + danger_shaping
+        res_delta, haz_delta, gain, penalty = metric_tracker.update_step(env)
+        shaping_only = raw_reward - (gain - penalty)
+        accuracy_bonus = 0.05 * (res_delta - haz_delta)
+        ext_reward = (gain - penalty) + shaping_only + proximity_bonus + accuracy_bonus + danger_shaping
         # —— ⑨ 下一状态转张量 ——
         next_raw = next_state_np.float().to(device)
 
@@ -336,7 +409,9 @@ def main(cfg):
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
                 graph.reset_state()
+            _finalize_horizon("done")
             env_state = env.reset().float().to(device)
+            metric_tracker.reset(env)
             state = env_state
             _reset_history(state, history, last_dim)
 
@@ -352,7 +427,9 @@ def main(cfg):
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
                 graph.reset_state()
+            _finalize_horizon("cutoff")
             env_state = env.reset().float().to(device)
+            metric_tracker.reset(env)
             state = env_state
             _reset_history(state, history, last_dim)
         if cfg.save_every and horizon_id % cfg.save_every == 0:
@@ -374,19 +451,24 @@ def main(cfg):
         if cfg.use_curiosity:
             icm.update_parameters()
         reward_history.append(ep_reward)
+        _finalize_horizon("final")
 
     # —— 训练总结 & 最终保存 ——
     print(f"Training finished ✓  total horizons = {horizon_id}")
     os.makedirs("checkpoints", exist_ok=True)
     agent.save("checkpoints/agent_final.pth")
     print("Saved final model to checkpoints/agent_final.pth")
+    if horizon_summaries:
+        with open("checkpoints/horizon_scores.json", "w", encoding="utf-8") as fp:
+            json.dump(horizon_summaries, fp, ensure_ascii=False, indent=2)
+        print("Saved horizon score summary to checkpoints/horizon_scores.json")
 
 
 # -------------------------------------------------------------------------- #
 if __name__ == "__main__":
     cfg = get_cfg()
-    main(cfg)
     t0 = time.time()
+    main(cfg)
     print(f"Total runtime: {time.time() - t0:.1f} s")
 
 """
