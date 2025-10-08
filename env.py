@@ -283,6 +283,9 @@ class GridEnvironment:
         return buf.view(-1)
 
     def render(self):
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
         grid = [['.' for _ in range(self.size)] for _ in range(self.size)]
         x, y = self.agent_pos
         grid[y][x] = 'A'

@@ -161,7 +161,8 @@ def main(cfg):
     def _goal_vector() -> torch.Tensor:
         tv = graph.target_vector.to(device)
         if tv.dim() == 1:
-            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
+            zeros_like_tv = torch.zeros_like(tv)
+            tv = torch.stack([tv, zeros_like_tv], dim=0)
         return tv.view(-1)
 
     def _compose_feature(proc_vec: torch.Tensor, target_dim: int) -> torch.Tensor:
@@ -178,13 +179,9 @@ def main(cfg):
         return processor_out, feat
 
     def _build_state_sequence(hist: deque[torch.Tensor]) -> torch.Tensor:
-        max_len = max(t.numel() for t in hist)
-        aligned = []
-        for t in hist:
-            if t.numel() < max_len:
-                t = F.pad(t, (0, max_len - t.numel()))
-            aligned.append(t)
-        return torch.stack(aligned, dim=0)
+        if not hist:
+            return torch.empty((0,), device=device)
+        return torch.stack(list(hist), dim=0)
 
     def _reset_history(state_tensor: torch.Tensor, history_buf: deque[torch.Tensor], target_dim: int) -> None:
         history_buf.clear()
@@ -202,7 +199,7 @@ def main(cfg):
     if hasattr(graph, "reset_state"):
         graph.reset_state()
     env.reset()
-    state = env.get_state().float()
+    state = env.get_state().float().to(device)
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
     _reset_history(state, history, last_dim)
@@ -301,11 +298,15 @@ def main(cfg):
         next_processor = graph.processor_forward(next_sensor).squeeze(0)
         next_feat = _compose_feature(next_processor, last_dim)
         # 4) 用 step_feat (上面已构造) 和 next_feat 计算 IC 奖励
-        ic_reward = icm.compute_intrinsic_reward(
-            step_feat,
-            next_feat,
-            torch.tensor([action], device=device)
-        ) if cfg.use_curiosity else 0.0
+        if cfg.use_curiosity:
+            action_tensor = torch.tensor(action, device=device)
+            ic_reward = icm.compute_intrinsic_reward(
+                step_feat,
+                next_feat,
+                action_tensor
+            )
+        else:
+            ic_reward = 0.0
 
         # —— ⑧ 计算衰减因子 & 合并奖励 ——
         progress = min(global_step, 5000) / 5000
@@ -335,7 +336,7 @@ def main(cfg):
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
                 graph.reset_state()
-            env_state = env.reset().float()
+            env_state = env.reset().float().to(device)
             state = env_state
             _reset_history(state, history, last_dim)
 
@@ -351,7 +352,7 @@ def main(cfg):
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
                 graph.reset_state()
-            env_state = env.reset().float()
+            env_state = env.reset().float().to(device)
             state = env_state
             _reset_history(state, history, last_dim)
         if cfg.save_every and horizon_id % cfg.save_every == 0:
