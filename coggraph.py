@@ -1841,11 +1841,7 @@ class CogGraph:
 
         wants_split = unit.should_split()
         if wants_split:
-            emergency_split = self._needs_emergency_repopulation(unit)
-            if allow_clone or emergency_split:
-                if emergency_split and not allow_clone:
-                    logger.info(
-                        f"[紧急补员] {unit.id} 触发 {unit.role} 紧缺增殖，越过能量上限执行复制")
+            if allow_clone:
                 pending[unit.role].append(unit)
             else:
                 logger.debug(f"[系统保护] 总能量过高，暂缓 {unit.id} 分裂")

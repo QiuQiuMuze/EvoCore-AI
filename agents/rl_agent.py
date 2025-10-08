@@ -175,11 +175,14 @@ class RLAgent:
         advantages_tensor = torch.stack(advantages).view(-1)
 
         adv_mean = advantages_tensor.mean()
-        adv_std = advantages_tensor.std(unbiased=False)
-        if torch.isnan(adv_std) or adv_std < 1e-8:
+        if advantages_tensor.numel() <= 1:
             advantages_tensor = advantages_tensor - adv_mean
         else:
-            advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
+            adv_std = advantages_tensor.std(unbiased=False)
+            if torch.isnan(adv_std) or adv_std < 1e-8:
+                advantages_tensor = advantages_tensor - adv_mean
+            else:
+                advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
 
         return returns_tensor.detach(), advantages_tensor.detach()
 
