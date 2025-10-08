@@ -1568,7 +1568,7 @@ class CogGraph:
             gap = target - current
             if gap <= 1e-6:
                 continue
-            share = min(gap, 0.2, self.energy_pool)
+            share = min(gap, 0.5, self.energy_pool)
             if share <= 1e-6:
                 break
             unit.energy += share
@@ -1633,7 +1633,8 @@ class CogGraph:
             for data in eligible:
                 weight = max(data["weight"], 1e-6)
                 proportional = budget * (weight / total_weight)
-                share = min(cap, data["gap"], proportional)
+                unit_cap = 0.5 if getattr(data["unit"], "role", None) == "emitter" else cap
+                share = min(unit_cap, data["gap"], proportional)
                 if share > 0.0:
                     data["unit"].energy += share
                     data["gap"] -= share
@@ -1647,7 +1648,8 @@ class CogGraph:
                         break
                     if data["gap"] <= 1e-6:
                         continue
-                    room = max(cap - shares[idx], 0.0)
+                    unit_cap = 0.5 if getattr(data["unit"], "role", None) == "emitter" else cap
+                    room = max(unit_cap - shares[idx], 0.0)
                     if room <= 0.0:
                         continue
                     extra = min(room, data["gap"], remaining_budget)
