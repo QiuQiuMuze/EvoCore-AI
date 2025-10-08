@@ -92,6 +92,61 @@ def _infer_input_dim(graph: CogGraph, env_state: torch.Tensor) -> int:
     return env_state.numel()
 
 
+def _init_performance_metrics() -> dict:
+    return {
+        "resource_hits": 0,
+        "hazard_hits": 0,
+        "energy_gain": 0.0,
+        "energy_penalty": 0.0,
+    }
+
+
+def _update_performance_metrics(metrics: dict, *, gain: float, penalty: float) -> None:
+    metrics["energy_gain"] += float(gain)
+    metrics["energy_penalty"] += float(penalty)
+    if gain > 0:
+        metrics["resource_hits"] += 1
+    if penalty > 0:
+        metrics["hazard_hits"] += 1
+
+
+def _summarize_performance_metrics(metrics: dict) -> dict:
+    total_interactions = metrics["resource_hits"] + metrics["hazard_hits"]
+    accuracy = (
+        metrics["resource_hits"] / total_interactions
+        if total_interactions > 0 else 0.0
+    )
+
+    total_energy_flow = metrics["energy_gain"] + metrics["energy_penalty"]
+    net_energy = metrics["energy_gain"] - metrics["energy_penalty"]
+    energy_eff = (
+        net_energy / total_energy_flow
+        if total_energy_flow > 0 else 0.0
+    )
+
+    overall = 0.6 * accuracy + 0.4 * energy_eff
+
+    return {
+        "accuracy": accuracy,
+        "energy_efficiency": energy_eff,
+        "overall_score": overall,
+        "resource_hits": metrics["resource_hits"],
+        "hazard_hits": metrics["hazard_hits"],
+        "net_energy": net_energy,
+        "total_energy_gain": metrics["energy_gain"],
+        "total_energy_penalty": metrics["energy_penalty"],
+    }
+
+
+def _reset_performance_metrics(metrics: dict) -> None:
+    metrics.update(
+        resource_hits=0,
+        hazard_hits=0,
+        energy_gain=0.0,
+        energy_penalty=0.0,
+    )
+
+
 # -------------------------------------------------------------------------- #
 #                              训练主函数                                    #
 # -------------------------------------------------------------------------- #
@@ -205,6 +260,26 @@ def main(cfg):
     _reset_history(state, history, last_dim)
 
 
+    performance_metrics = _init_performance_metrics()
+    score_history: list[dict] = []
+
+    def _log_and_reset_performance(hid: int) -> dict:
+        summary = _summarize_performance_metrics(performance_metrics)
+        logger.info(
+            "[评分] Horizon %d: accuracy=%.3f, energy_eff=%.3f, overall=%.3f | hits R/H=%d/%d | net_energy=%.3f",
+            hid,
+            summary["accuracy"],
+            summary["energy_efficiency"],
+            summary["overall_score"],
+            summary["resource_hits"],
+            summary["hazard_hits"],
+            summary["net_energy"],
+        )
+        score_history.append(summary)
+        _reset_performance_metrics(performance_metrics)
+        return summary
+
+
 
 
     ep_reward = 0.0
@@ -278,6 +353,12 @@ def main(cfg):
         #    同时拿到下一状态和 done 标志
         next_state_np, raw_reward, done, _ = env.step(action, cog_step=graph.current_step)
 
+        _update_performance_metrics(
+            performance_metrics,
+            gain=env.agent_energy_gain,
+            penalty=env.agent_energy_penalty,
+        )
+
         # —— ⑧ 组合最终外在奖励 —— #
         # raw_reward 已包含：
         #   env.agent_energy_gain - env.agent_energy_penalty
@@ -332,6 +413,7 @@ def main(cfg):
             if cfg.use_curiosity:
                 icm.update_parameters()
             reward_history.append(ep_reward)
+            _log_and_reset_performance(horizon_id)
             step_in_horizon = 0
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
@@ -348,6 +430,7 @@ def main(cfg):
             if cfg.use_curiosity:
                 icm.update_parameters()
             reward_history.append(ep_reward)
+            _log_and_reset_performance(horizon_id)
             step_in_horizon = 0
             ep_reward = 0.0
             if hasattr(graph, "reset_state"):
@@ -374,9 +457,27 @@ def main(cfg):
         if cfg.use_curiosity:
             icm.update_parameters()
         reward_history.append(ep_reward)
+        _log_and_reset_performance(horizon_id)
 
     # —— 训练总结 & 最终保存 ——
     print(f"Training finished ✓  total horizons = {horizon_id}")
+    if score_history:
+        avg_accuracy = sum(item["accuracy"] for item in score_history) / len(score_history)
+        avg_eff = sum(item["energy_efficiency"] for item in score_history) / len(score_history)
+        avg_overall = sum(item["overall_score"] for item in score_history) / len(score_history)
+        total_hits = sum(item["resource_hits"] for item in score_history)
+        total_hazards = sum(item["hazard_hits"] for item in score_history)
+        net_energy_total = sum(item["net_energy"] for item in score_history)
+        print(
+            "[评分汇总] avg_accuracy={:.3f}, avg_energy_eff={:.3f}, avg_overall={:.3f}, total_hits={} (hazards={}), net_energy_total={:.3f}".format(
+                avg_accuracy,
+                avg_eff,
+                avg_overall,
+                total_hits,
+                total_hazards,
+                net_energy_total,
+            )
+        )
     os.makedirs("checkpoints", exist_ok=True)
     agent.save("checkpoints/agent_final.pth")
     print("Saved final model to checkpoints/agent_final.pth")
@@ -385,8 +486,8 @@ def main(cfg):
 # -------------------------------------------------------------------------- #
 if __name__ == "__main__":
     cfg = get_cfg()
-    main(cfg)
     t0 = time.time()
+    main(cfg)
     print(f"Total runtime: {time.time() - t0:.1f} s")
 
 """

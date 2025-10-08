@@ -98,6 +98,9 @@ class CogUnit:
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.avg_recent_calls = 0.0
+        # —— 分裂限制：Emitter 最多允许 3~6 次 ——
+        self.emitter_split_cap = random.randint(3, 6) if self.role == "emitter" else None
+        self.emitter_splits_done = 0
         # 认知状态向量
         self.state = torch.zeros(hidden_size)
         self.output_positions = deque(maxlen=10)
@@ -568,6 +571,15 @@ class CogUnit:
         total = getattr(self, "global_unit_count", 1)
 
         role = self.get_role()
+
+        if role == "emitter":
+            cap = getattr(self, "emitter_split_cap", None)
+            if cap is None:
+                cap = random.randint(3, 6)
+                self.emitter_split_cap = cap
+            done = getattr(self, "emitter_splits_done", 0)
+            if done >= cap:
+                return False
 
         # ✅ 各类细胞紧急增殖
         if role == "emitter" and emitter_count <= 8:
