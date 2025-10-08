@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn.functional as F
 from collections import deque
@@ -114,6 +115,34 @@ class MemoryBuffer:
         if self.use_faiss:
             self.faiss_index.reset()
             self._id_map.clear()
+
+    def sample(self, batch_size: int, min_reward: float = None, require_action: bool = True):
+        """返回经过过滤的随机样本列表。
+
+        Args:
+            batch_size: 期望返回的记录数量（若不足则返回全部）。
+            min_reward: 仅保留 reward ≥ min_reward 的记录；为 None 时不限制。
+            require_action: 若为 True，仅保留包含 action 的记录。
+        """
+        if batch_size <= 0 or not self.buffer:
+            return []
+
+        if min_reward is None and not require_action:
+            candidates = list(self.buffer)
+        else:
+            candidates = [
+                rec for rec in self.buffer
+                if (not require_action or rec.get("action") is not None)
+                and (min_reward is None or rec.get("reward", 0.0) >= min_reward)
+            ]
+
+        if not candidates:
+            return []
+
+        if len(candidates) <= batch_size:
+            return list(candidates)
+
+        return random.sample(candidates, batch_size)
 
 
 """
