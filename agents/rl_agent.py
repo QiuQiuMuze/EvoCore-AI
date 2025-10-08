@@ -180,6 +180,7 @@ class RLAgent:
             advantages_tensor = advantages_tensor - adv_mean
         else:
             advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
+
         return returns_tensor.detach(), advantages_tensor.detach()
 
     def finish_episode(self, last_state_seq: torch.Tensor | None = None):
