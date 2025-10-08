@@ -209,6 +209,7 @@ class CogGraph:
         self.static_mode = False
         self._orig_metabolic = {}   # 存储进入静吸模式前的速率
         self.static_mode_allowed = False
+        self._static_mode_forbid_step = 0
         # —— 缓存最近一次各角色的原始输出，供拓扑加权聚合使用 ——
         self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
@@ -1526,6 +1527,60 @@ class CogGraph:
                 logger.debug(
                     f"[能量转移] {unit.id} ({role}) 系统过载 → 存入能量池 {contribution:.2f}，保留 {unit.energy:.2f}")
 
+    def _target_energy_for_unit(self, unit: CogUnit) -> float:
+        bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+        bias = min(max(bias, 0.3), 2.0)
+        base = 0.4 if unit.role != "processor" else 0.45
+        if unit.role == "emitter":
+            base += 0.05
+        return min(1.2, base + 0.18 * bias)
+
+    def _emitter_priority_score(self, unit: CogUnit) -> float:
+        recent = getattr(unit, "avg_recent_calls", 0.0)
+        success = 0.0
+        if hasattr(unit, "meta"):
+            rate = unit.meta.recent_success_rate()
+            if rate is not None:
+                success = rate
+        return 0.6 * recent + 0.25 * success + 0.15 * float(unit.energy)
+
+    def _rapid_emitter_refuel(self):
+        if self.current_step % 5 != 0:
+            return
+        if self.energy_pool <= 1e-6:
+            return
+
+        emitters = [u for u in self.units if u.role == "emitter"]
+        if not emitters:
+            return
+
+        emitters.sort(key=self._emitter_priority_score, reverse=True)
+        top_k = max(1, math.ceil(len(emitters) * 0.7))
+        selected = emitters[:top_k]
+
+        distributed = 0.0
+        for unit in selected:
+            target = max(self._target_energy_for_unit(unit), 0.85)
+            critical = max(0.5, target * 0.85)
+            current = float(unit.energy)
+            if current >= critical:
+                continue
+            gap = target - current
+            if gap <= 1e-6:
+                continue
+            share = min(gap, 0.2, self.energy_pool)
+            if share <= 1e-6:
+                break
+            unit.energy += share
+            self.energy_pool -= share
+            distributed += share
+            if self.energy_pool <= 1e-6:
+                break
+
+        if distributed > 1e-6:
+            logger.debug(
+                f"[Emitter补能] 第 {self.current_step} 步快速补充 {distributed:.3f} 能量，池余 {self.energy_pool:.2f}")
+
     def supply_energy_from_pool(self):
         """
         每一步都根据个体属性评估是否需要从能量池补给，避免统一撒网。
@@ -1540,17 +1595,9 @@ class CogGraph:
         total_cell_energy = self.total_energy()
         max_allowable = self.max_total_energy * 0.9
 
-        def _target_energy(unit: CogUnit) -> float:
-            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
-            bias = min(max(bias, 0.3), 2.0)
-            base = 0.4 if unit.role != "processor" else 0.45
-            if unit.role == "emitter":
-                base += 0.05
-            return min(1.2, base + 0.18 * bias)
-
         deficits = []
         for unit in self.units:
-            target = _target_energy(unit)
+            target = self._target_energy_for_unit(unit)
             gap = target - float(unit.energy)
             if gap <= 0.0:
                 continue
@@ -1853,6 +1900,8 @@ class CogGraph:
 
     # —— 2) 判断是否进入静吸模式 —— #
     def _check_enter_static_mode(self):
+        if self.current_step == self._static_mode_forbid_step:
+            return
         if self.current_step >= 1000 and self.steps_since_last_reward >= 100 and not self.static_mode:
             self._enter_static_mode()
 
@@ -1978,9 +2027,20 @@ class CogGraph:
 
     def _perform_system_maintenance(self):
         self.supply_energy_from_pool()
+        self._rapid_emitter_refuel()
 
-        if self.debug and self.current_step % 40 == 0:
+        if self.current_step > 0 and self.current_step % 40 == 0:
             self.rebalance_cell_types()
+
+    def _ensure_minimum_population(self):
+        if self.units:
+            return
+        if self.static_mode:
+            self._exit_static_mode()
+        logger.warning("[紧急增殖] 细胞数量降为 0，触发紧急补种")
+        self._init_seed_units(n_sensor=6, n_processor=12, n_emitter=6, device=self.device)
+        self.steps_since_last_reward = 0
+        self._static_mode_forbid_step = self.current_step
 
 
     def step(self, input_tensor: torch.Tensor):
@@ -1993,6 +2053,11 @@ class CogGraph:
             self.active_units.clear()
 
         self.current_step += 1
+        if self.current_step % 1000 == 0:
+            self.steps_since_last_reward = 0
+            self._static_mode_forbid_step = self.current_step
+            if self.static_mode:
+                self._exit_static_mode()
         self._update_global_counts()
 
         # === Transformer 一网打尽 ===
@@ -2089,6 +2154,8 @@ class CogGraph:
 
         if self.current_step > 0 and self.current_step % 50 == 0:
             self.finalize_deaths()
+
+        self._ensure_minimum_population()
 
         self.auto_connect()
 
