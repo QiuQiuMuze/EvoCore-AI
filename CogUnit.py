@@ -187,6 +187,21 @@ class CogUnit:
     def _param_dtype(self):
         return next(self.function.parameters()).dtype
 
+    def _should_skip_training(self, inputs: torch.Tensor, targets: torch.Tensor, tol: float = 1e-5):
+        """若输入与目标几乎一致或存在非法数值，则跳过梯度更新。"""
+        if inputs is None or targets is None:
+            return True
+
+        if inputs.shape != targets.shape:
+            return False
+
+        if not torch.isfinite(inputs).all() or not torch.isfinite(targets).all():
+            logger.warning(f"[Mini-Learn] {self.id} 检测到非法数值，跳过训练。")
+            return True
+
+        delta = torch.max(torch.abs(inputs - targets))
+        return float(delta.detach().cpu()) <= tol
+
     def _align_to_input_size(self, tensor):
         if tensor is None:
             return None
@@ -209,6 +224,9 @@ class CogUnit:
         targets = targets.detach()
         inputs = self._align_to_input_size(inputs)
         targets = self._align_to_input_size(targets)
+
+        if self._should_skip_training(inputs, targets):
+            return
 
         dtype = self._param_dtype()
         inputs = inputs.to(self.device, dtype=dtype)
@@ -261,19 +279,36 @@ class CogUnit:
         if getattr(self, "memory_buffer", None) is None:
             return
 
-        records = [rec for rec in self.memory_buffer.buffer
-                   if rec.get("action") is not None and rec.get("reward", 0.0) >= min_reward]
-        if not records:
+        batch = self.memory_buffer.sample(batch_size, min_reward=min_reward, require_action=True)
+        if not batch:
             return
 
-        batch = random.sample(records, min(batch_size, len(records)))
         inputs = []
         targets = []
+        param_dtype = self._param_dtype()
+        cpu_dtype = torch.float32 if param_dtype == torch.float16 else param_dtype
         for rec in batch:
-            state = rec["state"].view(-1)
-            action = rec["action"].view(-1)
-            inputs.append(self._align_to_input_size(state.unsqueeze(0)))
-            targets.append(self._align_to_input_size(action.unsqueeze(0)))
+            state = rec.get("state")
+            action = rec.get("action")
+
+            if action is None:
+                continue
+
+            if not isinstance(state, torch.Tensor):
+                state = torch.as_tensor(state, dtype=cpu_dtype)
+            else:
+                state = state.detach().to(dtype=cpu_dtype)
+
+            if not isinstance(action, torch.Tensor):
+                action_tensor = torch.as_tensor(action, dtype=cpu_dtype)
+            else:
+                action_tensor = action.detach().to(dtype=cpu_dtype)
+
+            state = state.view(1, -1)
+            action_tensor = action_tensor.view(1, -1)
+
+            inputs.append(self._align_to_input_size(state))
+            targets.append(self._align_to_input_size(action_tensor))
 
         if not inputs or not targets:
             return
