@@ -1815,6 +1815,7 @@ class CogGraph:
 
         logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
 
+        logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
             recs = unit.recall(state_snapshot, k=5, metric='cosine')
@@ -1838,10 +1839,16 @@ class CogGraph:
             self.connections[uid][unit.id] *= 1.05
             self.connections[uid][unit.id] = min(self.connections[uid][unit.id], 5.0)
 
-        if allow_clone and unit.should_split():
-            pending[unit.role].append(unit)
-        elif not allow_clone:
-            logger.debug(f"[系统保护] 总能量过高，禁止 {unit.id} 分裂")
+        wants_split = unit.should_split()
+        if wants_split:
+            emergency_split = self._needs_emergency_repopulation(unit)
+            if allow_clone or emergency_split:
+                if emergency_split and not allow_clone:
+                    logger.info(
+                        f"[紧急补员] {unit.id} 触发 {unit.role} 紧缺增殖，越过能量上限执行复制")
+                pending[unit.role].append(unit)
+            else:
+                logger.debug(f"[系统保护] 总能量过高，暂缓 {unit.id} 分裂")
 
         if unit.should_die():
             logger.debug(f"[死亡] {unit.id} 被移除")
