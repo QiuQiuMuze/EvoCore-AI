@@ -158,6 +158,40 @@ def main(cfg):
     ).to(device)
     curiosity_beta = 0.3 if cfg.use_curiosity else 0.0  # 内在奖励权重
 
+    def _goal_vector() -> torch.Tensor:
+        tv = graph.target_vector.to(device)
+        if tv.dim() == 1:
+            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
+        return tv.view(-1)
+
+    def _compose_feature(proc_vec: torch.Tensor, target_dim: int) -> torch.Tensor:
+        goal_vec = _goal_vector()
+        feat = torch.cat([proc_vec, goal_vec], dim=-1)
+        if feat.numel() < target_dim:
+            feat = F.pad(feat, (0, target_dim - feat.numel()))
+        return feat
+
+    def _encode_state_feature(state_tensor: torch.Tensor, target_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        sensor_out = graph.sensor_forward(state_tensor)
+        processor_out = graph.processor_forward(sensor_out).squeeze(0)
+        feat = _compose_feature(processor_out, target_dim)
+        return processor_out, feat
+
+    def _build_state_sequence(hist: deque[torch.Tensor]) -> torch.Tensor:
+        max_len = max(t.numel() for t in hist)
+        aligned = []
+        for t in hist:
+            if t.numel() < max_len:
+                t = F.pad(t, (0, max_len - t.numel()))
+            aligned.append(t)
+        return torch.stack(aligned, dim=0)
+
+    def _reset_history(state_tensor: torch.Tensor, history_buf: deque[torch.Tensor], target_dim: int) -> None:
+        history_buf.clear()
+        _, feat = _encode_state_feature(state_tensor, target_dim)
+        for _ in range(history_buf.maxlen):
+            history_buf.append(feat.detach().clone())
+
     last_dim = full_dim
 
     print(f"[Init] transformer input_dim = {full_dim}, device = {device}")
@@ -171,22 +205,7 @@ def main(cfg):
     state = env.get_state().float()
     # —— 新增：用滑动窗口保存最近 4 步的带目标向量的特征 —— #
     history = deque(maxlen=4)
-    # 构造一个固定长度 = proc_dim + 2*env² 的 init_feat
-    init_sensor    = graph.sensor_forward(state)                      # (1, state_dim)
-    init_processor = graph.processor_forward(init_sensor).squeeze(0)  # (proc_dim,)
-    # —— 标准化目标向量到 2×(env²) —— #
-    tv = graph.target_vector.to(device)
-    if tv.dim() == 1:
-        # 单通道→补第二通道全 0
-        tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)          # (2, env²)
-    goal_vec = graph.target_vector.to(device).view(-1)  # 正好 2*env²
-    # (2*env²,)
-    init_feat = torch.cat([init_processor, goal_vec], dim=-1)       # (proc_dim+2*env²,)
-    # --- 保守起见：若将来 proc_dim 变小，也对 init_feat 右补零 ---
-    if init_feat.numel() < last_dim:  # last_dim 之前已经设为 full_dim
-        init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
-    for _ in range(history.maxlen):
-        history.append(init_feat)
+    _reset_history(state, history, last_dim)
 
 
 
@@ -204,8 +223,6 @@ def main(cfg):
         logger.warning(f"\n==== Step {global_step} (within horizon step {step_in_horizon}) ====")
 
         # —— ② 构造 CogGraph.step() 的输入 ——
-        goal_vec = graph.task.encode_goal(graph.env.size).float().to(device)
-        flat_state = state.view(-1)                                       # (env_size*env_size*C,)
         inp = state.view(1, -1).to(device)     # (1, D)
         graph.step(inp)
 
@@ -222,51 +239,20 @@ def main(cfg):
 
             # —— 隐藏维度变更时，重置 history —— #
             history = deque(maxlen=history.maxlen)
-            init_sensor    = graph.sensor_forward(state)
-            init_processor = graph.processor_forward(init_sensor).squeeze(0)
-            # 同样标准化目标向量到 2×(env²)
-            tv = graph.target_vector.to(device)
-            if tv.dim() == 1:
-                tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-            goal_vec = tv.view(-1)
-            init_feat = torch.cat([init_processor, goal_vec], dim=-1)
-            if init_feat.numel() < last_dim:  # new_full 已经赋给 last_dim
-                init_feat = F.pad(init_feat, (0, last_dim - init_feat.numel()))
-            for _ in range(history.maxlen):
-                history.append(init_feat)
+            _reset_history(state, history, last_dim)
 
 
 
 
         # —— ④ 拿 Transformer 输入 ——
         sensor_out    = graph.sensor_forward(state)      # (1, state_dim)
-        processor_out = graph.processor_forward(sensor_out)
+        processor_out = graph.processor_forward(sensor_out).squeeze(0)
         env.render()
 
-        # —— 新增：加上本轮最近目标（资源 or 陷阱）的位置编码 —— #
-        # flatten 到一维（2*env²） 或者你也可以只取资源通道 goal_vec = graph.target_vector[0]
-        # —— 更新历史 & 构造带目标的特征 —— #
-        tv = graph.target_vector.to(device)
-        if tv.dim() == 1:
-            tv = torch.stack([tv, torch.zeros_like(tv)], dim=0)
-        goal_vec  = tv.view(-1)
-        step_feat = torch.cat([processor_out.squeeze(0), goal_vec], dim=-1)
-        if step_feat.numel() < last_dim:  # 防止 < last_dim
-            step_feat = F.pad(step_feat, (0, last_dim - step_feat.numel()))
+        # 保留当前步的特征用于 ICM 奖励
+        step_feat = _compose_feature(processor_out, last_dim)
 
-        history.append(step_feat)
-
-        # 用最近 history.maxlen 步的 processor_out 序列作为 Transformer 输入
-
-        # --- 对齐 history 中的张量 ---
-        max_len = max(t.numel() for t in history)  # 找到最长的
-        aligned = []
-        for t in history:
-            if t.numel() < max_len:  # 右侧补零
-                t = F.pad(t, (0, max_len - t.numel()))
-            aligned.append(t)
-
-        seq = torch.stack(aligned, dim=0).unsqueeze(0).to(device)  # (1, L, max_len)
+        seq = _build_state_sequence(history).unsqueeze(0).to(device)  # (1, L, max_len)
         state_seq = seq
 
 
@@ -311,17 +297,9 @@ def main(cfg):
 
         # —— ⑩ 计算 Intrinsic Curiosity Reward —— #
         # 1) 下一个 Processor 特征
-        next_sensor = graph.sensor_forward(next_raw)  # (1, proc_dim)
-        next_processor = graph.processor_forward(next_sensor)  # (1, proc_dim)
-        # 2) 下一个 Goal 向量（双通道）
-        tv_next = graph.target_vector.to(device)
-        if tv_next.dim() == 1:
-            tv_next = torch.stack([tv_next, torch.zeros_like(tv_next)], dim=0)
-        goal_vec_next = tv_next.view(-1)  # (2*env²,)
-        # 3) 拼接成 full_dim 特征
-        next_feat = torch.cat([next_processor.squeeze(0), goal_vec_next], dim=-1)
-        if next_feat.numel() < last_dim:
-            next_feat = F.pad(next_feat, (0, last_dim - next_feat.numel()))
+        next_sensor = graph.sensor_forward(next_raw)
+        next_processor = graph.processor_forward(next_sensor).squeeze(0)
+        next_feat = _compose_feature(next_processor, last_dim)
         # 4) 用 step_feat (上面已构造) 和 next_feat 计算 IC 奖励
         ic_reward = icm.compute_intrinsic_reward(
             step_feat,
@@ -334,26 +312,48 @@ def main(cfg):
         decay    = 1.0 - 0.35 * progress
         total_reward = (ext_reward + curiosity_beta * ic_reward) * decay
 
-        agent.store_reward(total_reward)
+        agent.store_reward(total_reward, done)
         ep_reward += total_reward
         # —— 新增：每200步也更新 ICM —— #
         if cfg.use_curiosity and global_step % 200 == 0:
             icm.update_parameters()
 
+        # 滑动窗口加入下一状态特征
+        history.append(next_feat.detach())
 
         # —— ⑨ 更新 state ——
         state = next_raw
 
-        # —— ⑩ 达到截断长度，做一次“Episode”更新 ——
-        if step_in_horizon >= cfg.max_steps:
+        if done:
             horizon_id += 1
-            agent.finish_episode()
+            last_seq = _build_state_sequence(history).unsqueeze(0).to(device)
+            agent.finish_episode(last_seq)
             if cfg.use_curiosity:
                 icm.update_parameters()
             reward_history.append(ep_reward)
             step_in_horizon = 0
             ep_reward = 0.0
-            # 注意：不调用 env.reset()
+            if hasattr(graph, "reset_state"):
+                graph.reset_state()
+            env_state = env.reset().float()
+            state = env_state
+            _reset_history(state, history, last_dim)
+
+        # —— ⑩ 达到截断长度，做一次“Episode”更新 ——
+        if step_in_horizon >= cfg.max_steps:
+            horizon_id += 1
+            last_seq = _build_state_sequence(history).unsqueeze(0).to(device)
+            agent.finish_episode(last_seq)
+            if cfg.use_curiosity:
+                icm.update_parameters()
+            reward_history.append(ep_reward)
+            step_in_horizon = 0
+            ep_reward = 0.0
+            if hasattr(graph, "reset_state"):
+                graph.reset_state()
+            env_state = env.reset().float()
+            state = env_state
+            _reset_history(state, history, last_dim)
         if cfg.save_every and horizon_id % cfg.save_every == 0:
             os.makedirs("checkpoints", exist_ok=True)
             ckpt = f"checkpoints/agent_h{horizon_id}.pth"
@@ -368,7 +368,8 @@ def main(cfg):
     # 收尾：如果最后一段未满 max_steps，也要做一次更新
     if step_in_horizon > 0:
         horizon_id += 1
-        agent.finish_episode()
+        last_seq = _build_state_sequence(history).unsqueeze(0).to(device)
+        agent.finish_episode(last_seq)
         if cfg.use_curiosity:
             icm.update_parameters()
         reward_history.append(ep_reward)
@@ -391,7 +392,7 @@ if __name__ == "__main__":
 关键点说明
 位置	说明
 input_dim 自动推断	通过 graph.sensor_forward() 探测输出维度；若接口未实现，则退化为环境 state 大小。
-Episode 终止	因 GridEnvironment 当前无 done 标志，采用固定 MAX_STEPS（可通过 --max-steps 调整）。
+Episode 终止	结合环境 done 标志与 MAX_STEPS（可通过 --max-steps 调整），终止后会自动 reset 环境。
 奖励计算	直接使用环境在 step() 内更新的 agent_energy_gain / agent_energy_penalty 字段。
 断点续训	--save-every 控制周期性保存，文件包含网络参数 + 优化器状态。
 

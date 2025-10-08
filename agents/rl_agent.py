@@ -40,12 +40,14 @@ class RLAgent:
         clip_epsilon: float = 0.2,
         value_coef: float = 0.5,
         entropy_coef: float = 0.1,
+        gae_lambda: float = 0.95,
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = torch.device(device)
         self.state_dim = input_dim
         self.num_actions = num_actions
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
 
         # 策略网络 & 值网络
         self.policy_net = TransformerPolicyNetwork(
@@ -72,6 +74,7 @@ class RLAgent:
         self.saved_actions: List[int] = []
         self.saved_values: List[torch.Tensor] = []
         self.rewards: List[float] = []
+        self.dones: List[bool] = []
 
 
     def expand_value_head(self, new_input_dim):
@@ -138,7 +141,7 @@ class RLAgent:
         # 缓存
         # state_feat: 简化后的状态表示 (input_dim,)
         state_feat = state_seq.detach().mean(dim=1).squeeze(0)  # (input_dim,)
-        value = self.value_head(state_feat).squeeze(0)         # (1,) -> scalar
+        value = self.value_head(state_feat.unsqueeze(0)).squeeze()
 
         self.saved_states.append(state_feat)
         self.saved_actions.append(action.item())
@@ -146,26 +149,57 @@ class RLAgent:
         self.saved_values.append(value)
         return action.item()
 
-    def store_reward(self, r: float) -> None:
-        """在每个 env.step() 后调用，缓存即时回报。"""
+    def store_reward(self, r: float, done: bool = False) -> None:
+        """在每个 env.step() 后调用，缓存即时回报和终止标记。"""
         self.rewards.append(r)
+        self.dones.append(done)
 
-    def _compute_returns(self) -> torch.Tensor:
-        """计算折扣回报并标准化，返回 shape=(T,)"""
-        R = 0.0
-        returns = []
-        for r in reversed(self.rewards):
-            R = r + self.gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        return returns
+    def _compute_returns_and_advantages(self, bootstrap_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """使用 GAE 计算回报与优势。"""
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+        values = torch.stack(self.saved_values + [bootstrap_value]).view(-1)
 
-    def finish_episode(self):
+        gae = torch.tensor(0.0, device=self.device)
+        returns: List[torch.Tensor] = []
+        advantages: List[torch.Tensor] = []
+
+        for step in reversed(range(len(rewards))):
+            mask = 1.0 - dones[step]
+            delta = rewards[step] + self.gamma * values[step + 1] * mask - values[step]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[step])
+
+        returns_tensor = torch.stack(returns).view(-1)
+        advantages_tensor = torch.stack(advantages).view(-1)
+        advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+        return returns_tensor.detach(), advantages_tensor.detach()
+
+    def finish_episode(self, last_state_seq: torch.Tensor | None = None):
         """
         根据 use_ppo 决定使用 REINFORCE 或 PPO 更新，并清空缓存。
         """
-        returns = self._compute_returns()
+        if last_state_seq is not None:
+            last_state_seq = last_state_seq.to(self.device)
+            if last_state_seq.dim() == 3:  # (1, L, D)
+                last_feat = last_state_seq.mean(dim=1).squeeze(0)
+            elif last_state_seq.dim() == 2:
+                last_feat = last_state_seq.mean(dim=0)
+            else:
+                last_feat = last_state_seq
+
+            cur_dim = last_feat.shape[-1]
+            if cur_dim < self.state_dim:
+                last_feat = F.pad(last_feat, (0, self.state_dim - cur_dim))
+            elif cur_dim > self.state_dim:
+                last_feat = last_feat[:self.state_dim]
+
+            bootstrap_value = self.value_head(last_feat.unsqueeze(0)).squeeze()
+        else:
+            bootstrap_value = torch.tensor(0.0, device=self.device)
+
+        returns, advantages = self._compute_returns_and_advantages(bootstrap_value)
         old_log_probs = torch.stack(self.log_probs)             # (T,)
         # —— 补丁：把所有 saved_states pad 到当前 state_dim 再 stack —— #
         padded_states = []
@@ -182,11 +216,7 @@ class RLAgent:
         states = torch.stack(padded_states)  # (T, state_dim)
 
         actions = torch.tensor(self.saved_actions, device=self.device)  # (T,)
-        old_values = torch.stack(self.saved_values)        # (T,)
-
-        # 优势估计
-        advantages = returns - old_values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        old_values = torch.stack(self.saved_values).view(-1)        # (T,)
 
         # 多次 PPO 更新
         if self.use_ppo:
@@ -252,6 +282,7 @@ class RLAgent:
         self.saved_actions.clear()
         self.saved_values.clear()
         self.rewards.clear()
+        self.dones.clear()
 
     def save(self, path: str) -> None:
         """保存策略状态、值网络和优化器状态。"""
