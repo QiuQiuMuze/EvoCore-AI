@@ -209,6 +209,30 @@ class CogGraph:
         self.static_mode = False
         self._orig_metabolic = {}   # 存储进入静吸模式前的速率
         self.static_mode_allowed = False
+        # —— 缓存最近一次各角色的原始输出，供拓扑加权聚合使用 ——
+        self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
+        self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
+        # —— 存储最近一次聚合时的拓扑统计，便于调试与自省 ——
+        self._role_topology_snapshots: Dict[str, Dict[str, Dict[str, float]]] = {
+            "sensor": {},
+            "processor": {},
+            "emitter": {},
+        }
+        # —— 追踪各角色的代谢趋势（指数滑动平均） ——
+        self._metabolic_ema_beta = 0.85
+        self._role_metabolic_stats: Dict[str, Dict[str, float]] = {
+            role: self._make_metabolic_bucket() for role in ("sensor", "processor", "emitter")
+        }
+        self._role_feature_dim_ema: Dict[str, float] = {
+            "sensor": 0.0,
+            "processor": 0.0,
+            "emitter": 0.0,
+        }
+        self._feature_dim_ema_beta = 0.9
+        self._emitter_input_rms_cap = 1.25
+        self._emitter_input_value_cap = 3.5
+        self._emitter_metabolic_floor = 0.08
+        self._emitter_metabolic_ceiling = 0.24
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1504,45 +1528,109 @@ class CogGraph:
 
     def supply_energy_from_pool(self):
         """
-        每 10 步触发一次：从能量池中为细胞补能。
-        逻辑：
-        - 如果细胞总能量 < max_total_energy * 0.9：
-            → 从 energy_pool 补能，直到池为空或达到90%
-            → 优先补 age > 100 和 energy < 0.5 的细胞
-        - 无论总能量是否超限，都允许每 40 步为弱细胞额外补能（只要池里有）
+        每一步都根据个体属性评估是否需要从能量池补给，避免统一撒网。
+
+        - 首先按角色偏好和当前缺口计算目标能量；仅低于目标的细胞会参与分配。
+        - 若系统总能量仍低于上限的 90%，优先使用能量池填补缺口。
+        - 若总能量已达上限但仍存在低能量细胞，则提供小额稳态补给，防止个体瞬时死亡。
         """
-        if self.current_step % 10 != 0:
+        if not self.units or self.energy_pool <= 1e-6:
             return
 
         total_cell_energy = self.total_energy()
         max_allowable = self.max_total_energy * 0.9
-        to_distribute = max(0.0, min(self.energy_pool, max_allowable - total_cell_energy))
 
-        # ✅ 优先补给老弱细胞（age>100 或 energy<0.5）
-        priority_units = [u for u in self.units if u.energy < 0.5 or u.age > 100]
-        all_units = self.units
+        def _target_energy(unit: CogUnit) -> float:
+            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+            bias = min(max(bias, 0.3), 2.0)
+            base = 0.4 if unit.role != "processor" else 0.45
+            if unit.role == "emitter":
+                base += 0.05
+            return min(1.2, base + 0.18 * bias)
 
-        # —— 主补给逻辑（直到能量达到限制或池为空） ——
-        if to_distribute > 0 and all_units:
-            for unit in priority_units + all_units:
-                if to_distribute <= 0:
-                    break
-                give = min(0.2, to_distribute)
-                unit.energy += give
-                to_distribute -= give
-                self.energy_pool -= give
-            logger.info(
-                f"[主补给] 为 {len(all_units)} 个细胞发放能量，共消耗 {self.energy_pool:.2f} → 当前细胞总能量 {self.total_energy():.2f}"
+        deficits = []
+        for unit in self.units:
+            target = _target_energy(unit)
+            gap = target - float(unit.energy)
+            if gap <= 0.0:
+                continue
+            recent = getattr(unit, "avg_recent_calls", 0.0)
+            activity_bonus = 1.0 + 0.25 * min(recent, 4.0)
+            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+            resilience = 1.0 / max(0.5, math.sqrt(max(bias, 0.3)))
+            weight = gap * activity_bonus * resilience
+            if unit.role == "emitter":
+                weight *= 1.0 + 0.1 * min(unit.age / 300.0, 1.0)
+            deficits.append({"unit": unit, "gap": gap, "weight": weight})
+
+        active_deficits = [d for d in deficits if d["gap"] > 1e-6 and d["weight"] > 0.0]
+        if not active_deficits:
+            return
+
+        pool_before = self.energy_pool
+
+        def distribute(budget: float, *, cap: float) -> float:
+            if budget <= 1e-6:
+                return 0.0
+            eligible = [d for d in active_deficits if d["gap"] > 1e-6]
+            if not eligible:
+                return 0.0
+
+            eligible.sort(key=lambda item: item["weight"], reverse=True)
+            total_weight = sum(max(d["weight"], 1e-6) for d in eligible)
+            if total_weight <= 0.0:
+                return 0.0
+
+            consumed = 0.0
+            shares = []
+            for data in eligible:
+                weight = max(data["weight"], 1e-6)
+                proportional = budget * (weight / total_weight)
+                share = min(cap, data["gap"], proportional)
+                if share > 0.0:
+                    data["unit"].energy += share
+                    data["gap"] -= share
+                    consumed += share
+                shares.append(max(share, 0.0))
+
+            remaining_budget = budget - consumed
+            if remaining_budget > 1e-6:
+                for idx, data in enumerate(eligible):
+                    if remaining_budget <= 1e-6:
+                        break
+                    if data["gap"] <= 1e-6:
+                        continue
+                    room = max(cap - shares[idx], 0.0)
+                    if room <= 0.0:
+                        continue
+                    extra = min(room, data["gap"], remaining_budget)
+                    if extra <= 0.0:
+                        continue
+                    data["unit"].energy += extra
+                    data["gap"] -= extra
+                    consumed += extra
+                    remaining_budget -= extra
+
+            return consumed
+
+        cap_gap = max(0.0, max_allowable - total_cell_energy)
+        primary_budget = min(self.energy_pool, cap_gap)
+        consumed_primary = distribute(primary_budget, cap=0.25)
+        self.energy_pool -= consumed_primary
+
+        remaining_needy = [d for d in active_deficits if d["gap"] > 1e-6]
+        consumed_secondary = 0.0
+        if remaining_needy and self.energy_pool > 1e-6:
+            stability_budget = min(self.energy_pool, 0.05 * len(remaining_needy))
+            consumed_secondary = distribute(stability_budget, cap=0.1)
+            self.energy_pool -= consumed_secondary
+
+        consumed_total = (pool_before - self.energy_pool)
+        if consumed_total > 1e-6:
+            logger.debug(
+                f"[能量补给] 消耗 {consumed_total:.2f}（主补 {consumed_primary:.2f} / 稳态 {consumed_secondary:.2f}），"
+                f" 剩余池 {self.energy_pool:.2f} → 当前细胞总能量 {self.total_energy():.2f}"
             )
-
-        # —— 额外弱细胞补给（无论总能量是否超限） ——
-        weak_units = [u for u in self.units if u.energy < 0.5]
-        if self.energy_pool > 0.1 and weak_units:
-            per_unit = min(0.2, self.energy_pool / len(weak_units))
-            for u in weak_units:
-                u.energy += per_unit
-                self.energy_pool -= per_unit
-            logger.info(f"[弱细胞补给] 为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     def clone_and_connect(self, parent):
         """
@@ -1620,6 +1708,23 @@ class CogGraph:
                 delattr(u, "is_permanent_explorer")
                 logger.info(f"[开拓者削减] {u.id} 被取消开拓身份。列车人太多啦，下去点下去点。")
 
+    def _compute_emitter_metabolic_scalar(self, unit: CogUnit, *, adjusted_var: float, call_density: float) -> float:
+        bias = max(0.3, float(unit.gene.get("emitter_bias", 1.0)))
+        energy = max(unit.energy, 0.0)
+        preferred = 0.85 + 0.25 * math.sqrt(bias)
+        energy_gap = preferred - energy
+        energy_term = 1.0 - 0.32 * math.tanh(energy_gap)
+        energy_term = max(0.7, min(1.3, energy_term))
+
+        maturity = min(unit.age / 220.0, 1.0)
+        activity = min(call_density, 1.5)
+        stability = 1.0 - min(adjusted_var / (adjusted_var + 1.0), 0.7)
+
+        composite = (0.88 + 0.06 * activity + 0.05 * maturity) * (0.9 + 0.1 * stability)
+        trait_term = 1.0 / math.sqrt(bias)
+        scalar = 0.1 * composite * trait_term * energy_term
+        return max(self._emitter_metabolic_floor, min(self._emitter_metabolic_ceiling, scalar))
+
     def _apply_unit_metabolism(self, unit, unit_input):
         if getattr(unit, "resting", False):
             return
@@ -1633,31 +1738,82 @@ class CogGraph:
         unit.inactive_steps = unit.inactive_steps + 1 if unit.recent_calls == 0 else 0
         unit.current_step = self.current_step
 
-        var = float(unit_input.var(unbiased=False))
+        raw_var = float(unit_input.var(unbiased=False))
         freq = unit.avg_recent_calls
         conn = unit.connection_count
-        call_density = freq / (conn + 1)
+        call_density = min(freq / (conn + 1), 3.0)
         conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
+        conn_strength_sum = min(conn_strength_sum, 6.0)
 
-        dim_scale = 1.0 # if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
-        #     1.0 + 0.5 * ((self.current_step - 3000) / 3000)
-
-        bias_factor = unit.gene.get(f"{unit.role}_bias", 1.0)
-        step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
-        unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
-
-        decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
-                * dim_scale * bias_factor * step_factor * unit_factor
-        # honor 单元自己的 metabolic_rate
-        base_factor = 0.015 if self.current_step < 1000 else 0.030
-        if unit.role == "emitter":
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0) * 0.1
+        if unit.role == "emitter" and raw_var > 0.0:
+            adjusted_var = math.sqrt(raw_var)
         else:
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0)
+            adjusted_var = raw_var
+
+        if unit_input.dim() == 0:
+            feature_dim = 1.0
+        elif unit_input.dim() == 1:
+            feature_dim = float(unit_input.shape[0])
+        else:
+            feature_dim = float(unit_input.shape[-1])
+        feature_dim = max(feature_dim, 1.0)
+
+        dim_baseline = self._role_feature_dim_ema.get(unit.role, 0.0)
+        if dim_baseline <= 0.0:
+            dim_baseline = feature_dim
+
+        dim_scale = math.sqrt(feature_dim / max(dim_baseline, 1.0))
+        dim_scale = max(0.65, min(1.45, dim_scale))
+        updated_baseline = (
+            self._feature_dim_ema_beta * dim_baseline
+            + (1.0 - self._feature_dim_ema_beta) * feature_dim
+        )
+        self._role_feature_dim_ema[unit.role] = max(updated_baseline, 1.0)
+
+        trait_bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+        bias_factor = max(0.6, min(1.4, trait_bias))
+        preferred_energy = 0.75 + 0.2 * math.sqrt(max(trait_bias, 0.3))
+        energy_gap = preferred_energy - float(unit.energy)
+        energy_mod = 1.0 - 0.25 * math.tanh(energy_gap)
+        energy_mod = max(0.65, min(1.35, energy_mod))
+        step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
+        unit_factor = 1.0 + 0.00005 * max(0, len(self.units) - 150)
+
+        adjusted_term = adjusted_var * (0.33 if unit.role == "emitter" else 0.35)
+        decay_base = adjusted_term + call_density * 0.14 + conn_strength_sum * 0.12
+        decay = decay_base * dim_scale * bias_factor * step_factor * unit_factor * energy_mod
+        # honor 单元自己的 metabolic_rate
+        progress = min(max(self.current_step - 500, 0) / 4000.0, 1.0)
+        base_factor = 0.018 + 0.012 * progress
+        if unit.role == "emitter":
+            base_factor += 0.002
+        metabolic_rate = getattr(unit, "metabolic_rate", 1.0)
+        drain = decay * base_factor * metabolic_rate
+        scalar = 1.0
+        if unit.role == "emitter":
+            scalar = self._compute_emitter_metabolic_scalar(
+                unit, adjusted_var=adjusted_var, call_density=call_density
+            )
+            drain *= scalar
+
+        unit.energy -= drain
 
         unit.energy = max(unit.energy, 0.0)
 
-        logger.debug("[代谢] %s var=%.3f conn_sum=%.2f", unit.id, var, conn_strength_sum)
+        rms = float(unit_input.pow(2).mean().sqrt().item()) if unit_input.numel() else 0.0
+        self._update_metabolic_stats(
+            unit.role,
+            input_var=raw_var,
+            adjusted_var=adjusted_var,
+            input_rms=rms,
+            energy=unit.energy,
+            drain=drain,
+            scalar=scalar,
+            dim_scale=dim_scale,
+            feature_dim=feature_dim,
+        )
+
+        logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
 
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
@@ -2437,6 +2593,206 @@ class CogGraph:
 
     # ------------------------------------------------------------------
 
+    def _align_to_hidden_dim(self, tensor: torch.Tensor, *, target: int | None = None) -> torch.Tensor:
+        """
+        把输入张量对齐到 transformer 期望的隐藏维度（processor_hidden_size）。
+        """
+        if tensor.dim() > 1:
+            tensor = tensor.view(-1)
+        dim = tensor.numel()
+        target_dim = target if target is not None else self.processor_hidden_size
+        if dim == target_dim:
+            return tensor
+        if dim > target_dim:
+            return tensor[:target_dim]
+        pad = (0, target_dim - dim)
+        return torch.nn.functional.pad(tensor, pad, value=0.0)
+
+    def _role_outgoing_strength(self, unit: CogUnit) -> float:
+        """计算单元的对外连接强度总和（用于作为加权因子）。"""
+        strengths = self.connections.get(unit.id, {})
+        if not strengths:
+            return 0.0
+        return float(sum(strengths.values()))
+
+    def _role_outgoing_degree(self, unit: CogUnit) -> int:
+        return len(self.connections.get(unit.id, {}))
+
+    def _normalize_weight_tensor(self, values: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
+        total = values.sum()
+        if not torch.isfinite(total) or total.abs() < eps:
+            return torch.full_like(values, 1.0 / max(values.numel(), 1))
+        return values / total
+
+    def _summarize_topology_tensor(self, tensor: torch.Tensor) -> Dict[str, float]:
+        if tensor.numel() == 0:
+            return {"mean": 0.0, "abs_mean": 0.0, "var": 0.0}
+        det = tensor.detach()
+        mean = det.mean()
+        abs_mean = det.abs().mean()
+        var = det.var(unbiased=False)
+        return {
+            "mean": float(mean.item()),
+            "abs_mean": float(abs_mean.item()),
+            "var": float(var.item()),
+        }
+
+    def _record_topology_snapshot(
+        self,
+        role: str,
+        *,
+        weighted_mean: torch.Tensor,
+        degree_mean: torch.Tensor,
+        plain_mean: torch.Tensor,
+        spread: torch.Tensor,
+        std: torch.Tensor,
+        central_mean: torch.Tensor,
+        count: int,
+    ) -> None:
+        self._role_topology_snapshots[role] = {
+            "count": {"mean": float(count), "abs_mean": float(count), "var": 0.0},
+            "weighted_mean": self._summarize_topology_tensor(weighted_mean),
+            "degree_mean": self._summarize_topology_tensor(degree_mean),
+            "plain_mean": self._summarize_topology_tensor(plain_mean),
+            "spread": self._summarize_topology_tensor(spread),
+            "std": self._summarize_topology_tensor(std),
+            "central_mean": self._summarize_topology_tensor(central_mean),
+        }
+
+    def _make_metabolic_bucket(self) -> Dict[str, float]:
+        return {
+            "ema_var": 0.0,
+            "ema_adjusted_var": 0.0,
+            "ema_rms": 0.0,
+            "ema_energy": 0.0,
+            "ema_drain": 0.0,
+            "ema_scalar": 0.0,
+            "ema_dim_scale": 0.0,
+            "ema_feature_dim": 0.0,
+            "last_var": 0.0,
+            "last_adjusted_var": 0.0,
+            "last_rms": 0.0,
+            "last_energy": 0.0,
+            "last_drain": 0.0,
+            "last_scalar": 0.0,
+            "last_dim_scale": 0.0,
+            "last_feature_dim": 0.0,
+            "steps": 0,
+        }
+
+    def _update_metabolic_stats(
+        self,
+        role: str,
+        *,
+        input_var: float,
+        adjusted_var: float,
+        input_rms: float,
+        energy: float,
+        drain: float,
+        scalar: float,
+        dim_scale: float,
+        feature_dim: float,
+    ) -> None:
+        stats = self._role_metabolic_stats.setdefault(role, self._make_metabolic_bucket())
+        beta = self._metabolic_ema_beta
+
+        if stats["steps"] == 0:
+            stats["ema_var"] = input_var
+            stats["ema_adjusted_var"] = adjusted_var
+            stats["ema_rms"] = input_rms
+            stats["ema_energy"] = energy
+            stats["ema_drain"] = drain
+            stats["ema_scalar"] = scalar
+            stats["ema_dim_scale"] = dim_scale
+            stats["ema_feature_dim"] = feature_dim
+        else:
+            inv = 1.0 - beta
+            stats["ema_var"] = beta * stats["ema_var"] + inv * input_var
+            stats["ema_adjusted_var"] = beta * stats["ema_adjusted_var"] + inv * adjusted_var
+            stats["ema_rms"] = beta * stats["ema_rms"] + inv * input_rms
+            stats["ema_energy"] = beta * stats["ema_energy"] + inv * energy
+            stats["ema_drain"] = beta * stats["ema_drain"] + inv * drain
+            stats["ema_scalar"] = beta * stats["ema_scalar"] + inv * scalar
+            stats["ema_dim_scale"] = beta * stats["ema_dim_scale"] + inv * dim_scale
+            stats["ema_feature_dim"] = beta * stats["ema_feature_dim"] + inv * feature_dim
+
+        stats["last_var"] = input_var
+        stats["last_adjusted_var"] = adjusted_var
+        stats["last_rms"] = input_rms
+        stats["last_energy"] = energy
+        stats["last_drain"] = drain
+        stats["last_scalar"] = scalar
+        stats["last_dim_scale"] = dim_scale
+        stats["last_feature_dim"] = feature_dim
+        stats["steps"] += 1
+
+    def get_role_metabolic_snapshot(self, role: str) -> Dict[str, float]:
+        stats = self._role_metabolic_stats.get(role)
+        if not stats:
+            return {}
+        snapshot: Dict[str, float] = {}
+        for key, value in stats.items():
+            if key == "steps":
+                snapshot[key] = int(value)
+            elif isinstance(value, (int, float)):
+                snapshot[key] = float(value)
+        return snapshot
+
+    def _aggregate_role_outputs(
+        self,
+        role: str,
+        stacked: torch.Tensor,
+        strength_weights: torch.Tensor,
+        degree_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        根据连接强度 / 度作为权重，并融合离散度信息。
+        返回与单个单元输出同维度的聚合向量。
+        """
+        if stacked.dim() == 1:
+            stacked = stacked.unsqueeze(0)
+
+        dtype = stacked.dtype
+        device = stacked.device
+
+        s_w = self._normalize_weight_tensor(strength_weights.to(device=device, dtype=dtype))
+        d_w = self._normalize_weight_tensor(degree_weights.to(device=device, dtype=dtype))
+
+        weighted_mean = (s_w.unsqueeze(-1) * stacked).sum(dim=0)
+        degree_mean = (d_w.unsqueeze(-1) * stacked).sum(dim=0)
+        plain_mean = stacked.mean(dim=0)
+        max_vals, _ = stacked.max(dim=0)
+        min_vals, _ = stacked.min(dim=0)
+        spread = max_vals - min_vals
+        std = stacked.var(dim=0, unbiased=False).sqrt()
+
+        central_mean = torch.stack([weighted_mean, degree_mean, plain_mean], dim=0).mean(dim=0)
+        imbalance = (weighted_mean - degree_mean + weighted_mean - plain_mean) * (1.0 / 3.0)
+
+        spread_denom = spread.abs().mean().clamp(min=1e-6)
+        std_denom = std.abs().mean().clamp(min=1e-6)
+        dispersion = 0.5 * (torch.tanh(spread / spread_denom) + torch.tanh(std / std_denom))
+
+        summary = central_mean + 0.35 * dispersion + 0.15 * imbalance
+        summary = self._align_to_hidden_dim(summary)
+
+        self._record_topology_snapshot(
+            role,
+            weighted_mean=weighted_mean,
+            degree_mean=degree_mean,
+            plain_mean=plain_mean,
+            spread=spread,
+            std=std,
+            central_mean=central_mean,
+            count=stacked.shape[0],
+        )
+        return summary
+
+    def get_role_topology_snapshot(self, role: str) -> Dict[str, Dict[str, float]]:
+        """返回指定角色最近一次聚合时的拓扑统计（浮点摘要）。"""
+        stats = self._role_topology_snapshots.get(role, {})
+        return {name: values.copy() for name, values in stats.items()}
+
 
     def sensor_forward(self, env_state_np):
         """
@@ -2447,44 +2803,41 @@ class CogGraph:
         """
         dev = self.device  # ← 统一目标设备
         x = torch.as_tensor(env_state_np, dtype=torch.float32, device=dev).view(-1)
-
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "sensor"):
-            for s in (u for u in self.units if u.role == "sensor"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
-        # —— 对齐到 processor_hidden_size ——
-        D = x.numel()
-        if D < self.processor_hidden_size:
-            pad = (0, self.processor_hidden_size - D)
-            x = torch.nn.functional.pad(x, pad)
-        elif D > self.processor_hidden_size:
-            x = x[: self.processor_hidden_size]
+        x = self._align_to_hidden_dim(x)
 
         sensors = [u for u in self.units if u.get_role() == "sensor"]
         if not sensors:
-            return x            # 无 sensor 时直接返回
+            return x
 
-        if not RF.batch_sensor:  # ← 用 config 统一控制是否 batch 模式
-            for s in sensors:
-                s.update(x.unsqueeze(0))
-            return torch.stack([s.last_output for s in sensors], dim=0).mean(dim=0)
+        outputs = []
+        strengths = []
+        degrees = []
+        active_ids = set()
 
-        # ---- ⚡ 批量前向，仅做前向推理 ----
-        # ① 把 N 份输入堆在一起
-        batch_in = x.unsqueeze(0).repeat(len(sensors), 1)        # [N, D]
+        for sensor in sensors:
+            sensor.update(x.unsqueeze(0))
+            raw = sensor.get_output().detach().to(dev)
+            aligned = self._align_to_hidden_dim(raw)
+            outputs.append(aligned)
+            strengths.append(self._role_outgoing_strength(sensor))
+            degrees.append(float(self._role_outgoing_degree(sensor)))
+            self._last_sensor_outputs[sensor.id] = aligned
+            active_ids.add(sensor.id)
 
-        # ② 用 **首个 sensor 的网络结构** 复制一个临时 net
-        #    假设所有 sensor 都是相同的  Linear → ReLU → Linear
-        net = sensors[0].function
-        batch_out = net(batch_in)                                # [N, D]
+        # 清理已经死亡的 sensor 输出缓存
+        self._last_sensor_outputs = {
+            uid: self._last_sensor_outputs[uid]
+            for uid in active_ids
+        }
 
-        # ③ 分别写回每个 sensor 的 last_output（不调用 update()，
-        #    省掉 split/代谢等逻辑；这些逻辑你已经在 Graph.step() 外部显式调用）
-        for s, o in zip(sensors, batch_out):
-            s.last_output = o.detach()
-
-        return batch_out.mean(dim=0)       # 仍返回合并输出
+        stacked = torch.stack(outputs, dim=0)
+        strength_tensor = stacked.new_tensor(strengths)
+        degree_tensor = stacked.new_tensor(degrees)
+        summary = self._aggregate_role_outputs(
+            "sensor", stacked, strength_tensor, degree_tensor
+        )
+        summary = self._align_to_hidden_dim(summary)
+        return summary
 
 
     def processor_forward(self, sensor_out):
@@ -2496,50 +2849,55 @@ class CogGraph:
         """
         """批量或逐个执行 processor.update()."""
         dev = self.device
-        sensor_out = sensor_out.to(dev)                   # (1,D)
-
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "processor"):
-            for s in (u for u in self.units if u.role == "processor"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
+        sensor_out = self._align_to_hidden_dim(sensor_out.to(dev))
 
         procs = [u for u in self.units if u.role == "processor"]
         if not procs:
             return sensor_out
 
-        D = sensor_out.size(-1)
-        if RF.batch_processor:
-            # -------- 构造批输入 --------
-            batch_in = sensor_out.expand(len(procs), -1)  # [N,D]
+        outputs = []
+        strengths = []
+        degrees = []
+        active_ids = set()
 
-            # -------- 共享一张网络 --------
-            net = procs[0].function
+        for proc in procs:
+            incoming_vecs = []
+            incoming_weights = []
+            for sid, vec in self._last_sensor_outputs.items():
+                if proc.id in self.connections.get(sid, {}):
+                    incoming_vecs.append(vec.to(dev))
+                    incoming_weights.append(self.connections[sid][proc.id])
 
-            ctx = (torch.autocast("cuda", dtype=torch.float16)
-                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
-            with ctx, torch.inference_mode():
-                batch_out = net(batch_in)                 # [N,D]
+            if incoming_vecs:
+                stacked_in = torch.stack(incoming_vecs, dim=0)
+                weight_tensor = stacked_in.new_tensor(incoming_weights)
+                weight_tensor = self._normalize_weight_tensor(weight_tensor)
+                proc_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
+            else:
+                proc_input = sensor_out
 
-            # -------- 回写 last_output --------
-            for u, o in zip(procs, batch_out):
-                u.last_output = o.detach()
-            merged = batch_out.mean(dim=0)
-        else:
-            # 回退：逐个 update
-            outs = []
-            for p in procs:
-                p.update(sensor_out)
-                outs.append(p.get_output().view(-1))
-            merged = torch.stack(outs).mean(dim=0)
+            proc.update(proc_input.unsqueeze(0))
+            raw = proc.get_output().detach().to(dev)
+            aligned = self._align_to_hidden_dim(raw)
+            outputs.append(aligned)
+            strengths.append(self._role_outgoing_strength(proc))
+            degrees.append(float(self._role_outgoing_degree(proc)))
+            self._last_processor_outputs[proc.id] = aligned
+            active_ids.add(proc.id)
 
-        # —— 与旧实现相同的 pad / truncate —— #
-        if merged.numel() < self.processor_hidden_size:
-            merged = torch.nn.functional.pad(
-                merged, (0, self.processor_hidden_size - merged.numel()))
-        else:
-            merged = merged[: self.processor_hidden_size]
-        return merged.to(dev)
+        self._last_processor_outputs = {
+            uid: self._last_processor_outputs[uid]
+            for uid in active_ids
+        }
+
+        stacked = torch.stack(outputs, dim=0)
+        strength_tensor = stacked.new_tensor(strengths)
+        degree_tensor = stacked.new_tensor(degrees)
+        summary = self._aggregate_role_outputs(
+            "processor", stacked, strength_tensor, degree_tensor
+        )
+        summary = self._align_to_hidden_dim(summary)
+        return summary
 
 
     def emitter_forward(self, processor_out):
@@ -2548,30 +2906,56 @@ class CogGraph:
         不要求返回值（若你想调试，可 return 平均输出）。
         """
         dev = self.device
+        processor_vec = self._align_to_hidden_dim(processor_out.to(dev))
         emitters = [u for u in self.units if u.role == "emitter"]
         if not emitters:
             return
 
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "emitter"):
-            for s in (u for u in self.units if u.role == "emitter"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
-        D = processor_out.size(-1)
-        if RF.batch_emitter:
-            batch_in = processor_out.to(dev).expand(len(emitters), -1)  # [N,D]
-            net = emitters[0].function
-            ctx = (torch.autocast("cuda", dtype=torch.float16)
-                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
-            with ctx, torch.inference_mode():
-                batch_out = net(batch_in)
-            for u, o in zip(emitters, batch_out):
-                u.last_output = o.detach()
-        else:
-            inp = processor_out.to(dev).unsqueeze(0)
-            for e in emitters:
-                e.update(inp)
-                e.last_output = e.get_output().detach()
+        emitter_outputs = []
+        emitter_strengths = []
+        emitter_degrees = []
+
+        for emitter in emitters:
+            incoming_vecs = []
+            incoming_weights = []
+            for pid, vec in self._last_processor_outputs.items():
+                if emitter.id in self.connections.get(pid, {}):
+                    incoming_vecs.append(vec.to(dev))
+                    incoming_weights.append(self.connections[pid][emitter.id])
+
+            if incoming_vecs:
+                stacked_in = torch.stack(incoming_vecs, dim=0)
+                weight_tensor = stacked_in.new_tensor(incoming_weights)
+                weight_tensor = self._normalize_weight_tensor(weight_tensor)
+                emitter_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
+            else:
+                emitter_input = processor_vec
+
+            centered = emitter_input - emitter_input.mean()
+            rms = centered.pow(2).mean().sqrt()
+            rms_value = float(rms.item()) if torch.isfinite(rms).item() else 0.0
+            cap = self._emitter_input_rms_cap
+            if rms_value > cap:
+                scale = cap / (rms_value + 1e-6)
+                emitter_input = centered * scale + emitter_input.mean()
+            emitter_input = emitter_input.clamp(
+                min=-self._emitter_input_value_cap, max=self._emitter_input_value_cap
+            )
+
+            emitter.update(emitter_input.unsqueeze(0))
+            last = emitter.get_output().detach()
+            emitter.last_output = last
+            aligned = self._align_to_hidden_dim(last.to(dev))
+            emitter_outputs.append(aligned)
+            emitter_strengths.append(self._role_outgoing_strength(emitter))
+            emitter_degrees.append(float(self._role_outgoing_degree(emitter)))
+
+        if emitter_outputs:
+            stacked = torch.stack(emitter_outputs, dim=0)
+            strength_tensor = stacked.new_tensor(emitter_strengths)
+            degree_tensor = stacked.new_tensor(emitter_degrees)
+            # 仅为更新拓扑快照，emitters 本身不需要返回摘要
+            self._aggregate_role_outputs("emitter", stacked, strength_tensor, degree_tensor)
 
     def _rebuild_free_positions(self):
         """一次性扫描所有格子，生成安全出生点列表"""
