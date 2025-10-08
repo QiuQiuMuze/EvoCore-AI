@@ -209,6 +209,9 @@ class CogGraph:
         self.static_mode = False
         self._orig_metabolic = {}   # 存储进入静吸模式前的速率
         self.static_mode_allowed = False
+        # —— 缓存最近一次各角色的原始输出，供拓扑加权聚合使用 ——
+        self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
+        self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -2437,6 +2440,74 @@ class CogGraph:
 
     # ------------------------------------------------------------------
 
+    def _align_to_hidden_dim(self, tensor: torch.Tensor, *, target: int | None = None) -> torch.Tensor:
+        """
+        把输入张量对齐到 transformer 期望的隐藏维度（processor_hidden_size）。
+        """
+        if tensor.dim() > 1:
+            tensor = tensor.view(-1)
+        dim = tensor.numel()
+        target_dim = target if target is not None else self.processor_hidden_size
+        if dim == target_dim:
+            return tensor
+        if dim > target_dim:
+            return tensor[:target_dim]
+        pad = (0, target_dim - dim)
+        return torch.nn.functional.pad(tensor, pad, value=0.0)
+
+    def _role_outgoing_strength(self, unit: CogUnit) -> float:
+        """计算单元的对外连接强度总和（用于作为加权因子）。"""
+        strengths = self.connections.get(unit.id, {})
+        if not strengths:
+            return 0.0
+        return float(sum(strengths.values()))
+
+    def _role_outgoing_degree(self, unit: CogUnit) -> int:
+        return len(self.connections.get(unit.id, {}))
+
+    def _normalize_weight_tensor(self, values: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
+        total = values.sum()
+        if not torch.isfinite(total) or total.abs() < eps:
+            return torch.full_like(values, 1.0 / max(values.numel(), 1))
+        return values / total
+
+    def _aggregate_role_outputs(
+        self,
+        stacked: torch.Tensor,
+        strength_weights: torch.Tensor,
+        degree_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        根据连接强度 / 度作为权重，并融入极值、方差来保留结构差异。
+        返回与单个单元输出同维度的聚合向量。
+        """
+        if stacked.dim() == 1:
+            return stacked
+
+        dtype = stacked.dtype
+        device = stacked.device
+
+        s_w = self._normalize_weight_tensor(strength_weights.to(device=device, dtype=dtype))
+        d_w = self._normalize_weight_tensor(degree_weights.to(device=device, dtype=dtype))
+
+        weighted_mean = (s_w.unsqueeze(-1) * stacked).sum(dim=0)
+        degree_mean = (d_w.unsqueeze(-1) * stacked).sum(dim=0)
+        plain_mean = stacked.mean(dim=0)
+        max_vals, _ = stacked.max(dim=0)
+        min_vals, _ = stacked.min(dim=0)
+        spread = max_vals - min_vals
+        std = stacked.var(dim=0, unbiased=False).sqrt()
+
+        # 线性组合，强化有结构差异的维度
+        summary = (
+            0.45 * weighted_mean
+            + 0.25 * degree_mean
+            + 0.20 * plain_mean
+            + 0.07 * spread
+            + 0.03 * std
+        )
+        return summary
+
 
     def sensor_forward(self, env_state_np):
         """
@@ -2447,44 +2518,39 @@ class CogGraph:
         """
         dev = self.device  # ← 统一目标设备
         x = torch.as_tensor(env_state_np, dtype=torch.float32, device=dev).view(-1)
-
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "sensor"):
-            for s in (u for u in self.units if u.role == "sensor"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
-        # —— 对齐到 processor_hidden_size ——
-        D = x.numel()
-        if D < self.processor_hidden_size:
-            pad = (0, self.processor_hidden_size - D)
-            x = torch.nn.functional.pad(x, pad)
-        elif D > self.processor_hidden_size:
-            x = x[: self.processor_hidden_size]
+        x = self._align_to_hidden_dim(x)
 
         sensors = [u for u in self.units if u.get_role() == "sensor"]
         if not sensors:
-            return x            # 无 sensor 时直接返回
+            return x
 
-        if not RF.batch_sensor:  # ← 用 config 统一控制是否 batch 模式
-            for s in sensors:
-                s.update(x.unsqueeze(0))
-            return torch.stack([s.last_output for s in sensors], dim=0).mean(dim=0)
+        outputs = []
+        strengths = []
+        degrees = []
+        active_ids = set()
 
-        # ---- ⚡ 批量前向，仅做前向推理 ----
-        # ① 把 N 份输入堆在一起
-        batch_in = x.unsqueeze(0).repeat(len(sensors), 1)        # [N, D]
+        for sensor in sensors:
+            sensor.update(x.unsqueeze(0))
+            raw = sensor.get_output().detach().to(dev)
+            aligned = self._align_to_hidden_dim(raw)
+            outputs.append(aligned)
+            strengths.append(self._role_outgoing_strength(sensor))
+            degrees.append(float(self._role_outgoing_degree(sensor)))
+            self._last_sensor_outputs[sensor.id] = aligned
+            active_ids.add(sensor.id)
 
-        # ② 用 **首个 sensor 的网络结构** 复制一个临时 net
-        #    假设所有 sensor 都是相同的  Linear → ReLU → Linear
-        net = sensors[0].function
-        batch_out = net(batch_in)                                # [N, D]
+        # 清理已经死亡的 sensor 输出缓存
+        self._last_sensor_outputs = {
+            uid: self._last_sensor_outputs[uid]
+            for uid in active_ids
+        }
 
-        # ③ 分别写回每个 sensor 的 last_output（不调用 update()，
-        #    省掉 split/代谢等逻辑；这些逻辑你已经在 Graph.step() 外部显式调用）
-        for s, o in zip(sensors, batch_out):
-            s.last_output = o.detach()
-
-        return batch_out.mean(dim=0)       # 仍返回合并输出
+        stacked = torch.stack(outputs, dim=0)
+        strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
+        degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
+        summary = self._aggregate_role_outputs(stacked, strength_tensor, degree_tensor)
+        summary = self._align_to_hidden_dim(summary)
+        return summary
 
 
     def processor_forward(self, sensor_out):
@@ -2496,50 +2562,53 @@ class CogGraph:
         """
         """批量或逐个执行 processor.update()."""
         dev = self.device
-        sensor_out = sensor_out.to(dev)                   # (1,D)
-
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "processor"):
-            for s in (u for u in self.units if u.role == "processor"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
+        sensor_out = self._align_to_hidden_dim(sensor_out.to(dev))
 
         procs = [u for u in self.units if u.role == "processor"]
         if not procs:
             return sensor_out
 
-        D = sensor_out.size(-1)
-        if RF.batch_processor:
-            # -------- 构造批输入 --------
-            batch_in = sensor_out.expand(len(procs), -1)  # [N,D]
+        outputs = []
+        strengths = []
+        degrees = []
+        active_ids = set()
 
-            # -------- 共享一张网络 --------
-            net = procs[0].function
+        for proc in procs:
+            incoming_vecs = []
+            incoming_weights = []
+            for sid, vec in self._last_sensor_outputs.items():
+                if proc.id in self.connections.get(sid, {}):
+                    incoming_vecs.append(vec.to(dev))
+                    incoming_weights.append(self.connections[sid][proc.id])
 
-            ctx = (torch.autocast("cuda", dtype=torch.float16)
-                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
-            with ctx, torch.inference_mode():
-                batch_out = net(batch_in)                 # [N,D]
+            if incoming_vecs:
+                stacked_in = torch.stack(incoming_vecs, dim=0)
+                weight_tensor = torch.tensor(incoming_weights, device=dev, dtype=stacked_in.dtype)
+                weight_tensor = self._normalize_weight_tensor(weight_tensor)
+                proc_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
+            else:
+                proc_input = sensor_out
 
-            # -------- 回写 last_output --------
-            for u, o in zip(procs, batch_out):
-                u.last_output = o.detach()
-            merged = batch_out.mean(dim=0)
-        else:
-            # 回退：逐个 update
-            outs = []
-            for p in procs:
-                p.update(sensor_out)
-                outs.append(p.get_output().view(-1))
-            merged = torch.stack(outs).mean(dim=0)
+            proc.update(proc_input.unsqueeze(0))
+            raw = proc.get_output().detach().to(dev)
+            aligned = self._align_to_hidden_dim(raw)
+            outputs.append(aligned)
+            strengths.append(self._role_outgoing_strength(proc))
+            degrees.append(float(self._role_outgoing_degree(proc)))
+            self._last_processor_outputs[proc.id] = aligned
+            active_ids.add(proc.id)
 
-        # —— 与旧实现相同的 pad / truncate —— #
-        if merged.numel() < self.processor_hidden_size:
-            merged = torch.nn.functional.pad(
-                merged, (0, self.processor_hidden_size - merged.numel()))
-        else:
-            merged = merged[: self.processor_hidden_size]
-        return merged.to(dev)
+        self._last_processor_outputs = {
+            uid: self._last_processor_outputs[uid]
+            for uid in active_ids
+        }
+
+        stacked = torch.stack(outputs, dim=0)
+        strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
+        degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
+        summary = self._aggregate_role_outputs(stacked, strength_tensor, degree_tensor)
+        summary = self._align_to_hidden_dim(summary)
+        return summary
 
 
     def emitter_forward(self, processor_out):
@@ -2548,30 +2617,29 @@ class CogGraph:
         不要求返回值（若你想调试，可 return 平均输出）。
         """
         dev = self.device
+        processor_vec = self._align_to_hidden_dim(processor_out.to(dev))
         emitters = [u for u in self.units if u.role == "emitter"]
         if not emitters:
             return
 
-        # ① —— 保底：传进来多少，就以 graph.processor_hidden_size 为准 ——
-        if any(u.input_size < self.processor_hidden_size for u in self.units if u.role == "emitter"):
-            for s in (u for u in self.units if u.role == "emitter"):
-                if s.input_size < self.processor_hidden_size:  # 只升不降
-                    self.expand_unit_dim(s, self.processor_hidden_size)
-        D = processor_out.size(-1)
-        if RF.batch_emitter:
-            batch_in = processor_out.to(dev).expand(len(emitters), -1)  # [N,D]
-            net = emitters[0].function
-            ctx = (torch.autocast("cuda", dtype=torch.float16)
-                   if (RF.use_fp16 and dev.type == "cuda") else nullcontext())
-            with ctx, torch.inference_mode():
-                batch_out = net(batch_in)
-            for u, o in zip(emitters, batch_out):
-                u.last_output = o.detach()
-        else:
-            inp = processor_out.to(dev).unsqueeze(0)
-            for e in emitters:
-                e.update(inp)
-                e.last_output = e.get_output().detach()
+        for emitter in emitters:
+            incoming_vecs = []
+            incoming_weights = []
+            for pid, vec in self._last_processor_outputs.items():
+                if emitter.id in self.connections.get(pid, {}):
+                    incoming_vecs.append(vec.to(dev))
+                    incoming_weights.append(self.connections[pid][emitter.id])
+
+            if incoming_vecs:
+                stacked_in = torch.stack(incoming_vecs, dim=0)
+                weight_tensor = torch.tensor(incoming_weights, device=dev, dtype=stacked_in.dtype)
+                weight_tensor = self._normalize_weight_tensor(weight_tensor)
+                emitter_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
+            else:
+                emitter_input = processor_vec
+
+            emitter.update(emitter_input.unsqueeze(0))
+            emitter.last_output = emitter.get_output().detach()
 
     def _rebuild_free_positions(self):
         """一次性扫描所有格子，生成安全出生点列表"""
