@@ -175,6 +175,15 @@ class GridEnvironment:
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
 
+        # 当资源被完全采集后，下一轮需要重新刷新环境，避免 "horizon step"
+        # 在每一步都被立即截断
+        if not self.resources:
+            self.refresh_environment(
+                step=0,
+                explored_cells_count=0,
+                exclude_positions={tuple(self.agent_pos)},
+            )
+
         # 清空标记
         self.visited_map.fill_(False)
         self.known_map.fill_(False)

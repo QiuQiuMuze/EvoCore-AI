@@ -2338,11 +2338,12 @@ class CogGraph:
             is_res_near = HIT_THRESH <= res_dist <= 1.5
             cur_idx = torch.argmax(res_vec).item()
 
+            pred_idx = torch.argmax(pred).item()
+
             hazard = getattr(unit, "current_hazard_xy", None)
             if hazard is not None:
                 hx, hy = hazard
                 hazard_idx = hy * self.env_size + hx
-                pred_idx = torch.argmax(pred).item()
                 is_hz_hit = (pred_idx == hazard_idx)
             else:
                 is_hz_hit = False
