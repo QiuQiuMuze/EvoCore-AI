@@ -2674,7 +2674,6 @@ class CogGraph:
         stats = self._role_topology_snapshots.get(role, {})
         return {name: tensor.clone() for name, tensor in stats.items()}
 
-
     def sensor_forward(self, env_state_np):
         """
         Args:
