@@ -213,7 +213,7 @@ class CogGraph:
         self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         # —— 存储最近一次聚合时的拓扑统计，便于调试与自省 ——
-        self._role_topology_snapshots: Dict[str, Dict[str, torch.Tensor]] = {
+        self._role_topology_snapshots: Dict[str, Dict[str, Dict[str, float]]] = {
             "sensor": {},
             "processor": {},
             "emitter": {},
@@ -225,8 +225,8 @@ class CogGraph:
         }
         self._emitter_input_rms_cap = 1.25
         self._emitter_input_value_cap = 3.5
-        self._emitter_metabolic_scalar_bounds = (0.11, 0.18)
-        self._role_emergency_floor = {"sensor": 8, "processor": 16, "emitter": 8}
+        self._emitter_metabolic_floor = 0.08
+        self._emitter_metabolic_ceiling = 0.24
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1522,45 +1522,109 @@ class CogGraph:
 
     def supply_energy_from_pool(self):
         """
-        每 10 步触发一次：从能量池中为细胞补能。
-        逻辑：
-        - 如果细胞总能量 < max_total_energy * 0.9：
-            → 从 energy_pool 补能，直到池为空或达到90%
-            → 优先补 age > 100 和 energy < 0.5 的细胞
-        - 无论总能量是否超限，都允许每 40 步为弱细胞额外补能（只要池里有）
+        每一步都根据个体属性评估是否需要从能量池补给，避免统一撒网。
+
+        - 首先按角色偏好和当前缺口计算目标能量；仅低于目标的细胞会参与分配。
+        - 若系统总能量仍低于上限的 90%，优先使用能量池填补缺口。
+        - 若总能量已达上限但仍存在低能量细胞，则提供小额稳态补给，防止个体瞬时死亡。
         """
-        if self.current_step % 10 != 0:
+        if not self.units or self.energy_pool <= 1e-6:
             return
 
         total_cell_energy = self.total_energy()
         max_allowable = self.max_total_energy * 0.9
-        to_distribute = max(0.0, min(self.energy_pool, max_allowable - total_cell_energy))
 
-        # ✅ 优先补给老弱细胞（age>100 或 energy<0.5）
-        priority_units = [u for u in self.units if u.energy < 0.5 or u.age > 100]
-        all_units = self.units
+        def _target_energy(unit: CogUnit) -> float:
+            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+            bias = min(max(bias, 0.3), 2.0)
+            base = 0.4 if unit.role != "processor" else 0.45
+            if unit.role == "emitter":
+                base += 0.05
+            return min(1.2, base + 0.18 * bias)
 
-        # —— 主补给逻辑（直到能量达到限制或池为空） ——
-        if to_distribute > 0 and all_units:
-            for unit in priority_units + all_units:
-                if to_distribute <= 0:
-                    break
-                give = min(0.2, to_distribute)
-                unit.energy += give
-                to_distribute -= give
-                self.energy_pool -= give
-            logger.info(
-                f"[主补给] 为 {len(all_units)} 个细胞发放能量，共消耗 {self.energy_pool:.2f} → 当前细胞总能量 {self.total_energy():.2f}"
+        deficits = []
+        for unit in self.units:
+            target = _target_energy(unit)
+            gap = target - float(unit.energy)
+            if gap <= 0.0:
+                continue
+            recent = getattr(unit, "avg_recent_calls", 0.0)
+            activity_bonus = 1.0 + 0.25 * min(recent, 4.0)
+            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+            resilience = 1.0 / max(0.5, math.sqrt(max(bias, 0.3)))
+            weight = gap * activity_bonus * resilience
+            if unit.role == "emitter":
+                weight *= 1.0 + 0.1 * min(unit.age / 300.0, 1.0)
+            deficits.append({"unit": unit, "gap": gap, "weight": weight})
+
+        active_deficits = [d for d in deficits if d["gap"] > 1e-6 and d["weight"] > 0.0]
+        if not active_deficits:
+            return
+
+        pool_before = self.energy_pool
+
+        def distribute(budget: float, *, cap: float) -> float:
+            if budget <= 1e-6:
+                return 0.0
+            eligible = [d for d in active_deficits if d["gap"] > 1e-6]
+            if not eligible:
+                return 0.0
+
+            eligible.sort(key=lambda item: item["weight"], reverse=True)
+            total_weight = sum(max(d["weight"], 1e-6) for d in eligible)
+            if total_weight <= 0.0:
+                return 0.0
+
+            consumed = 0.0
+            shares = []
+            for data in eligible:
+                weight = max(data["weight"], 1e-6)
+                proportional = budget * (weight / total_weight)
+                share = min(cap, data["gap"], proportional)
+                if share > 0.0:
+                    data["unit"].energy += share
+                    data["gap"] -= share
+                    consumed += share
+                shares.append(max(share, 0.0))
+
+            remaining_budget = budget - consumed
+            if remaining_budget > 1e-6:
+                for idx, data in enumerate(eligible):
+                    if remaining_budget <= 1e-6:
+                        break
+                    if data["gap"] <= 1e-6:
+                        continue
+                    room = max(cap - shares[idx], 0.0)
+                    if room <= 0.0:
+                        continue
+                    extra = min(room, data["gap"], remaining_budget)
+                    if extra <= 0.0:
+                        continue
+                    data["unit"].energy += extra
+                    data["gap"] -= extra
+                    consumed += extra
+                    remaining_budget -= extra
+
+            return consumed
+
+        cap_gap = max(0.0, max_allowable - total_cell_energy)
+        primary_budget = min(self.energy_pool, cap_gap)
+        consumed_primary = distribute(primary_budget, cap=0.25)
+        self.energy_pool -= consumed_primary
+
+        remaining_needy = [d for d in active_deficits if d["gap"] > 1e-6]
+        consumed_secondary = 0.0
+        if remaining_needy and self.energy_pool > 1e-6:
+            stability_budget = min(self.energy_pool, 0.05 * len(remaining_needy))
+            consumed_secondary = distribute(stability_budget, cap=0.1)
+            self.energy_pool -= consumed_secondary
+
+        consumed_total = (pool_before - self.energy_pool)
+        if consumed_total > 1e-6:
+            logger.debug(
+                f"[能量补给] 消耗 {consumed_total:.2f}（主补 {consumed_primary:.2f} / 稳态 {consumed_secondary:.2f}），"
+                f" 剩余池 {self.energy_pool:.2f} → 当前细胞总能量 {self.total_energy():.2f}"
             )
-
-        # —— 额外弱细胞补给（无论总能量是否超限） ——
-        weak_units = [u for u in self.units if u.energy < 0.5]
-        if self.energy_pool > 0.1 and weak_units:
-            per_unit = min(0.2, self.energy_pool / len(weak_units))
-            for u in weak_units:
-                u.energy += per_unit
-                self.energy_pool -= per_unit
-            logger.info(f"[弱细胞补给] 为 {len(weak_units)} 个弱细胞补充 {per_unit:.2f} 能量")
 
     def clone_and_connect(self, parent):
         """
@@ -1638,6 +1702,23 @@ class CogGraph:
                 delattr(u, "is_permanent_explorer")
                 logger.info(f"[开拓者削减] {u.id} 被取消开拓身份。列车人太多啦，下去点下去点。")
 
+    def _compute_emitter_metabolic_scalar(self, unit: CogUnit, *, adjusted_var: float, call_density: float) -> float:
+        bias = max(0.3, float(unit.gene.get("emitter_bias", 1.0)))
+        energy = max(unit.energy, 0.0)
+        preferred = 0.85 + 0.25 * math.sqrt(bias)
+        energy_gap = preferred - energy
+        energy_term = 1.0 - 0.32 * math.tanh(energy_gap)
+        energy_term = max(0.7, min(1.3, energy_term))
+
+        maturity = min(unit.age / 220.0, 1.0)
+        activity = min(call_density, 1.5)
+        stability = 1.0 - min(adjusted_var / (adjusted_var + 1.0), 0.7)
+
+        composite = (0.88 + 0.06 * activity + 0.05 * maturity) * (0.9 + 0.1 * stability)
+        trait_term = 1.0 / math.sqrt(bias)
+        scalar = 0.1 * composite * trait_term * energy_term
+        return max(self._emitter_metabolic_floor, min(self._emitter_metabolic_ceiling, scalar))
+
     def _apply_unit_metabolism(self, unit, unit_input):
         if getattr(unit, "resting", False):
             return
@@ -1654,7 +1735,14 @@ class CogGraph:
         raw_var = float(unit_input.var(unbiased=False))
         freq = unit.avg_recent_calls
         conn = unit.connection_count
-        call_density = freq / (conn + 1)
+        call_density = min(freq / (conn + 1), 3.0)
+        conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
+        conn_strength_sum = min(conn_strength_sum, 6.0)
+
+        if unit.role == "emitter" and raw_var > 0.0:
+            adjusted_var = math.sqrt(raw_var)
+        else:
+            adjusted_var = raw_var
 
         outgoing = self.connections.get(unit.id, {})
         conn_strength_sum = 0.0
@@ -1687,20 +1775,31 @@ class CogGraph:
 
         decay = base_decay * trait_factor * reward_factor * age_factor * reserve_factor
 
+        trait_bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+        bias_factor = max(0.6, min(1.4, trait_bias))
+        preferred_energy = 0.75 + 0.2 * math.sqrt(max(trait_bias, 0.3))
+        energy_gap = preferred_energy - float(unit.energy)
+        energy_mod = 1.0 - 0.25 * math.tanh(energy_gap)
+        energy_mod = max(0.65, min(1.35, energy_mod))
         step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
-        unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
-        decay *= step_factor * unit_factor
+        unit_factor = 1.0 + 0.00005 * max(0, len(self.units) - 150)
 
-        base_factor = 0.015 if self.current_step < 1000 else 0.030
+        adjusted_term = adjusted_var * (0.33 if unit.role == "emitter" else 0.35)
+        decay_base = adjusted_term + call_density * 0.14 + conn_strength_sum * 0.12
+        decay = decay_base * dim_scale * bias_factor * step_factor * unit_factor * energy_mod
+        # honor 单元自己的 metabolic_rate
+        progress = min(max(self.current_step - 500, 0) / 4000.0, 1.0)
+        base_factor = 0.018 + 0.012 * progress
+        if unit.role == "emitter":
+            base_factor += 0.002
         metabolic_rate = getattr(unit, "metabolic_rate", 1.0)
         drain = decay * base_factor * metabolic_rate
+        scalar = 1.0
         if unit.role == "emitter":
-            low, high = self._emitter_metabolic_scalar_bounds
-            span = max(high - low, 1e-6)
-            interp = (1.5 - affinity) / 1.0
-            interp = max(0.0, min(1.0, interp))
-            role_scalar = low + span * interp
-            drain *= role_scalar
+            scalar = self._compute_emitter_metabolic_scalar(
+                unit, adjusted_var=adjusted_var, call_density=call_density
+            )
+            drain *= scalar
 
         unit.energy -= drain
 
@@ -1714,24 +1813,10 @@ class CogGraph:
             input_rms=rms,
             energy=unit.energy,
             drain=drain,
+            scalar=scalar,
         )
 
         logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
-
-    def _needs_emergency_repopulation(self, unit: CogUnit) -> bool:
-        floor = self._role_emergency_floor.get(unit.role)
-        if floor is None:
-            return False
-        if unit.role == "sensor":
-            current = self.sensor_count
-        elif unit.role == "processor":
-            current = self.processor_count
-        elif unit.role == "emitter":
-            current = self.emitter_count
-        else:
-            return False
-        return current <= floor
-
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
             recs = unit.recall(state_snapshot, k=5, metric='cosine')
@@ -2547,6 +2632,41 @@ class CogGraph:
             return torch.full_like(values, 1.0 / max(values.numel(), 1))
         return values / total
 
+    def _summarize_topology_tensor(self, tensor: torch.Tensor) -> Dict[str, float]:
+        if tensor.numel() == 0:
+            return {"mean": 0.0, "abs_mean": 0.0, "var": 0.0}
+        det = tensor.detach()
+        mean = det.mean()
+        abs_mean = det.abs().mean()
+        var = det.var(unbiased=False)
+        return {
+            "mean": float(mean.item()),
+            "abs_mean": float(abs_mean.item()),
+            "var": float(var.item()),
+        }
+
+    def _record_topology_snapshot(
+        self,
+        role: str,
+        *,
+        weighted_mean: torch.Tensor,
+        degree_mean: torch.Tensor,
+        plain_mean: torch.Tensor,
+        spread: torch.Tensor,
+        std: torch.Tensor,
+        central_mean: torch.Tensor,
+        count: int,
+    ) -> None:
+        self._role_topology_snapshots[role] = {
+            "count": {"mean": float(count), "abs_mean": float(count), "var": 0.0},
+            "weighted_mean": self._summarize_topology_tensor(weighted_mean),
+            "degree_mean": self._summarize_topology_tensor(degree_mean),
+            "plain_mean": self._summarize_topology_tensor(plain_mean),
+            "spread": self._summarize_topology_tensor(spread),
+            "std": self._summarize_topology_tensor(std),
+            "central_mean": self._summarize_topology_tensor(central_mean),
+        }
+
     def _make_metabolic_bucket(self) -> Dict[str, float]:
         return {
             "ema_var": 0.0,
@@ -2554,11 +2674,13 @@ class CogGraph:
             "ema_rms": 0.0,
             "ema_energy": 0.0,
             "ema_drain": 0.0,
+            "ema_scalar": 0.0,
             "last_var": 0.0,
             "last_adjusted_var": 0.0,
             "last_rms": 0.0,
             "last_energy": 0.0,
             "last_drain": 0.0,
+            "last_scalar": 0.0,
             "steps": 0,
         }
 
@@ -2571,6 +2693,7 @@ class CogGraph:
         input_rms: float,
         energy: float,
         drain: float,
+        scalar: float,
     ) -> None:
         stats = self._role_metabolic_stats.setdefault(role, self._make_metabolic_bucket())
         beta = self._metabolic_ema_beta
@@ -2581,6 +2704,7 @@ class CogGraph:
             stats["ema_rms"] = input_rms
             stats["ema_energy"] = energy
             stats["ema_drain"] = drain
+            stats["ema_scalar"] = scalar
         else:
             inv = 1.0 - beta
             stats["ema_var"] = beta * stats["ema_var"] + inv * input_var
@@ -2588,12 +2712,14 @@ class CogGraph:
             stats["ema_rms"] = beta * stats["ema_rms"] + inv * input_rms
             stats["ema_energy"] = beta * stats["ema_energy"] + inv * energy
             stats["ema_drain"] = beta * stats["ema_drain"] + inv * drain
+            stats["ema_scalar"] = beta * stats["ema_scalar"] + inv * scalar
 
         stats["last_var"] = input_var
         stats["last_adjusted_var"] = adjusted_var
         stats["last_rms"] = input_rms
         stats["last_energy"] = energy
         stats["last_drain"] = drain
+        stats["last_scalar"] = scalar
         stats["steps"] += 1
 
     def get_role_metabolic_snapshot(self, role: str) -> Dict[str, float]:
@@ -2616,23 +2742,11 @@ class CogGraph:
         degree_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        根据连接强度 / 度作为权重，并融入极值、方差来保留结构差异。
+        根据连接强度 / 度作为权重，并融合离散度信息。
         返回与单个单元输出同维度的聚合向量。
         """
         if stacked.dim() == 1:
-            summary = self._align_to_hidden_dim(stacked)
-            zero = torch.zeros_like(summary)
-            self._role_topology_snapshots[role] = {
-                "weighted_mean": summary.detach().clone(),
-                "degree_mean": summary.detach().clone(),
-                "plain_mean": summary.detach().clone(),
-                "spread": zero.clone(),
-                "std": zero.clone(),
-                "central_mean": summary.detach().clone(),
-                "spread_norm": zero.clone(),
-                "std_norm": zero.clone(),
-            }
-            return summary
+            stacked = stacked.unsqueeze(0)
 
         dtype = stacked.dtype
         device = stacked.device
@@ -2649,30 +2763,32 @@ class CogGraph:
         std = stacked.var(dim=0, unbiased=False).sqrt()
 
         central_mean = torch.stack([weighted_mean, degree_mean, plain_mean], dim=0).mean(dim=0)
+        imbalance = (weighted_mean - degree_mean + weighted_mean - plain_mean) * (1.0 / 3.0)
+
         spread_denom = spread.abs().mean().clamp(min=1e-6)
         std_denom = std.abs().mean().clamp(min=1e-6)
-        spread_norm = torch.tanh(spread / spread_denom)
-        std_norm = torch.tanh(std / std_denom)
+        dispersion = 0.5 * (torch.tanh(spread / spread_denom) + torch.tanh(std / std_denom))
 
-        summary = torch.cat([central_mean, spread_norm, std_norm], dim=0)
+        summary = central_mean + 0.35 * dispersion + 0.15 * imbalance
         summary = self._align_to_hidden_dim(summary)
-        # 存下这次的拓扑快照，便于后续分析
-        self._role_topology_snapshots[role] = {
-            "weighted_mean": weighted_mean.detach().clone(),
-            "degree_mean": degree_mean.detach().clone(),
-            "plain_mean": plain_mean.detach().clone(),
-            "spread": spread.detach().clone(),
-            "std": std.detach().clone(),
-            "central_mean": central_mean.detach().clone(),
-            "spread_norm": spread_norm.detach().clone(),
-            "std_norm": std_norm.detach().clone(),
-        }
+
+        self._record_topology_snapshot(
+            role,
+            weighted_mean=weighted_mean,
+            degree_mean=degree_mean,
+            plain_mean=plain_mean,
+            spread=spread,
+            std=std,
+            central_mean=central_mean,
+            count=stacked.shape[0],
+        )
         return summary
 
-    def get_role_topology_snapshot(self, role: str) -> Dict[str, torch.Tensor]:
-        """返回指定角色最近一次聚合时的拓扑统计（clone 后的张量）。"""
+    def get_role_topology_snapshot(self, role: str) -> Dict[str, Dict[str, float]]:
+        """返回指定角色最近一次聚合时的拓扑统计（浮点摘要）。"""
         stats = self._role_topology_snapshots.get(role, {})
-        return {name: tensor.clone() for name, tensor in stats.items()}
+        return {name: values.copy() for name, values in stats.items()}
+
 
     def sensor_forward(self, env_state_np):
         """
@@ -2711,8 +2827,8 @@ class CogGraph:
         }
 
         stacked = torch.stack(outputs, dim=0)
-        strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
-        degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
+        strength_tensor = stacked.new_tensor(strengths)
+        degree_tensor = stacked.new_tensor(degrees)
         summary = self._aggregate_role_outputs(
             "sensor", stacked, strength_tensor, degree_tensor
         )
@@ -2750,7 +2866,7 @@ class CogGraph:
 
             if incoming_vecs:
                 stacked_in = torch.stack(incoming_vecs, dim=0)
-                weight_tensor = torch.tensor(incoming_weights, device=dev, dtype=stacked_in.dtype)
+                weight_tensor = stacked_in.new_tensor(incoming_weights)
                 weight_tensor = self._normalize_weight_tensor(weight_tensor)
                 proc_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
             else:
@@ -2771,8 +2887,8 @@ class CogGraph:
         }
 
         stacked = torch.stack(outputs, dim=0)
-        strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
-        degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
+        strength_tensor = stacked.new_tensor(strengths)
+        degree_tensor = stacked.new_tensor(degrees)
         summary = self._aggregate_role_outputs(
             "processor", stacked, strength_tensor, degree_tensor
         )
@@ -2805,7 +2921,7 @@ class CogGraph:
 
             if incoming_vecs:
                 stacked_in = torch.stack(incoming_vecs, dim=0)
-                weight_tensor = torch.tensor(incoming_weights, device=dev, dtype=stacked_in.dtype)
+                weight_tensor = stacked_in.new_tensor(incoming_weights)
                 weight_tensor = self._normalize_weight_tensor(weight_tensor)
                 emitter_input = (weight_tensor.unsqueeze(-1) * stacked_in).sum(dim=0)
             else:
@@ -2832,8 +2948,8 @@ class CogGraph:
 
         if emitter_outputs:
             stacked = torch.stack(emitter_outputs, dim=0)
-            strength_tensor = torch.tensor(emitter_strengths, device=dev, dtype=stacked.dtype)
-            degree_tensor = torch.tensor(emitter_degrees, device=dev, dtype=stacked.dtype)
+            strength_tensor = stacked.new_tensor(emitter_strengths)
+            degree_tensor = stacked.new_tensor(emitter_degrees)
             # 仅为更新拓扑快照，emitters 本身不需要返回摘要
             self._aggregate_role_outputs("emitter", stacked, strength_tensor, degree_tensor)
 
