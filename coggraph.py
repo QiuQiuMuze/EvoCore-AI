@@ -2337,12 +2337,12 @@ class CogGraph:
             is_res_hit = res_dist < HIT_THRESH
             is_res_near = HIT_THRESH <= res_dist <= 1.5
             cur_idx = torch.argmax(res_vec).item()
+            pred_idx = torch.argmax(pred).item()
 
             hazard = getattr(unit, "current_hazard_xy", None)
             if hazard is not None:
                 hx, hy = hazard
                 hazard_idx = hy * self.env_size + hx
-                pred_idx = torch.argmax(pred).item()
                 is_hz_hit = (pred_idx == hazard_idx)
             else:
                 is_hz_hit = False
@@ -2355,7 +2355,7 @@ class CogGraph:
 
             # === 靠近陷阱后又撤退，触发好奇点切换 ===
             if getattr(unit, "goal_type", "") == "hazard" and hazard is not None:
-                px, py = torch.argmax(pred).item() % self.env_size, torch.argmax(pred).item() // self.env_size
+                px, py = pred_idx % self.env_size, pred_idx // self.env_size
                 hz_dist = math.hypot(px - hx, py - hy)
 
                 prev_dist = getattr(unit, "_last_hazard_dist", float("inf"))
@@ -2401,7 +2401,7 @@ class CogGraph:
 
             hz_dist = float("inf")
             if hazard is not None:
-                px, py = torch.argmax(pred).item() % self.env_size, torch.argmax(pred).item() // self.env_size
+                px, py = pred_idx % self.env_size, pred_idx // self.env_size
                 hz_dist = math.hypot(px - hx, py - hy)
 
             if unit.is_hazard_confirmed and hz_dist > 3.0:
