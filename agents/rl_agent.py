@@ -173,7 +173,13 @@ class RLAgent:
 
         returns_tensor = torch.stack(returns).view(-1)
         advantages_tensor = torch.stack(advantages).view(-1)
-        advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+
+        if advantages_tensor.numel() > 1:
+            advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (
+                advantages_tensor.std(unbiased=False) + 1e-8
+            )
+        else:
+            advantages_tensor = advantages_tensor - advantages_tensor.mean()
         return returns_tensor.detach(), advantages_tensor.detach()
 
     def finish_episode(self, last_state_seq: torch.Tensor | None = None):
