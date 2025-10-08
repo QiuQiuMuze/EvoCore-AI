@@ -23,6 +23,7 @@ import math
 from goal_generator import sample_unvisited, make_onehot
 from collections import Counter
 from self_model import build_self_model
+from energy_policy import EnergyPolicy
 
 
 HIT_THRESH = 0.15          # 越大越宽松
@@ -200,6 +201,7 @@ class CogGraph:
         self.removed_resources_count = 0
         self.removed_hazards_count = 0
         self.active_units = set()
+        self.energy_policy = EnergyPolicy()
         self.connections = {}  # {from_id: {to_id: strength_float}}
         self.unit_map = {}     # {unit_id: CogUnit 实例} 快速索引单元
         self.processor_hidden_size = self.env_size * self.env_size * INPUT_CHANNELS
@@ -388,6 +390,8 @@ class CogGraph:
         if unit.device != self.device:
             unit.to(self.device)
         unit.graph = self
+        if hasattr(unit, "attach_energy_policy"):
+            unit.attach_energy_policy(self.energy_policy)
         # 将单元加入图结构中
         self.units.append(unit)
         self.unit_map[unit.id] = unit
@@ -1288,10 +1292,13 @@ class CogGraph:
             logger.info("[进化] 子系统竞争机制已激活（Subsystem Competition）")
 
         # 🟡 预热补偿（前 500 步）
-        if self.current_step < 500:
+        warmup_bonus = self.energy_policy.warmup_bonus(self.current_step)
+        if warmup_bonus > 0.0:
             for unit in self.units:
-                unit.energy += 0.02
-                logger.debug(f"[预热补偿] {unit.id} 初始阶段获得能量 +0.02")
+                unit.energy += warmup_bonus
+                logger.debug(
+                    f"[预热补偿] {unit.id} 初始阶段获得能量 +{warmup_bonus:.3f}"
+                )
 
         # 🟠 能量税（每 10 步）
         if self.current_step > 200 and self.current_step % 100 == 0:
@@ -1660,16 +1667,18 @@ class CogGraph:
 
             return consumed
 
+        primary_cap, secondary_cap = self.energy_policy.pool_caps()
         cap_gap = max(0.0, max_allowable - total_cell_energy)
         primary_budget = min(self.energy_pool, cap_gap)
-        consumed_primary = distribute(primary_budget, cap=0.25)
+        consumed_primary = distribute(primary_budget, cap=primary_cap)
         self.energy_pool -= consumed_primary
 
         remaining_needy = [d for d in active_deficits if d["gap"] > 1e-6]
         consumed_secondary = 0.0
         if remaining_needy and self.energy_pool > 1e-6:
-            stability_budget = min(self.energy_pool, 0.05 * len(remaining_needy))
-            consumed_secondary = distribute(stability_budget, cap=0.1)
+            stability_factor = self.energy_policy.pool_stability_factor()
+            stability_budget = min(self.energy_pool, stability_factor * len(remaining_needy))
+            consumed_secondary = distribute(stability_budget, cap=secondary_cap)
             self.energy_pool -= consumed_secondary
 
         consumed_total = (pool_before - self.energy_pool)
@@ -1692,6 +1701,8 @@ class CogGraph:
             global_hazards=self.env.hazards,
             free_positions=self.free_positions
         )
+        if hasattr(child, "attach_energy_policy"):
+            child.attach_energy_policy(self.energy_policy)
 
         if getattr(parent, "role", None) == "emitter":
             cap = getattr(parent, "emitter_split_cap", None)
@@ -2362,8 +2373,9 @@ class CogGraph:
             return torch.zeros(unit.input_size).unsqueeze(0)
 
     def reward_emitter_grid_environment(self):
-        decay_threshold = 40  # 超过 30 步未奖励就开始衰减
-        decay_amount = 0.04  # 每步扣能量
+        policy = self.energy_policy
+        decay_threshold = policy.inactivity_threshold()
+        decay_amount = policy.inactivity_decay()
         """基于 emitter 输出，在网格环境中执行资源 / 陷阱 奖励与惩罚逻辑。"""
         outputs = self.collect_emitter_outputs()
         if outputs is None:
@@ -2377,8 +2389,10 @@ class CogGraph:
             pred = torch.argmax(self._align_to_goal_dim(out)).item()
             px, py = pred % self.env_size, pred // self.env_size
             if (px, py) == unit.personal_goal:
-                unit.energy += unit.intrinsic_reward
-                unit.meta.record(action="intrinsic", reward=+unit.intrinsic_reward)
+                intrinsic_bonus = policy.intrinsic_completion_bonus()
+                unit.intrinsic_reward = intrinsic_bonus
+                unit.energy += intrinsic_bonus
+                unit.meta.record(action="intrinsic", reward=+intrinsic_bonus)
                 logger.info("你达到了你好奇的地方，心中充满了决心")
                 unit.visit_counts.setdefault((px, py), 0)
                 unit.visit_counts[(px, py)] += 1
@@ -2447,11 +2461,13 @@ class CogGraph:
                     logger.info(f"[目标切换] emitter {unit.id} 接近陷阱后撤退，发现不对劲，有歹徒要害我！ → 切换为好奇点 {unit.personal_goal}")
 
             if is_hz_hit and (hx, hy) in self.env.hazards:
-                unit.energy -= 0.50
-                unit.meta.record(action=pred_idx, reward=-0.5)
+                hazard_loss, hazard_share = policy.hazard_penalties()
+                unit.energy -= hazard_loss
+                unit.meta.record(action=pred_idx, reward=-hazard_loss)
                 for p in upstream_processors:
-                    p.energy -= 0.4
-                    p.meta.record(action=pred_idx, reward=-0.125)
+                    if hazard_share > 0.0:
+                        p.energy -= hazard_share
+                        p.meta.record(action=pred_idx, reward=-hazard_share)
                 unit.is_hazard_confirmed = True
                 unit.last_action_rewarded = False
                 if self.env.hazards[(hx, hy)] > 0:
@@ -2484,8 +2500,10 @@ class CogGraph:
                 hz_dist = math.hypot(px - hx, py - hy)
 
             if unit.is_hazard_confirmed and hz_dist > 3.0:
-                unit.energy += 0.04
-                unit.meta.record(action=pred_idx, reward=+0.04)
+                escape_bonus = policy.hazard_escape_bonus()
+                if escape_bonus > 0.0:
+                    unit.energy += escape_bonus
+                    unit.meta.record(action=pred_idx, reward=+escape_bonus)
                 unit.is_hazard_confirmed = False
                 unit.last_reward_step = self.current_step
                 unit.last_action_rewarded = True
@@ -2495,16 +2513,21 @@ class CogGraph:
                 continue
 
             if (unit.last_rewarded_target_idx != cur_idx) and (is_res_hit or is_res_near):
-                base_r = max(0.02 * (1.0 - res_dist), 0.0)
-                unit.energy += base_r
-                unit.meta.record(action=cur_idx, reward=+base_r)
-                for p in upstream_processors:
-                    p.energy += base_r * 0.25
-                    p.meta.record(action=cur_idx, reward=+(base_r * 0.25))
+                base_r = policy.resource_base_reward(res_dist)
+                share_ratio = policy.resource_upstream_share()
+                if base_r > 0.0:
+                    unit.energy += base_r
+                    unit.meta.record(action=cur_idx, reward=+base_r)
+                    for p in upstream_processors:
+                        share = base_r * share_ratio
+                        if share > 0.0:
+                            p.energy += share
+                            p.meta.record(action=cur_idx, reward=+share)
 
                 if is_res_hit:
-                    unit.energy += 1.2
-                    unit.meta.record(action=cur_idx, reward=+1.2)
+                    hit_bonus = policy.resource_hit_bonus()
+                    unit.energy += hit_bonus
+                    unit.meta.record(action=cur_idx, reward=+hit_bonus)
                     if self.env.resources[(x_res, y_res)] > 0:
                         self.env.resources[(x_res, y_res)] -= 1
                         if self.env.resources[(x_res, y_res)] == 0:
@@ -2521,6 +2544,11 @@ class CogGraph:
                         del self.env.hazards[far]
                         self.env.update_known_cell(far)
                         self.removed_hazards_by_reward += 1
+                    for p in upstream_processors:
+                        share = hit_bonus * share_ratio
+                        if share > 0.0:
+                            p.energy += share
+                            p.meta.record(action=cur_idx, reward=+share)
                     if getattr(unit, "is_permanent_explorer", False):
                         continue  # 永久探索者不应被重设为资源目标
 
@@ -2539,9 +2567,6 @@ class CogGraph:
                     unit.last_rewarded_target_idx = None
                     unit.linger_steps = 0
                     unit.last_reward_amount = 0.0
-                    for p in upstream_processors:
-                        p.energy += 0.9
-                        p.meta.record(action="cur_idx", reward=+0.9)
 
                 unit.last_rewarded_target_idx = cur_idx
                 unit.last_reward_amount = base_r
@@ -2553,8 +2578,10 @@ class CogGraph:
             if (unit.last_rewarded_target_idx == cur_idx) and res_dist <= 2.0 and self.current_step >= 1500:
                 unit.linger_steps = min(unit.linger_steps + 1, 20)
                 if unit.linger_steps > 3:
-                    unit.energy -= 0.01
-                    unit.meta.record(action=cur_idx, reward=-0.01)
+                    linger_penalty = policy.linger_penalty()
+                    if linger_penalty > 0.0:
+                        unit.energy -= linger_penalty
+                        unit.meta.record(action=cur_idx, reward=-linger_penalty)
                 continue
 
             if (unit.last_rewarded_target_idx == cur_idx) and res_dist > 4.0:
@@ -2567,17 +2594,21 @@ class CogGraph:
             if len(action_indices) >= 3:
                 most_common = max(set(action_indices), key=action_indices.count)
                 if action_indices.count(most_common) > len(action_indices) * 0.9:
-                    unit.energy -= 0.05
-                    unit.meta.record(action="diversity_penalty", reward=-0.05)
+                    penalty = policy.diversity_penalty()
+                    if penalty > 0.0:
+                        unit.energy -= penalty
+                        unit.meta.record(action="diversity_penalty", reward=-penalty)
                 elif len(set(action_indices)) > len(action_indices) * 0.6:
-                    unit.energy += 0.05
-                    unit.meta.record(action="diversity_penalty", reward=+0.05)
+                    bonus = policy.diversity_bonus()
+                    if bonus > 0.0:
+                        unit.energy += bonus
+                        unit.meta.record(action="diversity_penalty", reward=+bonus)
 
             if self.current_step > 1500:
                 inactive_steps = self.current_step - unit.last_reward_step
                 if inactive_steps > decay_threshold:
-                    unit.energy -= decay_amount * 0.1
-                    unit.meta.record(action="round", reward=-(decay_amount * 0.1))
+                    unit.energy -= decay_amount
+                    unit.meta.record(action="round", reward=-decay_amount)
 
                 if (hasattr(unit, "output_positions")
                         and len(unit.output_positions) >= 10
@@ -2585,15 +2616,10 @@ class CogGraph:
                     start = unit.output_positions[0]
                     end = unit.output_positions[-1]
                     manhattan = abs(start[0] - end[0]) + abs(start[1] - end[1])
-                    if 3 <= manhattan < 5:
-                        unit.energy -= 0.08
-                        unit.meta.record(action="move less", reward=-0.08)
-                    elif 6 <= manhattan < 8:
-                        unit.energy -= 0.10
-                        unit.meta.record(action="move less", reward=-0.1)
-                    elif 9 <= manhattan <= 10:
-                        unit.energy -= 0.12
-                        unit.meta.record(action="move less", reward=-0.12)
+                    penalty = policy.movement_penalty(manhattan)
+                    if penalty > 0.0:
+                        unit.energy -= penalty
+                        unit.meta.record(action="move less", reward=-penalty)
 
 
     def _expand_environment_curriculum(self):
