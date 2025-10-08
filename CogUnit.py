@@ -11,6 +11,10 @@ from contextlib import nullcontext       # ★ autocast fallback
 from meta_cognition import MetaCognition
 from memory_unit import MemoryBuffer
 from torch.nn.utils import clip_grad_norm_
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from energy_policy import EnergyPolicy
 
 
 
@@ -110,10 +114,11 @@ class CogUnit:
         # —— 新增 Intrinsic Goal 支持 ——
         self.personal_goal = None            # 当前内在目标 (x,y)
         self.visit_counts = {}               # {(x,y): 次数}
-        self.intrinsic_reward = 1.0         # 达到内在目标奖励能量
+        self.intrinsic_reward = 0.3         # 达到内在目标奖励能量
         # 微型前馈网络（输入维度 → 隐藏维度 → 回到输入维度）
         self.intrinsic_cooldown = 20  # 冷却步数
         self._last_intrinsic_step = -float("inf")
+        self.energy_policy: "EnergyPolicy | None" = None
 
         self.function = torch.nn.Sequential(
             torch.nn.Linear(input_size, hidden_size),
@@ -177,6 +182,12 @@ class CogUnit:
             self.function = self.function.to(memory_format=torch.channels_last)
         if RF.use_fp16 and torch.cuda.is_available():
             self.function = self.function.half()
+
+    def attach_energy_policy(self, policy: "EnergyPolicy | None") -> None:
+        """Attach (or detach) the shared energy policy."""
+        self.energy_policy = policy
+        if policy is not None:
+            self.intrinsic_reward = policy.intrinsic_completion_bonus()
 
     def _init_optimizer(self, lr=None):
         base = lr if lr is not None else getattr(self, "base_lr", 1e-3)
@@ -497,10 +508,17 @@ class CogUnit:
 
         # === 高频调用奖励机制 ===
         avg_recent_calls = getattr(self, "avg_recent_calls", 0.0)
-        if avg_recent_calls >= 4.0 and self.energy > 0.0:
-            self.energy += 0.05
-            # self.meta.record(action="high_freq", reward=+0.04)
-            logger.debug(f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +0.04")
+        policy = getattr(self, "energy_policy", None)
+        bonus = 0.0
+        if policy is not None:
+            bonus = policy.high_frequency_bonus(avg_recent_calls)
+        elif avg_recent_calls >= 4.0:
+            bonus = 0.05
+        if bonus > 0.0 and self.energy > 0.0:
+            self.energy += bonus
+            logger.debug(
+                f"[奖励] {self.id} 平均调用频率 {avg_recent_calls:.2f} → 能量 +{bonus:.4f}"
+            )
 
         # === 输出扰动：模拟早期探索行为（前10步）===
         if hasattr(self, "current_step"):
@@ -514,11 +532,17 @@ class CogUnit:
                 logger.debug(f"[扰动] processor {self.id} 输出加入扰动")
 
         # === ✅ 内部奖励机制 Self-Reward ===
-        self_reward = self.compute_self_reward(input_tensor, self.last_output) * 0.03
-        self.energy += self_reward
-        # self.meta.record(action="self_reward", reward=self_reward)
-        if self_reward > 0:
-            logger.debug(f"[内部奖励] {self.id} 自评奖励 +{self_reward:.4f} 能量 (现有能量 {self.energy:.2f})")
+        raw_self_reward = self.compute_self_reward(input_tensor, self.last_output)
+        delta_energy = (
+            policy.scale_self_reward(raw_self_reward)
+            if policy is not None
+            else raw_self_reward * 0.03
+        )
+        if delta_energy > 0.0:
+            self.energy += delta_energy
+            logger.debug(
+                f"[内部奖励] {self.id} 自评奖励 +{delta_energy:.4f} 能量 (现有能量 {self.energy:.2f})"
+            )
 
         # === ✅ 局部微型学习
         # ---------- 新增【探测-判定-更新目标】----------
