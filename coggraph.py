@@ -212,6 +212,20 @@ class CogGraph:
         # —— 缓存最近一次各角色的原始输出，供拓扑加权聚合使用 ——
         self._last_sensor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
         self._last_processor_outputs: Dict[uuid.UUID, torch.Tensor] = {}
+        # —— 存储最近一次聚合时的拓扑统计，便于调试与自省 ——
+        self._role_topology_snapshots: Dict[str, Dict[str, torch.Tensor]] = {
+            "sensor": {},
+            "processor": {},
+            "emitter": {},
+        }
+        # —— 追踪各角色的代谢趋势（指数滑动平均） ——
+        self._metabolic_ema_beta = 0.85
+        self._role_metabolic_stats: Dict[str, Dict[str, float]] = {
+            role: self._make_metabolic_bucket() for role in ("sensor", "processor", "emitter")
+        }
+        self._emitter_input_rms_cap = 1.25
+        self._emitter_input_value_cap = 3.5
+        self._emitter_metabolic_scalar = 0.08
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1636,11 +1650,16 @@ class CogGraph:
         unit.inactive_steps = unit.inactive_steps + 1 if unit.recent_calls == 0 else 0
         unit.current_step = self.current_step
 
-        var = float(unit_input.var(unbiased=False))
+        raw_var = float(unit_input.var(unbiased=False))
         freq = unit.avg_recent_calls
         conn = unit.connection_count
         call_density = freq / (conn + 1)
         conn_strength_sum = sum(self.connections.get(unit.id, {}).values())
+
+        if unit.role == "emitter" and raw_var > 0.0:
+            adjusted_var = math.sqrt(raw_var)
+        else:
+            adjusted_var = raw_var
 
         dim_scale = 1.0 # if self.current_step < 3000 else 1.5 if self.current_step >= 6000 else \
         #     1.0 + 0.5 * ((self.current_step - 3000) / 3000)
@@ -1649,18 +1668,30 @@ class CogGraph:
         step_factor = 1.0 + 0.00001 * max(0, self.current_step - 2000)
         unit_factor = 1.0 + 0.00008 * max(0, len(self.units) - 150)
 
-        decay = (var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
+        decay = (adjusted_var * 0.35 + call_density * 0.15 + conn_strength_sum * 0.15) \
                 * dim_scale * bias_factor * step_factor * unit_factor
         # honor 单元自己的 metabolic_rate
         base_factor = 0.015 if self.current_step < 1000 else 0.030
+        metabolic_rate = getattr(unit, "metabolic_rate", 1.0)
+        drain = decay * base_factor * metabolic_rate
         if unit.role == "emitter":
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0) * 0.1
-        else:
-            unit.energy -= decay * base_factor * getattr(unit, "metabolic_rate", 1.0)
+            drain *= self._emitter_metabolic_scalar
+
+        unit.energy -= drain
 
         unit.energy = max(unit.energy, 0.0)
 
-        logger.debug("[代谢] %s var=%.3f conn_sum=%.2f", unit.id, var, conn_strength_sum)
+        rms = float(unit_input.pow(2).mean().sqrt().item()) if unit_input.numel() else 0.0
+        self._update_metabolic_stats(
+            unit.role,
+            input_var=raw_var,
+            adjusted_var=adjusted_var,
+            input_rms=rms,
+            energy=unit.energy,
+            drain=drain,
+        )
+
+        logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
 
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
         try:
@@ -2471,8 +2502,70 @@ class CogGraph:
             return torch.full_like(values, 1.0 / max(values.numel(), 1))
         return values / total
 
+    def _make_metabolic_bucket(self) -> Dict[str, float]:
+        return {
+            "ema_var": 0.0,
+            "ema_adjusted_var": 0.0,
+            "ema_rms": 0.0,
+            "ema_energy": 0.0,
+            "ema_drain": 0.0,
+            "last_var": 0.0,
+            "last_adjusted_var": 0.0,
+            "last_rms": 0.0,
+            "last_energy": 0.0,
+            "last_drain": 0.0,
+            "steps": 0,
+        }
+
+    def _update_metabolic_stats(
+        self,
+        role: str,
+        *,
+        input_var: float,
+        adjusted_var: float,
+        input_rms: float,
+        energy: float,
+        drain: float,
+    ) -> None:
+        stats = self._role_metabolic_stats.setdefault(role, self._make_metabolic_bucket())
+        beta = self._metabolic_ema_beta
+
+        if stats["steps"] == 0:
+            stats["ema_var"] = input_var
+            stats["ema_adjusted_var"] = adjusted_var
+            stats["ema_rms"] = input_rms
+            stats["ema_energy"] = energy
+            stats["ema_drain"] = drain
+        else:
+            inv = 1.0 - beta
+            stats["ema_var"] = beta * stats["ema_var"] + inv * input_var
+            stats["ema_adjusted_var"] = beta * stats["ema_adjusted_var"] + inv * adjusted_var
+            stats["ema_rms"] = beta * stats["ema_rms"] + inv * input_rms
+            stats["ema_energy"] = beta * stats["ema_energy"] + inv * energy
+            stats["ema_drain"] = beta * stats["ema_drain"] + inv * drain
+
+        stats["last_var"] = input_var
+        stats["last_adjusted_var"] = adjusted_var
+        stats["last_rms"] = input_rms
+        stats["last_energy"] = energy
+        stats["last_drain"] = drain
+        stats["steps"] += 1
+
+    def get_role_metabolic_snapshot(self, role: str) -> Dict[str, float]:
+        stats = self._role_metabolic_stats.get(role)
+        if not stats:
+            return {}
+        snapshot: Dict[str, float] = {}
+        for key, value in stats.items():
+            if key == "steps":
+                snapshot[key] = int(value)
+            elif isinstance(value, (int, float)):
+                snapshot[key] = float(value)
+        return snapshot
+
     def _aggregate_role_outputs(
         self,
+        role: str,
         stacked: torch.Tensor,
         strength_weights: torch.Tensor,
         degree_weights: torch.Tensor,
@@ -2482,7 +2575,19 @@ class CogGraph:
         返回与单个单元输出同维度的聚合向量。
         """
         if stacked.dim() == 1:
-            return stacked
+            summary = self._align_to_hidden_dim(stacked)
+            zero = torch.zeros_like(summary)
+            self._role_topology_snapshots[role] = {
+                "weighted_mean": summary.detach().clone(),
+                "degree_mean": summary.detach().clone(),
+                "plain_mean": summary.detach().clone(),
+                "spread": zero.clone(),
+                "std": zero.clone(),
+                "central_mean": summary.detach().clone(),
+                "spread_norm": zero.clone(),
+                "std_norm": zero.clone(),
+            }
+            return summary
 
         dtype = stacked.dtype
         device = stacked.device
@@ -2498,16 +2603,31 @@ class CogGraph:
         spread = max_vals - min_vals
         std = stacked.var(dim=0, unbiased=False).sqrt()
 
-        # 线性组合，强化有结构差异的维度
-        summary = (
-            0.45 * weighted_mean
-            + 0.25 * degree_mean
-            + 0.20 * plain_mean
-            + 0.07 * spread
-            + 0.03 * std
-        )
+        central_mean = torch.stack([weighted_mean, degree_mean, plain_mean], dim=0).mean(dim=0)
+        spread_denom = spread.abs().mean().clamp(min=1e-6)
+        std_denom = std.abs().mean().clamp(min=1e-6)
+        spread_norm = torch.tanh(spread / spread_denom)
+        std_norm = torch.tanh(std / std_denom)
+
+        summary = torch.cat([central_mean, spread_norm, std_norm], dim=0)
+        summary = self._align_to_hidden_dim(summary)
+        # 存下这次的拓扑快照，便于后续分析
+        self._role_topology_snapshots[role] = {
+            "weighted_mean": weighted_mean.detach().clone(),
+            "degree_mean": degree_mean.detach().clone(),
+            "plain_mean": plain_mean.detach().clone(),
+            "spread": spread.detach().clone(),
+            "std": std.detach().clone(),
+            "central_mean": central_mean.detach().clone(),
+            "spread_norm": spread_norm.detach().clone(),
+            "std_norm": std_norm.detach().clone(),
+        }
         return summary
 
+    def get_role_topology_snapshot(self, role: str) -> Dict[str, torch.Tensor]:
+        """返回指定角色最近一次聚合时的拓扑统计（clone 后的张量）。"""
+        stats = self._role_topology_snapshots.get(role, {})
+        return {name: tensor.clone() for name, tensor in stats.items()}
 
     def sensor_forward(self, env_state_np):
         """
@@ -2548,7 +2668,9 @@ class CogGraph:
         stacked = torch.stack(outputs, dim=0)
         strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
         degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
-        summary = self._aggregate_role_outputs(stacked, strength_tensor, degree_tensor)
+        summary = self._aggregate_role_outputs(
+            "sensor", stacked, strength_tensor, degree_tensor
+        )
         summary = self._align_to_hidden_dim(summary)
         return summary
 
@@ -2606,7 +2728,9 @@ class CogGraph:
         stacked = torch.stack(outputs, dim=0)
         strength_tensor = torch.tensor(strengths, device=dev, dtype=stacked.dtype)
         degree_tensor = torch.tensor(degrees, device=dev, dtype=stacked.dtype)
-        summary = self._aggregate_role_outputs(stacked, strength_tensor, degree_tensor)
+        summary = self._aggregate_role_outputs(
+            "processor", stacked, strength_tensor, degree_tensor
+        )
         summary = self._align_to_hidden_dim(summary)
         return summary
 
@@ -2621,6 +2745,10 @@ class CogGraph:
         emitters = [u for u in self.units if u.role == "emitter"]
         if not emitters:
             return
+
+        emitter_outputs = []
+        emitter_strengths = []
+        emitter_degrees = []
 
         for emitter in emitters:
             incoming_vecs = []
@@ -2638,8 +2766,31 @@ class CogGraph:
             else:
                 emitter_input = processor_vec
 
+            centered = emitter_input - emitter_input.mean()
+            rms = centered.pow(2).mean().sqrt()
+            rms_value = float(rms.item()) if torch.isfinite(rms).item() else 0.0
+            cap = self._emitter_input_rms_cap
+            if rms_value > cap:
+                scale = cap / (rms_value + 1e-6)
+                emitter_input = centered * scale + emitter_input.mean()
+            emitter_input = emitter_input.clamp(
+                min=-self._emitter_input_value_cap, max=self._emitter_input_value_cap
+            )
+
             emitter.update(emitter_input.unsqueeze(0))
-            emitter.last_output = emitter.get_output().detach()
+            last = emitter.get_output().detach()
+            emitter.last_output = last
+            aligned = self._align_to_hidden_dim(last.to(dev))
+            emitter_outputs.append(aligned)
+            emitter_strengths.append(self._role_outgoing_strength(emitter))
+            emitter_degrees.append(float(self._role_outgoing_degree(emitter)))
+
+        if emitter_outputs:
+            stacked = torch.stack(emitter_outputs, dim=0)
+            strength_tensor = torch.tensor(emitter_strengths, device=dev, dtype=stacked.dtype)
+            degree_tensor = torch.tensor(emitter_degrees, device=dev, dtype=stacked.dtype)
+            # 仅为更新拓扑快照，emitters 本身不需要返回摘要
+            self._aggregate_role_outputs("emitter", stacked, strength_tensor, degree_tensor)
 
     def _rebuild_free_positions(self):
         """一次性扫描所有格子，生成安全出生点列表"""
