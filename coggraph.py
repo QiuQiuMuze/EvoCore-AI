@@ -1527,6 +1527,60 @@ class CogGraph:
                 logger.debug(
                     f"[能量转移] {unit.id} ({role}) 系统过载 → 存入能量池 {contribution:.2f}，保留 {unit.energy:.2f}")
 
+    def _target_energy_for_unit(self, unit: CogUnit) -> float:
+        bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
+        bias = min(max(bias, 0.3), 2.0)
+        base = 0.4 if unit.role != "processor" else 0.45
+        if unit.role == "emitter":
+            base += 0.05
+        return min(1.2, base + 0.18 * bias)
+
+    def _emitter_priority_score(self, unit: CogUnit) -> float:
+        recent = getattr(unit, "avg_recent_calls", 0.0)
+        success = 0.0
+        if hasattr(unit, "meta"):
+            rate = unit.meta.recent_success_rate()
+            if rate is not None:
+                success = rate
+        return 0.6 * recent + 0.25 * success + 0.15 * float(unit.energy)
+
+    def _rapid_emitter_refuel(self):
+        if self.current_step % 5 != 0:
+            return
+        if self.energy_pool <= 1e-6:
+            return
+
+        emitters = [u for u in self.units if u.role == "emitter"]
+        if not emitters:
+            return
+
+        emitters.sort(key=self._emitter_priority_score, reverse=True)
+        top_k = max(1, math.ceil(len(emitters) * 0.7))
+        selected = emitters[:top_k]
+
+        distributed = 0.0
+        for unit in selected:
+            target = max(self._target_energy_for_unit(unit), 0.85)
+            critical = max(0.5, target * 0.85)
+            current = float(unit.energy)
+            if current >= critical:
+                continue
+            gap = target - current
+            if gap <= 1e-6:
+                continue
+            share = min(gap, 0.2, self.energy_pool)
+            if share <= 1e-6:
+                break
+            unit.energy += share
+            self.energy_pool -= share
+            distributed += share
+            if self.energy_pool <= 1e-6:
+                break
+
+        if distributed > 1e-6:
+            logger.debug(
+                f"[Emitter补能] 第 {self.current_step} 步快速补充 {distributed:.3f} 能量，池余 {self.energy_pool:.2f}")
+
     def supply_energy_from_pool(self):
         """
         每一步都根据个体属性评估是否需要从能量池补给，避免统一撒网。
@@ -1541,17 +1595,9 @@ class CogGraph:
         total_cell_energy = self.total_energy()
         max_allowable = self.max_total_energy * 0.9
 
-        def _target_energy(unit: CogUnit) -> float:
-            bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
-            bias = min(max(bias, 0.3), 2.0)
-            base = 0.4 if unit.role != "processor" else 0.45
-            if unit.role == "emitter":
-                base += 0.05
-            return min(1.2, base + 0.18 * bias)
-
         deficits = []
         for unit in self.units:
-            target = _target_energy(unit)
+            target = self._target_energy_for_unit(unit)
             gap = target - float(unit.energy)
             if gap <= 0.0:
                 continue
@@ -1646,6 +1692,16 @@ class CogGraph:
             global_hazards=self.env.hazards,
             free_positions=self.free_positions
         )
+
+        if getattr(parent, "role", None) == "emitter":
+            cap = getattr(parent, "emitter_split_cap", None)
+            if cap is None:
+                cap = random.randint(3, 6)
+                parent.emitter_split_cap = cap
+            parent.emitter_splits_done = getattr(parent, "emitter_splits_done", 0) + 1
+            if parent.emitter_splits_done >= cap:
+                logger.debug(
+                    f"[分裂封顶] {parent.id} 达到 {parent.emitter_splits_done}/{cap} 次限制，后续将作为工作细胞")
 
         self.connect(parent, child)
         self.auto_connect()  # 让新单元主动寻找连接
@@ -1981,6 +2037,7 @@ class CogGraph:
 
     def _perform_system_maintenance(self):
         self.supply_energy_from_pool()
+        self._rapid_emitter_refuel()
 
         if self.current_step > 0 and self.current_step % 40 == 0:
             self.rebalance_cell_types()
