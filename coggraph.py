@@ -223,6 +223,12 @@ class CogGraph:
         self._role_metabolic_stats: Dict[str, Dict[str, float]] = {
             role: self._make_metabolic_bucket() for role in ("sensor", "processor", "emitter")
         }
+        self._role_feature_dim_ema: Dict[str, float] = {
+            "sensor": 0.0,
+            "processor": 0.0,
+            "emitter": 0.0,
+        }
+        self._feature_dim_ema_beta = 0.9
         self._emitter_input_rms_cap = 1.25
         self._emitter_input_value_cap = 3.5
         self._emitter_metabolic_floor = 0.08
@@ -1744,36 +1750,25 @@ class CogGraph:
         else:
             adjusted_var = raw_var
 
-        outgoing = self.connections.get(unit.id, {})
-        conn_strength_sum = 0.0
-        if outgoing:
-            conn_strength_sum = sum(outgoing.values()) / max(len(outgoing), 1)
-
-        affinity = float(unit.gene.get(f"{unit.role}_bias", 1.0))
-        affinity = max(0.5, min(1.5, affinity))
-        trait_factor = math.pow(affinity, -0.6)
-
-        if unit.role == "emitter" and raw_var > 0.0:
-            adjusted_var = 0.6 * math.sqrt(raw_var) + 0.4 * raw_var
+        if unit_input.dim() == 0:
+            feature_dim = 1.0
+        elif unit_input.dim() == 1:
+            feature_dim = float(unit_input.shape[0])
         else:
-            adjusted_var = raw_var
+            feature_dim = float(unit_input.shape[-1])
+        feature_dim = max(feature_dim, 1.0)
 
-        reward_gap = max(0, self.current_step - getattr(unit, "last_reward_step", self.current_step))
-        reward_factor = 1.0 + min(0.45, reward_gap / 600.0)
+        dim_baseline = self._role_feature_dim_ema.get(unit.role, 0.0)
+        if dim_baseline <= 0.0:
+            dim_baseline = feature_dim
 
-        age_factor = 1.0 + min(0.35, unit.age / 1500.0)
-
-        reserve_factor = 0.75 + 0.35 * math.tanh(unit.energy - 1.0)
-        reserve_factor = max(0.45, min(1.15, reserve_factor))
-
-        base_decay = (
-            adjusted_var * 0.34
-            + call_density * 0.18
-            + conn_strength_sum * 0.12
+        dim_scale = math.sqrt(feature_dim / max(dim_baseline, 1.0))
+        dim_scale = max(0.65, min(1.45, dim_scale))
+        updated_baseline = (
+            self._feature_dim_ema_beta * dim_baseline
+            + (1.0 - self._feature_dim_ema_beta) * feature_dim
         )
-        base_decay = max(base_decay, 0.0)
-
-        decay = base_decay * trait_factor * reward_factor * age_factor * reserve_factor
+        self._role_feature_dim_ema[unit.role] = max(updated_baseline, 1.0)
 
         trait_bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
         bias_factor = max(0.6, min(1.4, trait_bias))
@@ -1814,7 +1809,11 @@ class CogGraph:
             energy=unit.energy,
             drain=drain,
             scalar=scalar,
+            dim_scale=dim_scale,
+            feature_dim=feature_dim,
         )
+
+        logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
 
         logger.debug("[代谢] %s var=%.3f adj=%.3f conn_sum=%.2f", unit.id, raw_var, adjusted_var, conn_strength_sum)
     def _finalize_unit_update(self, unit, unit_input, state_snapshot, output_buffer, pending, allow_clone):
@@ -2675,12 +2674,16 @@ class CogGraph:
             "ema_energy": 0.0,
             "ema_drain": 0.0,
             "ema_scalar": 0.0,
+            "ema_dim_scale": 0.0,
+            "ema_feature_dim": 0.0,
             "last_var": 0.0,
             "last_adjusted_var": 0.0,
             "last_rms": 0.0,
             "last_energy": 0.0,
             "last_drain": 0.0,
             "last_scalar": 0.0,
+            "last_dim_scale": 0.0,
+            "last_feature_dim": 0.0,
             "steps": 0,
         }
 
@@ -2694,6 +2697,8 @@ class CogGraph:
         energy: float,
         drain: float,
         scalar: float,
+        dim_scale: float,
+        feature_dim: float,
     ) -> None:
         stats = self._role_metabolic_stats.setdefault(role, self._make_metabolic_bucket())
         beta = self._metabolic_ema_beta
@@ -2705,6 +2710,8 @@ class CogGraph:
             stats["ema_energy"] = energy
             stats["ema_drain"] = drain
             stats["ema_scalar"] = scalar
+            stats["ema_dim_scale"] = dim_scale
+            stats["ema_feature_dim"] = feature_dim
         else:
             inv = 1.0 - beta
             stats["ema_var"] = beta * stats["ema_var"] + inv * input_var
@@ -2713,6 +2720,8 @@ class CogGraph:
             stats["ema_energy"] = beta * stats["ema_energy"] + inv * energy
             stats["ema_drain"] = beta * stats["ema_drain"] + inv * drain
             stats["ema_scalar"] = beta * stats["ema_scalar"] + inv * scalar
+            stats["ema_dim_scale"] = beta * stats["ema_dim_scale"] + inv * dim_scale
+            stats["ema_feature_dim"] = beta * stats["ema_feature_dim"] + inv * feature_dim
 
         stats["last_var"] = input_var
         stats["last_adjusted_var"] = adjusted_var
@@ -2720,6 +2729,8 @@ class CogGraph:
         stats["last_energy"] = energy
         stats["last_drain"] = drain
         stats["last_scalar"] = scalar
+        stats["last_dim_scale"] = dim_scale
+        stats["last_feature_dim"] = feature_dim
         stats["steps"] += 1
 
     def get_role_metabolic_snapshot(self, role: str) -> Dict[str, float]:
