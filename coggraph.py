@@ -1066,51 +1066,52 @@ class CogGraph:
         # Δ 容差（至少相差 Δ_cell 才算“真的多／少”）
         delta_cell = max(1, int(total * TOL_FRAC))
 
+        counts = Counter(u.get_role() for u in self.units)
+        desired = {
+            role: total * IDEAL_RATIO[role] / DENOM
+            for role in IDEAL_RATIO
+        }
+
+        if all(abs(counts.get(role, 0) - desired[role]) < delta_cell for role in IDEAL_RATIO):
+            return
+
         # 本轮最多转换
         max_conv = max(1, int(total * MAX_CONV_FRAC))
         conv_done = 0
 
-        def pick_weakest(units):
-            # ✅ 优先选择年龄在 5-30 的弱细胞（非永生），否则全局选弱者
-            young_candidates = [u for u in self.units if u.get_role() == giver_role and 5 <= u.age <= 30 and not getattr(u, "is_elite", False)]
-            other_candidates = [u for u in units if u not in young_candidates and not getattr(u, "is_elite", False)]
+        def pick_weakest(candidates):
+            if not candidates:
+                return None
+
+            young_candidates = [
+                u for u in candidates
+                if 5 <= u.age <= 30 and not getattr(u, "is_elite", False)
+            ]
+            other_candidates = [
+                u for u in candidates
+                if u not in young_candidates and not getattr(u, "is_elite", False)
+            ]
 
             def sort_key(u):
                 return (u.energy, getattr(u, "avg_recent_calls", 0.0))
 
             if young_candidates:
                 return min(young_candidates, key=sort_key)
-            elif other_candidates:
+            if other_candidates:
                 return min(other_candidates, key=sort_key)
-            else:
-                return None  # 没有可用细胞，返回 None
+            return None  # 没有可用细胞
         # def pick_weakest(units):
         #     return min(units, key=lambda u: (u.energy, getattr(u, "avg_recent_calls", 0.0)))
 
         while conv_done < max_conv:
-            # ── 重新计数
-            young_units = [u for u in self.units if u.age < 240]
-            cnt = Counter(u.get_role() for u in young_units)
-            s_cnt = cnt.get("sensor", 0)
-            p_cnt = cnt.get("processor", 0)
-            e_cnt = cnt.get("emitter", 0)
-
-            desired = {
-                "sensor": total * IDEAL_RATIO["sensor"] / DENOM,
-                "processor": total * IDEAL_RATIO["processor"] / DENOM,
-                "emitter": total * IDEAL_RATIO["emitter"] / DENOM,
-            }
-
-            # ratio & diff
+            # ── 当前差异（全量统计，目标仍基于总数）
             ratio = {
-                "sensor": s_cnt / (desired["sensor"] or 1),
-                "processor": p_cnt / (desired["processor"] or 1),
-                "emitter": e_cnt / (desired["emitter"] or 1),
+                role: counts.get(role, 0) / (desired[role] or 1)
+                for role in IDEAL_RATIO
             }
             diff = {
-                "sensor": s_cnt - desired["sensor"],
-                "processor": p_cnt - desired["processor"],
-                "emitter": e_cnt - desired["emitter"],
+                role: counts.get(role, 0) - desired[role]
+                for role in IDEAL_RATIO
             }
 
             # 1) 满足 ratio>hi 且 diff≥Δ 才算“over”   2) ratio<lo 且 diff≤-Δ 算“under”
@@ -1125,10 +1126,15 @@ class CogGraph:
             receiver_role = min(unders, key=lambda r: diff[r])  # diff 最小(负数)
 
             # 取 giver_role 最弱者
-            cand = [u for u in self.units if u.get_role() == giver_role]
+            cand = [
+                u for u in self.units
+                if u.get_role() == giver_role and not getattr(u, "is_elite", False)
+            ]
             if not cand:
                 break
             unit = pick_weakest(cand)
+            if unit is None:
+                break
 
             # ── 转化
             old = unit.get_role()
@@ -1137,6 +1143,9 @@ class CogGraph:
             unit.energy += 0
             unit.gene[f"{receiver_role}_bias"] = 1.0
             logger.info(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
+
+            counts[old] = max(0, counts.get(old, 0) - 1)
+            counts[receiver_role] = counts.get(receiver_role, 0) + 1
 
             # 清旧连 & 简易新连
             for uid, out_edges in list(self.connections.items()):
@@ -1357,26 +1366,102 @@ class CogGraph:
 
     def _select_clone_parents(self, pending_by_role):
         """
-        从待复制父单元中，按照配额 & 能量/活跃度排序挑出真正允许复制的。
-        若细胞能量超过 3.0，强制允许复制，不受比例限制。
+        按照目标比例挑选允许复制的父单元：
+        - 绝对高能量（≥3.0）的单元可以无条件复制；
+        - 其余单元按 1:2:1 目标比例分配配额，避免结构偏移到 1:1:1。
         """
+
         total_cells = len(self.units)
-        approved = set()
-
         if total_cells <= 15:
+            approved = []
             for lst in pending_by_role.values():
-                approved.update(lst)
-        else:
-            for role, cand in pending_by_role.items():
-                if not cand:
-                    continue
-                young_units = [u for u in self.units if u.role == role and u.age < 240]
-                role_count = len(young_units)
-                cap = max(1, (2 * role_count) // 5)  # 40%
-                cand.sort(key=lambda u: (u.energy, u.avg_recent_calls), reverse=True)
-                approved.update(cand[:cap])
+                approved.extend(lst)
+            return approved
 
-        return list(approved)
+        # —— 按能量 & 活跃度排序候选 ——
+        ranked = {}
+        for role, cand in pending_by_role.items():
+            if not cand:
+                continue
+            ranked[role] = sorted(
+                cand,
+                key=lambda u: (u.energy, getattr(u, "avg_recent_calls", 0.0)),
+                reverse=True,
+            )
+
+        if not ranked:
+            return []
+
+        approved: list[CogUnit] = []
+        global_counts = {
+            "sensor": self.sensor_count,
+            "processor": self.processor_count,
+            "emitter": self.emitter_count,
+        }
+        target_share = {
+            role: IDEAL_RATIO[role] / DENOM
+            for role in IDEAL_RATIO
+        }
+        virtual_total = float(total_cells)
+
+        # —— 高能量单元优先（保持原逻辑兼容） ——
+        FORCE_THRESHOLD = 3.0
+        for role, cand_list in list(ranked.items()):
+            remaining = []
+            for unit in cand_list:
+                if unit.energy >= FORCE_THRESHOLD:
+                    approved.append(unit)
+                    global_counts[role] = global_counts.get(role, 0) + 1
+                    virtual_total += 1
+                else:
+                    remaining.append(unit)
+            if remaining:
+                ranked[role] = remaining
+            else:
+                ranked.pop(role, None)
+
+        # —— 依照比例分配剩余名额 ——
+        def current_share(role: str) -> float:
+            return global_counts.get(role, 0) / max(virtual_total, 1.0)
+
+        MIN_PRESSURE = -0.01  # 允许极小的过量容忍，避免完全停滞
+        while ranked:
+            best_role = None
+            best_score = -float("inf")
+            for role, cand_list in ranked.items():
+                if not cand_list:
+                    continue
+                score = target_share[role] - current_share(role)
+                if score > best_score + 1e-6:
+                    best_score = score
+                    best_role = role
+
+            if best_role is None or best_score < MIN_PRESSURE:
+                break
+
+            unit = ranked[best_role].pop(0)
+            approved.append(unit)
+            global_counts[best_role] = global_counts.get(best_role, 0) + 1
+            virtual_total += 1
+
+            if not ranked[best_role]:
+                ranked.pop(best_role, None)
+
+        # —— 若仍无人获批，则至少保留一个活跃候选，防止整体停滞 ——
+        if not approved:
+            fallback = []
+            for role, cand_list in ranked.items():
+                if cand_list:
+                    unit = cand_list[0]
+                    fallback.append((unit, role))
+            if fallback:
+                unit, _ = max(
+                    fallback,
+                    key=lambda item: (item[0].energy, getattr(item[0], "avg_recent_calls", 0.0)),
+                )
+                approved.append(unit)
+
+        return approved
 
     def _expand_energy_cap_if_needed(self):
         if self.current_step > 0 and self.current_step % 1000 == 0 and self.max_total_energy < 8000:
@@ -1702,6 +1787,11 @@ class CogGraph:
         )
         if hasattr(child, "attach_energy_policy"):
             child.attach_energy_policy(self.energy_policy)
+
+        # 记录父子双方最近一次分裂的步数，防止短时间内重复增殖
+        current_step = getattr(self, "current_step", 0)
+        parent.last_split_step = current_step
+        child.last_split_step = current_step
 
         if getattr(parent, "role", None) == "emitter":
             cap = getattr(parent, "emitter_split_cap", None)

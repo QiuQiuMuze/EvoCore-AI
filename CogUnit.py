@@ -35,6 +35,17 @@ SPLIT_HI_P_TABLE  = { 50: 1.20, 200: 1.15, 500: 1.08, float("inf"): 1.03 }
 TOL_FRAC_SPLIT = 0.05      # 至少差值 Δ≥ceil(total×5 %) （且 ≥1）
 # ===============================================================
 
+# —— 目标细胞比例（与 CogGraph 保持一致）——
+IDEAL_SPLIT_RATIO = {"sensor": 1, "processor": 2, "emitter": 1}
+IDEAL_SPLIT_DENOM = sum(IDEAL_SPLIT_RATIO.values())
+
+# —— 分裂冷却（防止短时间内重复分裂导致结构震荡）——
+ROLE_SPLIT_COOLDOWN = {
+    "sensor": 70,
+    "processor": 60,
+    "emitter": 110,
+}
+
 def _get_hi(table, total):
     """按照总细胞数返回当前阶段的 hi 阈值"""
     for lim, val in table.items():
@@ -99,6 +110,7 @@ class CogUnit:
         self.int_id = self.uuid.int & 0xFFFFFFFF
         self.energy = 1.0               # 初始能量
         self.age = 0                    # 生存步数
+        self.last_split_step = -10**9    # 记录上一次成功分裂的全局步数
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.avg_recent_calls = 0.0
@@ -621,6 +633,23 @@ class CogUnit:
             self.energy += 1
             return True
 
+        # —— 冷却机制：避免几十步就再次分裂，除非当前角色严重短缺 ——
+        now = getattr(self, "current_step", 0)
+        last_split = getattr(self, "last_split_step", -10**9)
+        cooldown = ROLE_SPLIT_COOLDOWN.get(role, 80)
+        total_units = max(1, getattr(self, "global_unit_count", 1))
+        target_count = total_units * IDEAL_SPLIT_RATIO[role] / IDEAL_SPLIT_DENOM
+        current_count = getattr(self, f"global_{role}_count", 0)
+        shortage_margin = max(1.0, total_units * 0.02)
+        severe_shortage = current_count + 0.5 < (target_count - shortage_margin)
+
+        if not severe_shortage:
+            if now - last_split < cooldown:
+                return False
+            min_age = max(12, cooldown // 2)
+            if self.age < min_age:
+                return False
+
         # ===【Split-Gate : 1 : 2 : 1 动态门槛】===========================
         total = getattr(self, "global_unit_count", sensor_count + processor_count + emitter_count)
 
@@ -1085,6 +1114,9 @@ class CogUnit:
         clone_unit._apply_runtime_preferences()
         clone_unit.to(self.device)
         clone_unit._init_optimizer(clone_unit.base_lr)
+
+        # 刚出生的子体在当前步视作已分裂，阻止立刻再次触发 should_split
+        clone_unit.last_split_step = getattr(self, "current_step", 0)
 
         return clone_unit
 
