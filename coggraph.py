@@ -743,9 +743,11 @@ class CogGraph:
         candidates = [(self.unit_map[p], self.unit_map[e]) for ((p, e), _) in calls[:topk]
                       if p in self.unit_map and e in self.unit_map]
 
+        limit = len(candidates)
+
         # 再在这 top-K 里两重比较
-        for i in range(len(candidates)):
-            for j in range(i + 1, topk):
+        for i in range(limit):
+            for j in range(i + 1, limit):
 
                 p1, e1 = candidates[i]
                 p2, e2 = candidates[j]

@@ -276,6 +276,10 @@ class GridEnvironment:
         if self.resources[pos] > 0:
             self.reward_hit_count += 1
             self.agent_energy_gain = 0.1
+            self.resources[pos] -= 1
+            if self.resources[pos] <= 0:
+                self.resources.pop(pos, None)
+            self.update_known_cell(pos)
         else:
             self.agent_energy_gain = 0.0
 
@@ -283,6 +287,7 @@ class GridEnvironment:
         if self.hazards[pos] > 0:
             self.danger_hit_count += 1
             self.agent_energy_penalty = 0.1
+            self.update_known_cell(pos)
         else:
             self.agent_energy_penalty = 0.0
 
@@ -327,7 +332,11 @@ class GridEnvironment:
 
         done = False
         if not self.resources:
-            done = True
+            if self._chunk_index < len(self._resource_chunk_plan) or \
+               self._chunk_index < len(self._hazard_chunk_plan):
+                self._distribute_chunk(exclude_positions={tuple(self.agent_pos)})
+            if not self.resources:
+                done = True
         elif self.max_steps is not None and self.step_count >= self.max_steps:
             done = True
 
