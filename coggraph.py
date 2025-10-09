@@ -246,6 +246,14 @@ class CogGraph:
         if RF.use_shared_tx:
             self._init_shared_tx()  # 第一次建好共享 Tx
 
+    def _mark_connection_used(self, from_id: uuid.UUID | str, to_id: uuid.UUID | str):
+        """记录连接在当前步被使用。"""
+        self.connection_usage[(from_id, to_id)] = self.current_step
+
+    def _clear_connection_usage(self, from_id: uuid.UUID | str, to_id: uuid.UUID | str):
+        """安全移除某条连接的使用记录。"""
+        self.connection_usage.pop((from_id, to_id), None)
+
     # ============================================================
     #                   Shared-Tx 初始化封装
     # ============================================================
@@ -479,12 +487,15 @@ class CogGraph:
         # 从图中移除单元及其连接
         self.units = [u for u in self.units if u.id != unit.id]
         if unit.id in self.connections:
+            for to_id in list(self.connections[unit.id].keys()):
+                self._clear_connection_usage(unit.id, to_id)
             del self.connections[unit.id]
         if unit.id in self.unit_map:
             del self.unit_map[unit.id]
         for k in self.connections:
             if unit.id in self.connections[k]:
                 del self.connections[k][unit.id]
+                self._clear_connection_usage(k, unit.id)
                 self.reverse_connections.get(unit.id, set()).discard(k)
         self._update_global_counts()
 
@@ -524,6 +535,7 @@ class CogGraph:
             )
             del self.connections[from_unit.id][weakest_id]
             self.reverse_connections.get(weakest_id, set()).discard(from_unit.id)
+            self._clear_connection_usage(from_unit.id, weakest_id)
 
             logger.debug(f"[连接替换] {from_unit.id} 移除最弱连接 {weakest_id}")
 
@@ -534,6 +546,7 @@ class CogGraph:
         # 同步维护反向索引
         self.reverse_connections.setdefault(to_unit.id, set()).add(from_unit.id)
         self.edge_dirty = True
+        self._mark_connection_used(from_unit.id, to_unit.id)
 
     def total_energy(self):
         return sum(unit.energy for unit in self.units if unit.age < 240)
@@ -923,12 +936,9 @@ class CogGraph:
                 from_unit, to_unit = conn
                 if to_unit in self.connections.get(from_unit, {}):
                     del self.connections[from_unit][to_unit]  # ✅ 删除 dict 的 key
-                    self.reverse_connections.get(to_unit, set()).discard(from_unit.id)
-
+                    self.reverse_connections.get(to_unit, set()).discard(from_unit)
                 logger.debug(f"[剪枝] 连接 {from_unit} → {to_unit} 被剪掉")
-                # 也删掉 usage记录
-                if conn in self.connection_usage:
-                    del self.connection_usage[conn]
+                self._clear_connection_usage(from_unit, to_unit)
 
             # 强化高效连接（可选：比如增加能量传递权重等）
             for conn in to_strengthen:
@@ -1128,8 +1138,11 @@ class CogGraph:
 
             # 清旧连 & 简易新连
             for uid, out_edges in list(self.connections.items()):
-                out_edges.pop(unit.id, None)
-                self.connection_usage.pop((uid, unit.id), None)
+                if unit.id in out_edges:
+                    out_edges.pop(unit.id, None)
+                    self._clear_connection_usage(uid, unit.id)
+            for to_id in list(self.connections.get(unit.id, {}).keys()):
+                self._clear_connection_usage(unit.id, to_id)
             self.connections[unit.id] = {}
 
             if receiver_role == "processor":
@@ -1472,6 +1485,7 @@ class CogGraph:
                 if self.current_step - last_used > threshold:
                     del self.connections[from_id][to_id]
                     self.reverse_connections.get(to_id, set()).discard(from_id)
+                    self._clear_connection_usage(from_id, to_id)
                     logger.debug(f"[死连接清除] {from_id} → {to_id}")
 
                     # 能量惩罚
@@ -1485,6 +1499,7 @@ class CogGraph:
                     if self.connections[from_id][to_id] < 0.1:
                         del self.connections[from_id][to_id]
                         self.reverse_connections.get(to_id, set()).discard(from_id)
+                        self._clear_connection_usage(from_id, to_id)
                         logger.debug(f"[连接衰减清除] {from_id} → {to_id}")
 
     def handle_energy_overflow(self) -> object:
@@ -2387,9 +2402,10 @@ class CogGraph:
             for uid in incoming:
                 if unit.id not in self.connections.get(uid, {}):
                     continue
-                strength = self.connections[uid][unit.id]
                 if uid not in self.unit_map:
                     continue  # 已被删除的单元，跳过
+                strength = self.connections[uid][unit.id]
+                self._mark_connection_used(uid, unit.id)
                 output = self.unit_map[uid].get_output().squeeze(0)
                 target_len = self.processor_hidden_size
                 if output.shape[0] != target_len:
