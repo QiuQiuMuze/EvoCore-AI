@@ -63,6 +63,17 @@ class GridEnvironment:
         self.explored_cells_count = 0
         self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
 
+        # 记忆保留 & 反馈追踪
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
+        self._last_cycle_reward_hits = 0
+        self._last_cycle_danger_hits = 0
+        self._last_cycle_success_ratio = 0.5
+        self._last_cycle_exploration_ratio = 0.0
+        self.map_retention = 0.65
+        self.knowledge_retention = 0.75
+        self._hazard_contact_timer = 0
+
         # 初始化探索标记和状态缓冲
         self._init_buffers()
 
@@ -70,9 +81,6 @@ class GridEnvironment:
         exclude = {tuple(self.agent_pos)}
         self.refresh_environment(step=0, explored_cells_count=0, exclude_positions=exclude)
         self.reset()
-
-        self.reward_hit_count = 0
-        self.danger_hit_count = 0
 
     def _init_buffers(self):
         shape = (self.size, self.size)
@@ -93,6 +101,98 @@ class GridEnvironment:
             plan[idx % chunks] += 1
         return plan
 
+    def _apply_retention_mask(self, tensor: torch.Tensor, retention: float) -> None:
+        if retention >= 1.0:
+            return
+        if retention <= 0.0:
+            tensor.fill_(False)
+            return
+        drop_mask = torch.rand(tensor.shape, device=tensor.device) > retention
+        tensor[drop_mask] = False
+
+    def _apply_memory_retention(self) -> None:
+        self._apply_retention_mask(self.visited_map, self.map_retention)
+        self._apply_retention_mask(self.known_map, self.knowledge_retention)
+        self._apply_retention_mask(self.detected_resources_map, self.knowledge_retention)
+        self._apply_retention_mask(self.detected_hazards_map, self.knowledge_retention)
+        ax, ay = self.agent_pos
+        if self._in_bounds(ax, ay):
+            self.visited_map[ay, ax] = True
+            self.known_map[ay, ax] = True
+        self.explored_cells_count = int(self.visited_map.sum().item())
+
+    def _sample_weighted_positions(
+        self,
+        count: int,
+        *,
+        blocked: set[tuple[int, int]],
+        frontier_weight: float,
+        revisit_weight: float,
+    ) -> list[tuple[int, int]]:
+        if count <= 0:
+            return []
+
+        blocked = set(blocked)
+        visited_cpu = self.visited_map.detach().to("cpu")
+        known_cpu = self.known_map.detach().to("cpu")
+        frontier: list[tuple[int, int]] = []
+        fresh: list[tuple[int, int]] = []
+        familiar: list[tuple[int, int]] = []
+
+        for y in range(self.size):
+            for x in range(self.size):
+                pos = (x, y)
+                if pos in blocked:
+                    continue
+                visited = bool(visited_cpu[y, x].item())
+                known = bool(known_cpu[y, x].item())
+                if not visited and known:
+                    frontier.append(pos)
+                elif not visited:
+                    fresh.append(pos)
+                else:
+                    familiar.append(pos)
+
+        if not frontier and not fresh and not familiar:
+            return []
+
+        weighted: list[tuple[int, int]] = []
+        frontier_multiplier = max(1, int(round(frontier_weight * 2)))
+        fresh_multiplier = max(1, int(round(frontier_weight)))
+        familiar_multiplier = max(1, int(round(revisit_weight)))
+
+        for pos in frontier:
+            weighted.extend([pos] * frontier_multiplier)
+        for pos in fresh:
+            weighted.extend([pos] * fresh_multiplier)
+        for pos in familiar:
+            weighted.extend([pos] * familiar_multiplier)
+
+        random.shuffle(weighted)
+
+        selected: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for pos in weighted:
+            if pos in seen:
+                continue
+            selected.append(pos)
+            seen.add(pos)
+            if len(selected) >= count:
+                break
+
+        return selected
+
+    def _trim_points(self, counter: Counter, remove_count: int) -> None:
+        if remove_count <= 0:
+            return
+        keys = list(counter.keys())
+        if not keys:
+            return
+        random.shuffle(keys)
+        for pos in keys[:remove_count]:
+            counter.pop(pos, None)
+            self.update_known_cell(pos)
+
     def _distribute_chunk(self, exclude_positions: set | None = None):
         if self._chunk_index >= len(self._resource_chunk_plan):
             return
@@ -100,32 +200,22 @@ class GridEnvironment:
         exclude_positions = set(exclude_positions or set())
         exclude_positions.add(tuple(self.agent_pos))
 
-        def _sample_positions(count: int, blocked: set[tuple[int, int]]):
-            if count <= 0:
-                return []
-            candidates = [
-                (x, y)
-                for x in range(self.size)
-                for y in range(self.size)
-                if (x, y) not in blocked
-            ]
-            if not candidates:
-                return []
-            random.shuffle(candidates)
-            return candidates[: min(count, len(candidates))]
-
         resource_blocked = exclude_positions | set(self.resources.keys())
-        new_resources = _sample_positions(
+        new_resources = self._sample_weighted_positions(
             self._resource_chunk_plan[self._chunk_index],
-            resource_blocked,
+            blocked=resource_blocked,
+            frontier_weight=1.6,
+            revisit_weight=1.0,
         )
         for pos in new_resources:
             self.resources[pos] = 1
 
         hazard_blocked = exclude_positions | set(self.hazards.keys())
-        new_hazards = _sample_positions(
+        new_hazards = self._sample_weighted_positions(
             self._hazard_chunk_plan[self._chunk_index],
-            hazard_blocked,
+            blocked=hazard_blocked,
+            frontier_weight=2.2,
+            revisit_weight=0.8,
         )
         for pos in new_hazards:
             self.hazards[pos] = 1
@@ -135,26 +225,57 @@ class GridEnvironment:
 
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
-        extra = min(100, max(((self.step_count - 1500) // 250), 0))
 
-        # 资源点 & 危险点的周期计划
-        total_res = int(self.size * self.size / 5) + extra
-        total_haz = int(self.size * self.size / 3) + extra
-        self.resources.clear()
-        self.hazards.clear()
-        self._resource_chunk_plan = self._build_chunk_plan(total_res)
-        self._hazard_chunk_plan = self._build_chunk_plan(total_haz)
+        area = max(1, self.size * self.size)
+        explored_ratio = explored_cells_count / area if explored_cells_count is not None else self.explored_cells_count / area
+        explored_ratio = float(max(0.0, min(1.0, explored_ratio)))
+
+        reward_hits = getattr(self, "reward_hit_count", 0)
+        danger_hits = getattr(self, "danger_hit_count", 0)
+        total_hits = reward_hits + danger_hits
+        if total_hits > 0:
+            success_ratio = reward_hits / total_hits
+        else:
+            success_ratio = getattr(self, "_last_cycle_success_ratio", 0.5)
+        success_ratio = float(max(0.0, min(1.0, success_ratio)))
+
+        self._last_cycle_reward_hits = reward_hits
+        self._last_cycle_danger_hits = danger_hits
+        self._last_cycle_success_ratio = success_ratio
+        self._last_cycle_exploration_ratio = explored_ratio
+        self.reward_hit_count = 0
+        self.danger_hit_count = 0
+
+        self._apply_memory_retention()
+
+        extra = min(80, max(((self.step_count - 1200) // 300), 0))
+        base_resource_density = 0.18
+        growth_factor = 0.75 + 0.45 * explored_ratio
+        resource_target = int(area * base_resource_density * growth_factor)
+        resource_target += int(extra * (0.5 + 0.5 * success_ratio))
+
+        base_hazard_density = 0.22
+        hazard_adjust = 1.0 - 0.6 * (0.5 - success_ratio)
+        hazard_adjust = max(0.7, min(1.25, hazard_adjust))
+        caution_factor = 0.9 + 0.2 * (1.0 - explored_ratio)
+        hazard_density = base_hazard_density * hazard_adjust * caution_factor
+        hazard_density = max(0.14, min(0.28, hazard_density))
+        hazard_target = int(area * hazard_density)
+        hazard_target += int(extra * (0.6 + 0.4 * (1.0 - success_ratio)))
+
+        self._trim_points(self.resources, max(0, len(self.resources) - resource_target))
+        self._trim_points(self.hazards, max(0, len(self.hazards) - hazard_target))
+
+        to_add_res = max(0, resource_target - len(self.resources))
+        to_add_haz = max(0, hazard_target - len(self.hazards))
+
+        self._resource_chunk_plan = self._build_chunk_plan(to_add_res)
+        self._hazard_chunk_plan = self._build_chunk_plan(to_add_haz)
         self._chunk_index = 0
         self._cycle_anchor_step = step
 
-        # 清空探索标记
-        self.visited_map.fill_(False)
-        self.known_map.fill_(False)
-        self.detected_resources_map.fill_(False)
-        self.detected_hazards_map.fill_(False)
-        self.explored_cells_count = 0
+        self._sense_environment()
 
-        # 立即分配第一批
         self._distribute_chunk(exclude_positions=exclude_positions)
         self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
         self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
@@ -229,6 +350,7 @@ class GridEnvironment:
         self.step_count = 0
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
+        self._hazard_contact_timer = 0
 
         # 当资源被完全采集后，下一轮需要重新刷新环境，避免 "horizon step"
         # 在每一步都被立即截断
@@ -291,6 +413,11 @@ class GridEnvironment:
         else:
             self.agent_energy_penalty = 0.0
 
+        if self.agent_energy_penalty > 0.0:
+            self._hazard_contact_timer = 4
+        elif self._hazard_contact_timer > 0:
+            self._hazard_contact_timer -= 1
+
         # 感知更新（移动后立即刷新可见区域）
         self._sense_environment()
 
@@ -313,19 +440,31 @@ class GridEnvironment:
         base = self.agent_energy_gain - self.agent_energy_penalty
         dist_res = self.distance_to_nearest_known_resource(pos)
         delta_res = self.prev_dist_resource - dist_res
-        resource_shaping = 0.001 if delta_res > 0 else (-0.001 if delta_res < 0 else 0.0)
+        if delta_res > 0:
+            resource_shaping = 0.0015
+        elif delta_res < 0:
+            resource_shaping = -0.0005
+        else:
+            resource_shaping = 0.0
         self.prev_dist_resource = dist_res
 
         danger_dist = self.distance_to_nearest_known_danger(pos)
         delta_danger = self.prev_danger_dist - danger_dist
-        danger_shaping = 0.001 if delta_danger > 0 else (-0.001 if delta_danger < 0 else 0.0)
+        if delta_danger > 0:
+            danger_shaping = 0.0015
+            if self._hazard_contact_timer > 0:
+                danger_shaping += 0.0015
+        elif delta_danger < 0:
+            danger_shaping = -0.001
+        else:
+            danger_shaping = 0.0
         self.prev_danger_dist = danger_dist
 
         explore_bonus = 0.0
         if not self.visited_map[y, x]:
             self.visited_map[y, x] = True
             self.explored_cells_count += 1
-            explore_bonus = 0.0001
+            explore_bonus = 0.0012
 
         reward = base + resource_shaping + danger_shaping + explore_bonus
         next_state = self.get_state()

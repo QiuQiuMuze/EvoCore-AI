@@ -2636,6 +2636,15 @@ class CogGraph:
                         unit.energy -= penalty
                         unit.meta.record(action="move less", reward=-penalty)
 
+        if hasattr(policy, "update_environment_feedback"):
+            policy.update_environment_feedback(
+                reward_hits=self.env.reward_hit_count,
+                danger_hits=self.env.danger_hit_count,
+                processor_count=self.processor_count,
+                emitter_count=self.emitter_count,
+                exploration_ratio=getattr(self.env, "_last_cycle_exploration_ratio", None),
+                last_cycle_success=getattr(self.env, "_last_cycle_success_ratio", None),
+            )
 
     def _expand_environment_curriculum(self):
         if self.current_step >= 1000 and self.current_step % 1000 == 0:

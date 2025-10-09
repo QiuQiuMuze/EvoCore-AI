@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -15,11 +15,11 @@ class EnergyConfig:
     high_freq_bonus: float = 0.025
     self_reward_scale: float = 0.018
     intrinsic_goal_bonus: float = 0.34
-    hazard_penalty: float = 0.38
-    hazard_processor_penalty: float = 0.14
-    hazard_escape_bonus: float = 0.05
-    resource_base_scale: float = 0.16
-    resource_hit_bonus: float = 0.75
+    hazard_penalty: float = 0.33
+    hazard_processor_penalty: float = 0.11
+    hazard_escape_bonus: float = 0.06
+    resource_base_scale: float = 0.18
+    resource_hit_bonus: float = 0.72
     resource_upstream_share: float = 0.24
     linger_penalty: float = 0.006
     monotony_penalty: float = 0.03
@@ -43,6 +43,9 @@ class EnergyPolicy:
 
     def __init__(self, config: EnergyConfig | None = None) -> None:
         self.config = config or EnergyConfig()
+        self._resource_share = self.config.resource_upstream_share
+        self._hazard_escape = self.config.hazard_escape_bonus
+        self._success_ratio = 0.5
 
     # ----- warmup / upkeep -------------------------------------------------
     def warmup_bonus(self, step: int) -> float:
@@ -66,10 +69,13 @@ class EnergyPolicy:
 
     # ----- hazards ---------------------------------------------------------
     def hazard_penalties(self) -> Tuple[float, float]:
-        return (self.config.hazard_penalty, self.config.hazard_processor_penalty)
+        success = float(max(0.0, min(1.0, self._success_ratio)))
+        primary = self.config.hazard_penalty * (0.85 + 0.3 * success)
+        secondary = self.config.hazard_processor_penalty * (0.75 + 0.4 * success)
+        return (primary, secondary)
 
     def hazard_escape_bonus(self) -> float:
-        return self.config.hazard_escape_bonus
+        return self._hazard_escape
 
     # ----- resources -------------------------------------------------------
     def resource_base_reward(self, proximity: float) -> float:
@@ -80,7 +86,42 @@ class EnergyPolicy:
         return self.config.resource_hit_bonus
 
     def resource_upstream_share(self) -> float:
-        return self.config.resource_upstream_share
+        return self._resource_share
+
+    def update_environment_feedback(
+        self,
+        *,
+        reward_hits: int,
+        danger_hits: int,
+        processor_count: int,
+        emitter_count: int,
+        exploration_ratio: Optional[float] = None,
+        last_cycle_success: Optional[float] = None,
+    ) -> None:
+        total = max(1, reward_hits + danger_hits)
+        success = reward_hits / total
+        if last_cycle_success is not None:
+            success = 0.7 * success + 0.3 * float(last_cycle_success)
+        self._success_ratio = float(max(0.0, min(1.0, success)))
+
+        danger_pressure = 1.0 - self._success_ratio
+        base_share = self.config.resource_upstream_share * (1.0 + 0.25 * danger_pressure)
+
+        balance = processor_count / max(1, emitter_count)
+        balance = float(max(0.2, min(balance, 3.0)))
+        if balance < 1.0:
+            base_share *= 1.0 + (1.0 - balance) * 0.35
+        else:
+            base_share *= 1.0 - min(balance - 1.0, 1.5) * 0.2
+
+        if exploration_ratio is not None:
+            ratio = float(max(0.0, min(1.0, exploration_ratio)))
+            base_share *= 0.9 + 0.2 * ratio
+
+        self._resource_share = float(min(max(base_share, 0.16), 0.36))
+
+        escape = self.config.hazard_escape_bonus * (1.0 + 0.6 * danger_pressure)
+        self._hazard_escape = float(min(max(escape, self.config.hazard_escape_bonus * 0.8), self.config.hazard_escape_bonus * 1.8))
 
     # ----- behavioural penalties ------------------------------------------
     def linger_penalty(self) -> float:
@@ -133,6 +174,9 @@ class EnergyPolicy:
             "resource_base_scale": self.config.resource_base_scale,
             "resource_hit_bonus": self.config.resource_hit_bonus,
             "resource_upstream_share": self.config.resource_upstream_share,
+            "dynamic_resource_share": self._resource_share,
+            "dynamic_hazard_escape_bonus": self._hazard_escape,
+            "dynamic_success_ratio": self._success_ratio,
             "linger_penalty": self.config.linger_penalty,
             "monotony_penalty": self.config.monotony_penalty,
             "monotony_bonus": self.config.monotony_bonus,
