@@ -878,7 +878,7 @@ class CogUnit:
                 return False
 
         # 平均调用频率太低（仅针对 emitter）
-        if self.role in ["emitter"] and self.inactive_steps > 20:
+        if self.role in ["emitter"] and self.inactive_steps > 100:
             return True
 
         # 输出完全重复（仅针对 processor 和 emitter）

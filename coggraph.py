@@ -209,6 +209,8 @@ class CogGraph:
                                        device=self.device)
         self.steps_since_last_reward = 0
         self.static_mode = False
+        self.static_mode_entry_step = None
+        self.static_mode_max_duration = 200
         self._orig_metabolic = {}   # 存储进入静吸模式前的速率
         self.static_mode_allowed = False
         self._static_mode_forbid_step = 0
@@ -1993,12 +1995,14 @@ class CogGraph:
                 u.metabolic_rate = 0.0  # 上游 processor/sensor 不消耗
 
         self.static_mode = True
+        self.static_mode_entry_step = self.current_step
 
     # —— 4) 退出静吸模式 —— #
     def _exit_static_mode(self):
         logger.warning("每日刷新了，集美们动起来动起来")
         self.static_mode = False
         self.static_mode_exit_step = self.current_step  # ✅ 记录当前步数
+        self.static_mode_entry_step = None
         for u in self.units:
             # 如果这个单元进入了 resting，它才应该有一个原始 metabolic_rate
             if u.id in self._orig_metabolic:
@@ -2061,7 +2065,20 @@ class CogGraph:
 
         self._perform_system_maintenance()
 
+        self._check_static_timeout()
+
         return
+
+    def _check_static_timeout(self):
+        if not self.static_mode:
+            return
+        if self.static_mode_entry_step is None:
+            return
+        if self.current_step - self.static_mode_entry_step < self.static_mode_max_duration:
+            return
+        logger.warning("[静息模式] 已连续休息 %d 步，强制苏醒", self.static_mode_max_duration)
+        self.steps_since_last_reward = 0
+        self._exit_static_mode()
 
     def _perform_system_maintenance(self):
         self.supply_energy_from_pool()
