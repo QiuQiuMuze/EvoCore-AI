@@ -46,6 +46,14 @@ class GridEnvironment:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.sensor_range = max(0, sensor_range)
 
+        # 环境刷新调度
+        self.refresh_cycle_steps = 1000
+        self.refresh_chunk_steps = 200
+        self._cycle_anchor_step = 0
+        self._resource_chunk_plan: list[int] = []
+        self._hazard_chunk_plan: list[int] = []
+        self._chunk_index = 0
+
         # 经验点和危险点
         self.resources = Counter()
         self.hazards = Counter()
@@ -75,24 +83,69 @@ class GridEnvironment:
         self._state_buf = torch.zeros((5, self.size, self.size), dtype=torch.float32, device=self.device)
         self.explored_cells_count = 0
 
+    def _build_chunk_plan(self, total_count: int) -> list[int]:
+        if self.refresh_chunk_steps <= 0:
+            return [total_count]
+        chunks = max(1, self.refresh_cycle_steps // self.refresh_chunk_steps)
+        base, remainder = divmod(total_count, chunks)
+        plan = [base] * chunks
+        for idx in range(remainder):
+            plan[idx % chunks] += 1
+        return plan
+
+    def _distribute_chunk(self, exclude_positions: set | None = None):
+        if self._chunk_index >= len(self._resource_chunk_plan):
+            return
+
+        exclude_positions = set(exclude_positions or set())
+        exclude_positions.add(tuple(self.agent_pos))
+
+        def _sample_positions(count: int, blocked: set[tuple[int, int]]):
+            if count <= 0:
+                return []
+            candidates = [
+                (x, y)
+                for x in range(self.size)
+                for y in range(self.size)
+                if (x, y) not in blocked
+            ]
+            if not candidates:
+                return []
+            random.shuffle(candidates)
+            return candidates[: min(count, len(candidates))]
+
+        resource_blocked = exclude_positions | set(self.resources.keys())
+        new_resources = _sample_positions(
+            self._resource_chunk_plan[self._chunk_index],
+            resource_blocked,
+        )
+        for pos in new_resources:
+            self.resources[pos] = 1
+
+        hazard_blocked = exclude_positions | set(self.hazards.keys())
+        new_hazards = _sample_positions(
+            self._hazard_chunk_plan[self._chunk_index],
+            hazard_blocked,
+        )
+        for pos in new_hazards:
+            self.hazards[pos] = 1
+
+        self._chunk_index += 1
+        self._sense_environment()
+
     def refresh_environment(self, step: int, explored_cells_count: int, exclude_positions: set = None):
         exclude_positions = exclude_positions or set()
         extra = min(100, max(((self.step_count - 1500) // 250), 0))
 
-        # 资源点
+        # 资源点 & 危险点的周期计划
         total_res = int(self.size * self.size / 5) + extra
-        self.resources.clear()
-        candidates = [(x, y) for x in range(self.size) for y in range(self.size) if (x, y) not in exclude_positions]
-        random.shuffle(candidates)
-        for pos in candidates[:total_res]:
-            self.resources[pos] = 1
-
-        # 危险点
         total_haz = int(self.size * self.size / 3) + extra
+        self.resources.clear()
         self.hazards.clear()
-        random.shuffle(candidates)
-        for pos in candidates[:total_haz]:
-            self.hazards[pos] = 1
+        self._resource_chunk_plan = self._build_chunk_plan(total_res)
+        self._hazard_chunk_plan = self._build_chunk_plan(total_haz)
+        self._chunk_index = 0
+        self._cycle_anchor_step = step
 
         # 清空探索标记
         self.visited_map.fill_(False)
@@ -100,7 +153,9 @@ class GridEnvironment:
         self.detected_resources_map.fill_(False)
         self.detected_hazards_map.fill_(False)
         self.explored_cells_count = 0
-        self._sense_environment()
+
+        # 立即分配第一批
+        self._distribute_chunk(exclude_positions=exclude_positions)
         self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
         self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
 
@@ -237,10 +292,17 @@ class GridEnvironment:
         # 更新步数
         self.step_count += 1
         step_for_refresh = cog_step if cog_step is not None else self.step_count
-        if step_for_refresh % 1000 == 0 and step_for_refresh >= 1000:
-            self.refresh_environment(step_for_refresh, self.explored_cells_count)
-            self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
-            self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
+        progress = step_for_refresh - self._cycle_anchor_step
+        if progress >= self.refresh_cycle_steps and self.refresh_cycle_steps > 0:
+            self.refresh_environment(
+                step_for_refresh,
+                self.explored_cells_count,
+                exclude_positions={tuple(self.agent_pos)},
+            )
+            progress = 0
+
+        if progress > 0 and self.refresh_chunk_steps > 0 and progress % self.refresh_chunk_steps == 0:
+            self._distribute_chunk(exclude_positions={tuple(self.agent_pos)})
 
         # 计算 reward shaping
         base = self.agent_energy_gain - self.agent_energy_penalty
