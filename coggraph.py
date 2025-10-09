@@ -1582,43 +1582,8 @@ class CogGraph:
         )
 
     def _rapid_emitter_refuel(self):
-        if self.current_step % 5 != 0:
-            return
-        if self.energy_pool <= 1e-6:
-            return
-
-        emitters = [u for u in self.units if u.role == "emitter"]
-        if not emitters:
-            return
-
-        emitters.sort(key=self._emitter_priority_score, reverse=True)
-        top_k = max(1, math.ceil(len(emitters) * 0.85))
-        selected = emitters[:top_k]
-
-        distributed = 0.0
-        for unit in selected:
-            target = max(self._target_energy_for_unit(unit), 1.05)
-            critical = max(0.65, target * 0.82)
-            current = float(unit.energy)
-            if current >= critical:
-                continue
-            gap = target - current
-            if gap <= 1e-6:
-                continue
-            age_bonus = 1.0 + 0.2 * min(unit.age / 320.0, 1.0)
-            share_cap = self._emitter_refuel_share_cap * age_bonus
-            share = min(gap, share_cap, self.energy_pool)
-            if share <= 1e-6:
-                break
-            unit.energy += share
-            self.energy_pool -= share
-            distributed += share
-            if self.energy_pool <= 1e-6:
-                break
-
-        if distributed > 1e-6:
-            logger.debug(
-                f"[Emitter补能] 第 {self.current_step} 步快速补充 {distributed:.3f} 能量，池余 {self.energy_pool:.2f}")
+        """保持兼容性的占位方法，现阶段 emitter 不再享受额外补能。"""
+        return
 
     def supply_energy_from_pool(self):
         """
@@ -1645,9 +1610,7 @@ class CogGraph:
             bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
             resilience = 1.0 / max(0.5, math.sqrt(max(bias, 0.3)))
             weight = gap * activity_bonus * resilience
-            if unit.role == "emitter":
-                weight *= 1.25 + 0.25 * min(unit.age / 280.0, 1.0)
-            elif unit.role == "processor":
+            if unit.role == "processor":
                 weight *= 1.0 + 0.05 * min(unit.age / 360.0, 1.0)
             deficits.append({"unit": unit, "gap": gap, "weight": weight})
 
