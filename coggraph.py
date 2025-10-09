@@ -234,8 +234,9 @@ class CogGraph:
         self._feature_dim_ema_beta = 0.9
         self._emitter_input_rms_cap = 1.25
         self._emitter_input_value_cap = 3.5
-        self._emitter_metabolic_floor = 0.08
-        self._emitter_metabolic_ceiling = 0.24
+        self._emitter_metabolic_floor = 0.06
+        self._emitter_metabolic_ceiling = 0.18
+        self._emitter_refuel_share_cap = 0.28
         # --- 在 __init__() 的最后调用 ---
         self._init_seed_units(device=device)
 
@@ -1537,10 +1538,16 @@ class CogGraph:
     def _target_energy_for_unit(self, unit: CogUnit) -> float:
         bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
         bias = min(max(bias, 0.3), 2.0)
-        base = 0.4 if unit.role != "processor" else 0.45
+
         if unit.role == "emitter":
-            base += 0.05
-        return min(1.2, base + 0.18 * bias)
+            preferred = 0.78 + 0.28 * math.sqrt(bias)
+            return max(1.05, min(1.35, preferred))
+
+        base = 0.46 if unit.role == "processor" else 0.44
+        growth = 0.16 * math.sqrt(bias)
+        ceiling = 1.18 if unit.role == "processor" else 1.08
+        floor = 0.58 if unit.role == "processor" else 0.52
+        return max(floor, min(ceiling, base + growth))
 
     def _emitter_priority_score(self, unit: CogUnit) -> float:
         recent = getattr(unit, "avg_recent_calls", 0.0)
@@ -1549,7 +1556,13 @@ class CogGraph:
             rate = unit.meta.recent_success_rate()
             if rate is not None:
                 success = rate
-        return 0.6 * recent + 0.25 * success + 0.15 * float(unit.energy)
+        maturity = min(unit.age / 260.0, 1.0)
+        return (
+            0.55 * recent
+            + 0.22 * success
+            + 0.15 * float(unit.energy)
+            + 0.08 * maturity
+        )
 
     def _rapid_emitter_refuel(self):
         if self.current_step % 5 != 0:
@@ -1562,20 +1575,22 @@ class CogGraph:
             return
 
         emitters.sort(key=self._emitter_priority_score, reverse=True)
-        top_k = max(1, math.ceil(len(emitters) * 0.7))
+        top_k = max(1, math.ceil(len(emitters) * 0.85))
         selected = emitters[:top_k]
 
         distributed = 0.0
         for unit in selected:
-            target = max(self._target_energy_for_unit(unit), 0.85)
-            critical = max(0.5, target * 0.85)
+            target = max(self._target_energy_for_unit(unit), 1.05)
+            critical = max(0.65, target * 0.82)
             current = float(unit.energy)
             if current >= critical:
                 continue
             gap = target - current
             if gap <= 1e-6:
                 continue
-            share = min(gap, 0.2, self.energy_pool)
+            age_bonus = 1.0 + 0.2 * min(unit.age / 320.0, 1.0)
+            share_cap = self._emitter_refuel_share_cap * age_bonus
+            share = min(gap, share_cap, self.energy_pool)
             if share <= 1e-6:
                 break
             unit.energy += share
@@ -1609,12 +1624,14 @@ class CogGraph:
             if gap <= 0.0:
                 continue
             recent = getattr(unit, "avg_recent_calls", 0.0)
-            activity_bonus = 1.0 + 0.25 * min(recent, 4.0)
+            activity_bonus = 1.0 + 0.3 * min(recent, 4.0)
             bias = float(unit.gene.get(f"{unit.role}_bias", 1.0))
             resilience = 1.0 / max(0.5, math.sqrt(max(bias, 0.3)))
             weight = gap * activity_bonus * resilience
             if unit.role == "emitter":
-                weight *= 1.0 + 0.1 * min(unit.age / 300.0, 1.0)
+                weight *= 1.25 + 0.25 * min(unit.age / 280.0, 1.0)
+            elif unit.role == "processor":
+                weight *= 1.0 + 0.05 * min(unit.age / 360.0, 1.0)
             deficits.append({"unit": unit, "gap": gap, "weight": weight})
 
         active_deficits = [d for d in deficits if d["gap"] > 1e-6 and d["weight"] > 0.0]
@@ -1779,18 +1796,18 @@ class CogGraph:
     def _compute_emitter_metabolic_scalar(self, unit: CogUnit, *, adjusted_var: float, call_density: float) -> float:
         bias = max(0.3, float(unit.gene.get("emitter_bias", 1.0)))
         energy = max(unit.energy, 0.0)
-        preferred = 0.85 + 0.25 * math.sqrt(bias)
+        preferred = 0.92 + 0.24 * math.sqrt(bias)
         energy_gap = preferred - energy
-        energy_term = 1.0 - 0.32 * math.tanh(energy_gap)
-        energy_term = max(0.7, min(1.3, energy_term))
+        energy_term = 1.0 - 0.28 * math.tanh(energy_gap)
+        energy_term = max(0.75, min(1.22, energy_term))
 
         maturity = min(unit.age / 220.0, 1.0)
         activity = min(call_density, 1.5)
         stability = 1.0 - min(adjusted_var / (adjusted_var + 1.0), 0.7)
 
-        composite = (0.88 + 0.06 * activity + 0.05 * maturity) * (0.9 + 0.1 * stability)
-        trait_term = 1.0 / math.sqrt(bias)
-        scalar = 0.1 * composite * trait_term * energy_term
+        composite = (0.86 + 0.05 * activity + 0.045 * maturity) * (0.92 + 0.08 * stability)
+        trait_term = 0.92 / math.sqrt(bias)
+        scalar = 0.08 * composite * trait_term * energy_term
         return max(self._emitter_metabolic_floor, min(self._emitter_metabolic_ceiling, scalar))
 
     def _apply_unit_metabolism(self, unit, unit_input):

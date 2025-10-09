@@ -10,32 +10,32 @@ class EnergyConfig:
     """Configurable coefficients that shape the energy economy."""
 
     warmup_steps: int = 200
-    warmup_increment: float = 0.01
-    high_freq_call_threshold: float = 3.5
-    high_freq_bonus: float = 0.02
-    self_reward_scale: float = 0.015
-    intrinsic_goal_bonus: float = 0.3
-    hazard_penalty: float = 0.45
-    hazard_processor_penalty: float = 0.2
-    hazard_escape_bonus: float = 0.03
-    resource_base_scale: float = 0.12
-    resource_hit_bonus: float = 0.6
-    resource_upstream_share: float = 0.2
-    linger_penalty: float = 0.008
+    warmup_increment: float = 0.012
+    high_freq_call_threshold: float = 3.2
+    high_freq_bonus: float = 0.025
+    self_reward_scale: float = 0.018
+    intrinsic_goal_bonus: float = 0.34
+    hazard_penalty: float = 0.38
+    hazard_processor_penalty: float = 0.14
+    hazard_escape_bonus: float = 0.05
+    resource_base_scale: float = 0.16
+    resource_hit_bonus: float = 0.75
+    resource_upstream_share: float = 0.24
+    linger_penalty: float = 0.006
     monotony_penalty: float = 0.03
     monotony_bonus: float = 0.03
     inactivity_threshold: int = 35
-    inactivity_decay: float = 0.004
-    diversity_penalty: float = 0.03
-    diversity_bonus: float = 0.03
+    inactivity_decay: float = 0.003
+    diversity_penalty: float = 0.025
+    diversity_bonus: float = 0.035
     movement_penalties: Tuple[Tuple[int, int, float], ...] = (
-        (3, 5, 0.06),
-        (6, 8, 0.08),
-        (9, 11, 0.1),
+        (4, 6, 0.05),
+        (6, 9, 0.07),
+        (9, 12, 0.09),
     )
-    pool_primary_cap: float = 0.2
-    pool_secondary_cap: float = 0.08
-    pool_stability_factor: float = 0.04
+    pool_primary_cap: float = 0.28
+    pool_secondary_cap: float = 0.12
+    pool_stability_factor: float = 0.06
 
 
 class EnergyPolicy:
