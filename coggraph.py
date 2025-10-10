@@ -200,6 +200,8 @@ class CogGraph:
         self.units = []
         self.removed_resources_count = 0
         self.removed_hazards_count = 0
+        self._chunk_removed_resource_anchor = 0
+        self._chunk_removed_hazard_anchor = 0
         self.active_units = set()
         self.energy_policy = EnergyPolicy()
         self.connections = {}  # {from_id: {to_id: strength_float}}
@@ -2112,8 +2114,12 @@ class CogGraph:
             self.removed_resources_count = 0
             self.removed_hazards_count  = 0
             self.removed_hazards_by_reward = 0
+            self._chunk_removed_resource_anchor = 0
+            self._chunk_removed_hazard_anchor = 0
         if self.current_step % 200 == 0:
             self.active_units.clear()
+            self._chunk_removed_resource_anchor = self.removed_resources_count
+            self._chunk_removed_hazard_anchor = self.removed_hazards_count
 
         self.current_step += 1
         if self.current_step % 1000 == 0:
@@ -2266,10 +2272,27 @@ class CogGraph:
             haz_cleared = self.removed_hazards_count
             res_left = sum(self.env.resources.values())
             haz_left = sum(self.env.hazards.values())
+            chunk_res_hits = max(0, res_cleared - self._chunk_removed_resource_anchor)
+            chunk_haz_hits = max(0, haz_cleared - self._chunk_removed_hazard_anchor)
+            cycle_total_res = 0
+            cycle_total_haz = 0
+            chunk_total_res = 0
+            chunk_total_haz = 0
+            try:
+                stats = self.env.get_cycle_statistics()
+            except AttributeError:
+                stats = None
+            if isinstance(stats, dict):
+                cycle_total_res = stats.get("cycle_total", {}).get("resources", 0)
+                cycle_total_haz = stats.get("cycle_total", {}).get("hazards", 0)
+                chunk_total_res = stats.get("chunk_total", {}).get("resources", 0)
+                chunk_total_haz = stats.get("chunk_total", {}).get("hazards", 0)
             logger.warning(
-                f"[清理统计] 已清理资源 {res_cleared} 个，"
-                f"已清理危险 {haz_cleared} 个，因资源奖励移除危险 {haz_by_reward} 个；"
-                f"剩余资源 {res_left} 个，剩余危险 {haz_left} 个"
+                f"[清理统计] 1000步累计：资源 {res_cleared} 个，危险 {haz_cleared} 个（奖励额外移除 {haz_by_reward} 个）；"
+                f"周期总量：资源 {cycle_total_res} 个，危险 {cycle_total_haz} 个；"
+                f"当前200步投放：资源 {chunk_total_res} 个，危险 {chunk_total_haz} 个；"
+                f"200步命中：资源 {chunk_res_hits} 个，危险 {chunk_haz_hits} 个；"
+                f"剩余：资源 {res_left} 个，危险 {haz_left} 个"
             )
 
 
