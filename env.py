@@ -57,8 +57,16 @@ class GridEnvironment:
             else 1,
         )
         self._chunk_index = 0
-        self._resource_base_target = 0.0
-        self._hazard_base_target = 0.0
+        self.cycle_resource_total = 0
+        self.cycle_hazard_total = 0
+        self.cycle_reward_hits = 0
+        self.cycle_danger_hits = 0
+        self.chunk_resource_total = 0
+        self.chunk_hazard_total = 0
+        self.chunk_reward_hits = 0
+        self.chunk_danger_hits = 0
+        self._chunk_reward_hit_anchor = 0
+        self._chunk_danger_hit_anchor = 0
 
         # 经验点和危险点
         self.resources = Counter()
@@ -224,36 +232,30 @@ class GridEnvironment:
         return resource_multiplier, hazard_multiplier
 
     def _distribute_chunk(self, exclude_positions: set | None = None):
-        if self.refresh_chunk_steps <= 0:
-            return
-
-        if self._chunk_index >= self._chunks_per_cycle:
+        if self._chunk_index >= len(self._resource_chunk_plan):
+            self.chunk_resource_total = 0
+            self.chunk_hazard_total = 0
+            self._chunk_reward_hit_anchor = self.reward_hit_count
+            self._chunk_danger_hit_anchor = self.danger_hit_count
+            self.chunk_reward_hits = 0
+            self.chunk_danger_hits = 0
             return
 
         exclude_positions = set(exclude_positions or set())
         exclude_positions.add(tuple(self.agent_pos))
 
-        resource_multiplier, hazard_multiplier = self._compute_cell_density_adjustments()
-        adjusted_resource_target = int(round(self._resource_base_target * resource_multiplier))
-        adjusted_hazard_target = int(round(self._hazard_base_target * hazard_multiplier))
-
-        self._trim_points(self.resources, max(0, len(self.resources) - adjusted_resource_target))
-        self._trim_points(self.hazards, max(0, len(self.hazards) - adjusted_hazard_target))
-
-        remaining_chunks = max(1, self._chunks_per_cycle - self._chunk_index)
-
-        needed_resources = max(0, adjusted_resource_target - len(self.resources))
-        needed_hazards = max(0, adjusted_hazard_target - len(self.hazards))
-
-        base_res, rem_res = divmod(needed_resources, remaining_chunks)
-        base_haz, rem_haz = divmod(needed_hazards, remaining_chunks)
-
-        resources_to_spawn = base_res + (1 if rem_res > 0 else 0)
-        hazards_to_spawn = base_haz + (1 if rem_haz > 0 else 0)
+        resource_chunk_total = self._resource_chunk_plan[self._chunk_index]
+        hazard_chunk_total = self._hazard_chunk_plan[self._chunk_index]
+        self.chunk_resource_total = resource_chunk_total
+        self.chunk_hazard_total = hazard_chunk_total
+        self._chunk_reward_hit_anchor = self.reward_hit_count
+        self._chunk_danger_hit_anchor = self.danger_hit_count
+        self.chunk_reward_hits = 0
+        self.chunk_danger_hits = 0
 
         resource_blocked = exclude_positions | set(self.resources.keys())
         new_resources = self._sample_weighted_positions(
-            resources_to_spawn,
+            resource_chunk_total,
             blocked=resource_blocked,
             frontier_weight=1.6,
             revisit_weight=1.0,
@@ -263,7 +265,7 @@ class GridEnvironment:
 
         hazard_blocked = exclude_positions | set(self.hazards.keys())
         new_hazards = self._sample_weighted_positions(
-            hazards_to_spawn,
+            hazard_chunk_total,
             blocked=hazard_blocked,
             frontier_weight=2.2,
             revisit_weight=0.8,
@@ -335,6 +337,18 @@ class GridEnvironment:
         )
         self._chunk_index = 0
         self._cycle_anchor_step = step
+        existing_resource_total = len(self.resources)
+        existing_hazard_total = len(self.hazards)
+        self.cycle_resource_total = existing_resource_total + sum(self._resource_chunk_plan)
+        self.cycle_hazard_total = existing_hazard_total + sum(self._hazard_chunk_plan)
+        self.cycle_reward_hits = 0
+        self.cycle_danger_hits = 0
+        self.chunk_resource_total = 0
+        self.chunk_hazard_total = 0
+        self.chunk_reward_hits = 0
+        self.chunk_danger_hits = 0
+        self._chunk_reward_hit_anchor = self.reward_hit_count
+        self._chunk_danger_hit_anchor = self.danger_hit_count
 
         self._sense_environment()
 
@@ -425,6 +439,13 @@ class GridEnvironment:
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
         self._hazard_contact_timer = 0
+        # 当 episode 被上层截断时，step_count 会被重置为 0，但
+        # refresh 周期的锚点 (_cycle_anchor_step) 仍然停留在上一轮的值
+        #（例如 1000）。如果不同步更新，后续 progress = step_count - anchor
+        # 会变成负数，从而导致 refresh / chunk 分发永远不会触发，
+        # 给人一种资源 / 危险点变少的错觉。
+        # 因此在 reset 时也重置锚点，确保新的 episode 能正常进入 refresh 节奏。
+        self._cycle_anchor_step = self.step_count
 
         # 当资源被完全采集后，下一轮需要重新刷新环境，避免 "horizon step"
         # 在每一步都被立即截断
@@ -452,6 +473,12 @@ class GridEnvironment:
         # 清空命中统计
         self.reward_hit_count = 0
         self.danger_hit_count = 0
+        self.cycle_reward_hits = 0
+        self.cycle_danger_hits = 0
+        self.chunk_reward_hits = 0
+        self.chunk_danger_hits = 0
+        self._chunk_reward_hit_anchor = 0
+        self._chunk_danger_hit_anchor = 0
 
         return self.get_state()
 
@@ -486,6 +513,11 @@ class GridEnvironment:
             self.update_known_cell(pos)
         else:
             self.agent_energy_penalty = 0.0
+
+        self.cycle_reward_hits = self.reward_hit_count
+        self.cycle_danger_hits = self.danger_hit_count
+        self.chunk_reward_hits = max(0, self.reward_hit_count - self._chunk_reward_hit_anchor)
+        self.chunk_danger_hits = max(0, self.danger_hit_count - self._chunk_danger_hit_anchor)
 
         if self.agent_energy_penalty > 0.0:
             self._hazard_contact_timer = 4
@@ -634,9 +666,39 @@ class GridEnvironment:
         self.explored_cells_count = 0
         self.reward_hit_count = 0
         self.danger_hit_count = 0
+        self.cycle_resource_total = len(self.resources)
+        self.cycle_hazard_total = len(self.hazards)
+        self.cycle_reward_hits = 0
+        self.cycle_danger_hits = 0
+        self.chunk_resource_total = 0
+        self.chunk_hazard_total = 0
+        self.chunk_reward_hits = 0
+        self.chunk_danger_hits = 0
+        self._chunk_reward_hit_anchor = 0
+        self._chunk_danger_hit_anchor = 0
         self._sense_environment()
         self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
         self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
+
+    def get_cycle_statistics(self) -> dict:
+        return {
+            "cycle_total": {
+                "resources": self.cycle_resource_total,
+                "hazards": self.cycle_hazard_total,
+            },
+            "cycle_hits": {
+                "resources": self.cycle_reward_hits,
+                "hazards": self.cycle_danger_hits,
+            },
+            "chunk_total": {
+                "resources": self.chunk_resource_total,
+                "hazards": self.chunk_hazard_total,
+            },
+            "chunk_hits": {
+                "resources": self.chunk_reward_hits,
+                "hazards": self.chunk_danger_hits,
+            },
+        }
 
 if __name__ == "__main__":
     env = GridEnvironment(size=10)
