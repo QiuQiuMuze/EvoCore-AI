@@ -1063,6 +1063,9 @@ class CogGraph:
         else:
             hi, lo = 1.05, 0.95
 
+        hi_map = {"sensor": hi, "emitter": hi, "processor": hi + 0.04}
+        lo_map = {"sensor": lo, "emitter": lo, "processor": min(lo + 0.05, 0.98)}
+
         # Δ 容差（至少相差 Δ_cell 才算“真的多／少”）
         delta_cell = max(1, int(total * TOL_FRAC))
 
@@ -1114,8 +1117,15 @@ class CogGraph:
             }
 
             # 1) 满足 ratio>hi 且 diff≥Δ 才算“over”   2) ratio<lo 且 diff≤-Δ 算“under”
-            overs = [r for r in ratio if ratio[r] > hi and diff[r] >= delta_cell]
-            unders = [r for r in ratio if ratio[r] < lo and diff[r] <= -delta_cell]
+            overs = [r for r in ratio if ratio[r] > hi_map[r] and diff[r] >= delta_cell]
+            unders = [r for r in ratio if ratio[r] < lo_map[r] and diff[r] <= -delta_cell]
+
+            # processor 长期短缺时，允许从最富余的角色借位
+            if "processor" in unders and not overs:
+                fallback = [r for r in ("sensor", "emitter") if diff[r] > 0]
+                if not fallback:
+                    fallback = [max(ratio, key=ratio.get)] if ratio else []
+                overs = fallback
 
             if not overs or not unders:
                 break  # 落入迟滞带 or Δ 太小，结束
@@ -1134,7 +1144,10 @@ class CogGraph:
             old = unit.get_role()
             unit.role = receiver_role
             unit.age = 0
-            unit.energy += 0
+            if receiver_role == "processor":
+                unit.energy = max(unit.energy, 0.95)
+            else:
+                unit.energy += 0
             unit.gene[f"{receiver_role}_bias"] = 1.0
             logger.info(f"[平衡] {old}→{receiver_role} | step={self.current_step}")
 
@@ -1566,7 +1579,22 @@ class CogGraph:
         growth = 0.16 * math.sqrt(bias)
         ceiling = 1.18 if unit.role == "processor" else 1.08
         floor = 0.58 if unit.role == "processor" else 0.52
-        return max(floor, min(ceiling, base + growth))
+
+        if unit.role == "processor":
+            total = max(1, len(self.units))
+            ideal_proc = total * IDEAL_RATIO["processor"] / DENOM
+            current_proc = max(0, self.processor_count)
+            shortage = max(0.0, ideal_proc - current_proc)
+            if ideal_proc > 0.0 and shortage > 0.0:
+                shortage_ratio = min(1.0, shortage / ideal_proc)
+                boost = 1.0 + 0.35 * shortage_ratio
+                base *= boost
+                growth *= 1.0 + 0.45 * shortage_ratio
+                floor += 0.12 * shortage_ratio
+                ceiling = min(1.45, ceiling + 0.22 * shortage_ratio)
+
+        target = base + growth
+        return max(floor, min(ceiling, target))
 
     def _emitter_priority_score(self, unit: CogUnit) -> float:
         recent = getattr(unit, "avg_recent_calls", 0.0)
