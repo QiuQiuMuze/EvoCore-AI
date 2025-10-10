@@ -370,6 +370,8 @@ class CogGraph:
             u.global_processor_count = self.processor_count
             u.global_emitter_count   = self.emitter_count
             u.global_unit_count      = total
+        if hasattr(self, "env") and hasattr(self.env, "update_cell_population"):
+            self.env.update_cell_population(total)
 
     def _log_stats_and_conns(self):
         """集中打印一次统计 & 连接强度，避免散落在内层循环里重复计算"""
