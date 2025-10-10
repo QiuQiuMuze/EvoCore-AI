@@ -425,6 +425,7 @@ class GridEnvironment:
         self.step_count += 1
         step_for_refresh = cog_step if cog_step is not None else self.step_count
         progress = step_for_refresh - self._cycle_anchor_step
+        refresh_triggered = False
         if progress >= self.refresh_cycle_steps and self.refresh_cycle_steps > 0:
             self.refresh_environment(
                 step_for_refresh,
@@ -432,6 +433,7 @@ class GridEnvironment:
                 exclude_positions={tuple(self.agent_pos)},
             )
             progress = 0
+            refresh_triggered = True
 
         if progress > 0 and self.refresh_chunk_steps > 0 and progress % self.refresh_chunk_steps == 0:
             self._distribute_chunk(exclude_positions={tuple(self.agent_pos)})
@@ -470,14 +472,14 @@ class GridEnvironment:
         next_state = self.get_state()
 
         done = False
-        if not self.resources:
+        if self.max_steps is not None and self.step_count >= self.max_steps:
+            done = True
+        elif refresh_triggered and self.refresh_cycle_steps > 0:
+            done = True
+        elif not self.resources:
             if self._chunk_index < len(self._resource_chunk_plan) or \
                self._chunk_index < len(self._hazard_chunk_plan):
                 self._distribute_chunk(exclude_positions={tuple(self.agent_pos)})
-            if not self.resources:
-                done = True
-        elif self.max_steps is not None and self.step_count >= self.max_steps:
-            done = True
 
         return next_state, reward, done, {}
 
