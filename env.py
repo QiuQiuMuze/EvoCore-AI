@@ -63,6 +63,13 @@ class GridEnvironment:
         self.explored_cells_count = 0
         self.agent_pos = [random.randrange(self.size), random.randrange(self.size)]
 
+        # 细胞密度自适应调节
+        self._cell_count = 0
+        self._cell_density = 0.0
+        self._cell_density_baseline: float | None = None
+        self._cell_adjust_resource = 1.0
+        self._cell_adjust_hazard = 1.0
+
         # 记忆保留 & 反馈追踪
         self.reward_hit_count = 0
         self.danger_hit_count = 0
@@ -251,8 +258,8 @@ class GridEnvironment:
         extra = min(80, max(((self.step_count - 1200) // 300), 0))
         base_resource_density = 0.18
         growth_factor = 0.75 + 0.45 * explored_ratio
-        resource_target = int(area * base_resource_density * growth_factor)
-        resource_target += int(extra * (0.5 + 0.5 * success_ratio))
+        resource_target = area * base_resource_density * growth_factor
+        resource_target += extra * (0.5 + 0.5 * success_ratio)
 
         base_hazard_density = 0.22
         hazard_adjust = 1.0 - 0.6 * (0.5 - success_ratio)
@@ -260,8 +267,28 @@ class GridEnvironment:
         caution_factor = 0.9 + 0.2 * (1.0 - explored_ratio)
         hazard_density = base_hazard_density * hazard_adjust * caution_factor
         hazard_density = max(0.14, min(0.28, hazard_density))
-        hazard_target = int(area * hazard_density)
-        hazard_target += int(extra * (0.6 + 0.4 * (1.0 - success_ratio)))
+        hazard_target = area * hazard_density
+        hazard_target += extra * (0.6 + 0.4 * (1.0 - success_ratio))
+
+        resource_multiplier = 1.0
+        hazard_multiplier = 1.0
+        baseline = self._cell_density_baseline
+        density = self._cell_density
+        if baseline is not None and baseline > 1e-6:
+            relative_delta = (density - baseline) / max(baseline, 1e-6)
+            relative_delta = max(-0.6, min(0.6, relative_delta))
+            adjust_strength = 0.5
+            resource_multiplier = 1.0 - adjust_strength * relative_delta
+            hazard_multiplier = 1.0 + adjust_strength * relative_delta
+            resource_multiplier = max(0.7, min(1.3, resource_multiplier))
+            hazard_multiplier = max(0.7, min(1.3, hazard_multiplier))
+        self._cell_adjust_resource = resource_multiplier
+        self._cell_adjust_hazard = hazard_multiplier
+
+        resource_target = int(resource_target * resource_multiplier)
+        hazard_target = int(hazard_target * hazard_multiplier)
+        resource_target = max(0, resource_target)
+        hazard_target = max(0, hazard_target)
 
         self._trim_points(self.resources, max(0, len(self.resources) - resource_target))
         self._trim_points(self.hazards, max(0, len(self.hazards) - hazard_target))
@@ -279,6 +306,18 @@ class GridEnvironment:
         self._distribute_chunk(exclude_positions=exclude_positions)
         self.prev_dist_resource = self.distance_to_nearest_known_resource(tuple(self.agent_pos))
         self.prev_danger_dist = self.distance_to_nearest_known_danger(tuple(self.agent_pos))
+
+    def update_cell_population(self, cell_count: int) -> None:
+        """更新细胞数量统计，用于在刷新时调整资源/危险比例。"""
+        self._cell_count = max(0, int(cell_count))
+        area = max(1, self.size * self.size)
+        density = self._cell_count / area
+        self._cell_density = density
+        if self._cell_density_baseline is None:
+            self._cell_density_baseline = density
+        else:
+            alpha = 0.12
+            self._cell_density_baseline = (1.0 - alpha) * self._cell_density_baseline + alpha * density
 
     def _in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.size and 0 <= y < self.size
@@ -530,6 +569,7 @@ class GridEnvironment:
     def resize(self, new_size: int):
         self.size = new_size
         self._init_buffers()
+        self._cell_density_baseline = None
 
         x, y = self.agent_pos
         x = min(x, new_size - 1)
@@ -547,6 +587,7 @@ class GridEnvironment:
         self.explored_cells_count = 0
         self.reward_hit_count = 0
         self.danger_hit_count = 0
+        self._cell_density_baseline = None
         self.refresh_environment(step=0, explored_cells_count=0, exclude_positions={tuple(self.agent_pos)})
 
     def inject_reward_map(self, reward_points: list[tuple[int,int]], punishment_points: list[tuple[int,int]]):
