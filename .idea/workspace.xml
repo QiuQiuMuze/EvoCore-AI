@@ -4,17 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/checkpoints/agent_h0.pth" beforeDir="false" afterPath="$PROJECT_DIR$/checkpoints/agent_h0.pth" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/coggraph.py" beforeDir="false" afterPath="$PROJECT_DIR$/coggraph.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/env.py" beforeDir="false" afterPath="$PROJECT_DIR$/env.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/graph_scatter.py" beforeDir="false" afterPath="$PROJECT_DIR$/graph_scatter.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/memory_unit.py" beforeDir="false" afterPath="$PROJECT_DIR$/memory_unit.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/transformer_policy.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/transformer_policy.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/train_self_driven.py" beforeDir="false" afterPath="$PROJECT_DIR$/train_self_driven.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/triton_scatter.py" beforeDir="false" afterPath="$PROJECT_DIR$/triton_scatter.py" afterDir="false" />
-    </list>
+    <list default="true" id="2b12e0de-4dc7-4f76-944b-77af6ba55fae" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />

@@ -2301,12 +2301,13 @@ class CogGraph:
             chunk_hit_haz = chunk_hit_haz or chunk_haz_hits_graph
 
             logger.warning(
-                f"[清理统计] 1000步累计清除：资源 {res_cleared} 个，危险 {haz_cleared} 个（奖励额外移除 {haz_by_reward} 个）；"
-                f"1000步投放总量：资源 {cycle_total_res} 个，危险 {cycle_total_haz} 个；命中：资源 {cycle_hit_res} 个，危险 {cycle_hit_haz} 个；"
-                f"当前200步投放：资源 {chunk_total_res} 个，危险 {chunk_total_haz} 个；命中：资源 {chunk_hit_res} 个，危险 {chunk_hit_haz} 个；"
+                f"[清理统计] 1000步累计清除：资源 {res_cleared} 个，危险 {haz_cleared} 个（奖励额外移除 {haz_by_reward} 个）\n"
+                f"1000步投放总量：资源 {cycle_total_res} 个，危险 {cycle_total_haz} 个\n"
+                f"命中：资源 {cycle_hit_res} 个，危险 {cycle_hit_haz} 个\n"
+                f"当前200步投放：资源 {chunk_total_res} 个，危险 {chunk_total_haz} 个\n"
+                f"命中：资源 {chunk_hit_res} 个，危险 {chunk_hit_haz} 个\n"
                 f"剩余：资源 {res_left} 个，危险 {haz_left} 个"
             )
-
 
         self.meta_self_evaluation()
         self.record_long_term_memory(prev_energies, state_snapshot)
