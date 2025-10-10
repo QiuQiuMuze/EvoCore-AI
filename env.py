@@ -67,6 +67,8 @@ class GridEnvironment:
         self.chunk_danger_hits = 0
         self._chunk_reward_hit_anchor = 0
         self._chunk_danger_hit_anchor = 0
+        self._resource_chunk_plan: list[int] = []
+        self._hazard_chunk_plan: list[int] = []
 
         # 经验点和危险点
         self.resources = Counter()
@@ -335,6 +337,10 @@ class GridEnvironment:
             if self.refresh_chunk_steps > 0
             else 1,
         )
+        resource_deficit = max(0, resource_target - len(self.resources))
+        hazard_deficit = max(0, hazard_target - len(self.hazards))
+        self._resource_chunk_plan = self._build_chunk_plan(resource_deficit)
+        self._hazard_chunk_plan = self._build_chunk_plan(hazard_deficit)
         self._chunk_index = 0
         self._cycle_anchor_step = step
         existing_resource_total = len(self.resources)
