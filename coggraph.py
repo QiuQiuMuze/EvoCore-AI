@@ -200,6 +200,11 @@ class CogGraph:
         self.units = []
         self.removed_resources_count = 0
         self.removed_hazards_count = 0
+        self._chunk_base_removed_resources = 0
+        self._chunk_base_removed_hazards = 0
+        self._chunk_base_removed_hazards_by_reward = 0
+        get_chunk_serial = getattr(self.env, "get_chunk_serial", None)
+        self._last_chunk_serial = get_chunk_serial() if callable(get_chunk_serial) else None
         self.active_units = set()
         self.energy_policy = EnergyPolicy()
         self.connections = {}  # {from_id: {to_id: strength_float}}
@@ -2112,8 +2117,23 @@ class CogGraph:
             self.removed_resources_count = 0
             self.removed_hazards_count  = 0
             self.removed_hazards_by_reward = 0
-        if self.current_step % 200 == 0:
+            self._chunk_base_removed_resources = 0
+            self._chunk_base_removed_hazards = 0
+            self._chunk_base_removed_hazards_by_reward = 0
+        get_chunk_serial = getattr(self.env, "get_chunk_serial", None)
+        current_chunk_serial = get_chunk_serial() if callable(get_chunk_serial) else None
+        chunk_boundary = (self.current_step % 200 == 0)
+        chunk_changed = (
+            current_chunk_serial is not None
+            and current_chunk_serial != self._last_chunk_serial
+        )
+        if chunk_boundary or chunk_changed:
             self.active_units.clear()
+            self._chunk_base_removed_resources = self.removed_resources_count
+            self._chunk_base_removed_hazards = self.removed_hazards_count
+            self._chunk_base_removed_hazards_by_reward = self.removed_hazards_by_reward
+            if current_chunk_serial is not None:
+                self._last_chunk_serial = current_chunk_serial
 
         self.current_step += 1
         if self.current_step % 1000 == 0:
@@ -2262,16 +2282,40 @@ class CogGraph:
         # —— 新增：周期性清理统计 ——
         if self.current_step % 50 == 0:
             res_cleared = self.removed_resources_count
-            haz_by_reward = self.removed_hazards_by_reward
             haz_cleared = self.removed_hazards_count
+            haz_by_reward = self.removed_hazards_by_reward
+            cycle_spawn_res, cycle_spawn_haz = (0, 0)
+            chunk_spawn_res, chunk_spawn_haz = (0, 0)
+            chunk_serial = None
+            get_cycle_counts = getattr(self.env, "get_cycle_spawn_counts", None)
+            if callable(get_cycle_counts):
+                cycle_spawn_res, cycle_spawn_haz = get_cycle_counts()
+            get_chunk_counts = getattr(self.env, "get_chunk_spawn_counts", None)
+            if callable(get_chunk_counts):
+                chunk_spawn_res, chunk_spawn_haz = get_chunk_counts()
+            get_chunk_serial = getattr(self.env, "get_chunk_serial", None)
+            if callable(get_chunk_serial):
+                chunk_serial = get_chunk_serial()
+            chunk_res_hits = res_cleared - self._chunk_base_removed_resources
+            chunk_haz_hits = haz_cleared - self._chunk_base_removed_hazards
+            chunk_haz_reward = haz_by_reward - self._chunk_base_removed_hazards_by_reward
+            chunk_res_hits = max(chunk_res_hits, 0)
+            chunk_haz_hits = max(chunk_haz_hits, 0)
+            chunk_haz_reward = max(chunk_haz_reward, 0)
             res_left = sum(self.env.resources.values())
             haz_left = sum(self.env.hazards.values())
-            logger.warning(
-                f"[清理统计] 已清理资源 {res_cleared} 个，"
-                f"已清理危险 {haz_cleared} 个，因资源奖励移除危险 {haz_by_reward} 个；"
+            chunk_label = (
+                f"#{chunk_serial}" if chunk_serial is not None and chunk_serial > 0 else "当前"
+            )
+            message = (
+                f"[清理统计] step={self.current_step} | "
+                f"1000步生成: 资源 {cycle_spawn_res} / 危险 {cycle_spawn_haz}，"
+                f"1000步命中: 资源 {res_cleared} / 危险 {haz_cleared} (奖励移除危险 {haz_by_reward}) | "
+                f"当前200步段{chunk_label}: 生成 资源 {chunk_spawn_res} / 危险 {chunk_spawn_haz}，"
+                f"命中 资源 {chunk_res_hits} / 危险 {chunk_haz_hits} (奖励移除危险 {chunk_haz_reward}) | "
                 f"剩余资源 {res_left} 个，剩余危险 {haz_left} 个"
             )
-
+            logger.warning(message)
 
         self.meta_self_evaluation()
         self.record_long_term_memory(prev_energies, state_snapshot)

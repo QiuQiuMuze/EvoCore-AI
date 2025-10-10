@@ -53,6 +53,11 @@ class GridEnvironment:
         self._resource_chunk_plan: list[int] = []
         self._hazard_chunk_plan: list[int] = []
         self._chunk_index = 0
+        self._chunk_serial = 0
+        self._cycle_spawned_resources = 0
+        self._cycle_spawned_hazards = 0
+        self._chunk_spawned_resources = 0
+        self._chunk_spawned_hazards = 0
 
         # 经验点和危险点
         self.resources = Counter()
@@ -194,31 +199,52 @@ class GridEnvironment:
             self.update_known_cell(pos)
 
     def _distribute_chunk(self, exclude_positions: set | None = None):
-        if self._chunk_index >= len(self._resource_chunk_plan):
+        max_plan = max(len(self._resource_chunk_plan), len(self._hazard_chunk_plan))
+        if self._chunk_index >= max_plan:
             return
+
+        self._chunk_serial += 1
+        self._chunk_spawned_resources = 0
+        self._chunk_spawned_hazards = 0
 
         exclude_positions = set(exclude_positions or set())
         exclude_positions.add(tuple(self.agent_pos))
 
         resource_blocked = exclude_positions | set(self.resources.keys())
+        res_quota = (
+            self._resource_chunk_plan[self._chunk_index]
+            if self._chunk_index < len(self._resource_chunk_plan)
+            else 0
+        )
         new_resources = self._sample_weighted_positions(
-            self._resource_chunk_plan[self._chunk_index],
+            res_quota,
             blocked=resource_blocked,
             frontier_weight=1.6,
             revisit_weight=1.0,
         )
         for pos in new_resources:
             self.resources[pos] = 1
+        res_added = len(new_resources)
+        self._chunk_spawned_resources += res_added
+        self._cycle_spawned_resources += res_added
 
         hazard_blocked = exclude_positions | set(self.hazards.keys())
+        haz_quota = (
+            self._hazard_chunk_plan[self._chunk_index]
+            if self._chunk_index < len(self._hazard_chunk_plan)
+            else 0
+        )
         new_hazards = self._sample_weighted_positions(
-            self._hazard_chunk_plan[self._chunk_index],
+            haz_quota,
             blocked=hazard_blocked,
             frontier_weight=2.2,
             revisit_weight=0.8,
         )
         for pos in new_hazards:
             self.hazards[pos] = 1
+        haz_added = len(new_hazards)
+        self._chunk_spawned_hazards += haz_added
+        self._cycle_spawned_hazards += haz_added
 
         self._chunk_index += 1
         self._sense_environment()
@@ -272,6 +298,11 @@ class GridEnvironment:
         self._resource_chunk_plan = self._build_chunk_plan(to_add_res)
         self._hazard_chunk_plan = self._build_chunk_plan(to_add_haz)
         self._chunk_index = 0
+        self._chunk_serial = 0
+        self._cycle_spawned_resources = 0
+        self._cycle_spawned_hazards = 0
+        self._chunk_spawned_resources = 0
+        self._chunk_spawned_hazards = 0
         self._cycle_anchor_step = step
 
         self._sense_environment()
@@ -351,6 +382,13 @@ class GridEnvironment:
         self.agent_energy_gain = 0.0
         self.agent_energy_penalty = 0.0
         self._hazard_contact_timer = 0
+        # 当 episode 被上层截断时，step_count 会被重置为 0，但
+        # refresh 周期的锚点 (_cycle_anchor_step) 仍然停留在上一轮的值
+        #（例如 1000）。如果不同步更新，后续 progress = step_count - anchor
+        # 会变成负数，从而导致 refresh / chunk 分发永远不会触发，
+        # 给人一种资源 / 危险点变少的错觉。
+        # 因此在 reset 时也重置锚点，确保新的 episode 能正常进入 refresh 节奏。
+        self._cycle_anchor_step = self.step_count
 
         # 当资源被完全采集后，下一轮需要重新刷新环境，避免 "horizon step"
         # 在每一步都被立即截断
@@ -526,6 +564,15 @@ class GridEnvironment:
         if not self.hazards:
             return None
         return min(self.hazards, key=lambda r: abs(r[0] - pos[0]) + abs(r[1] - pos[1]))
+
+    def get_cycle_spawn_counts(self) -> tuple[int, int]:
+        return self._cycle_spawned_resources, self._cycle_spawned_hazards
+
+    def get_chunk_spawn_counts(self) -> tuple[int, int]:
+        return self._chunk_spawned_resources, self._chunk_spawned_hazards
+
+    def get_chunk_serial(self) -> int:
+        return self._chunk_serial
 
     def resize(self, new_size: int):
         self.size = new_size
