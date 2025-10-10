@@ -50,9 +50,15 @@ class GridEnvironment:
         self.refresh_cycle_steps = 1000
         self.refresh_chunk_steps = 200
         self._cycle_anchor_step = 0
-        self._resource_chunk_plan: list[int] = []
-        self._hazard_chunk_plan: list[int] = []
+        self._chunks_per_cycle = max(
+            1,
+            self.refresh_cycle_steps // self.refresh_chunk_steps
+            if self.refresh_chunk_steps > 0
+            else 1,
+        )
         self._chunk_index = 0
+        self._resource_base_target = 0.0
+        self._hazard_base_target = 0.0
 
         # 经验点和危险点
         self.resources = Counter()
@@ -200,16 +206,54 @@ class GridEnvironment:
             counter.pop(pos, None)
             self.update_known_cell(pos)
 
+    def _compute_cell_density_adjustments(self) -> tuple[float, float]:
+        resource_multiplier = 1.0
+        hazard_multiplier = 1.0
+        baseline = self._cell_density_baseline
+        density = self._cell_density
+        if baseline is not None and baseline > 1e-6:
+            relative_delta = (density - baseline) / max(baseline, 1e-6)
+            relative_delta = max(-0.6, min(0.6, relative_delta))
+            adjust_strength = 0.5
+            resource_multiplier = 1.0 - adjust_strength * relative_delta
+            hazard_multiplier = 1.0 + adjust_strength * relative_delta
+            resource_multiplier = max(0.7, min(1.3, resource_multiplier))
+            hazard_multiplier = max(0.7, min(1.3, hazard_multiplier))
+        self._cell_adjust_resource = resource_multiplier
+        self._cell_adjust_hazard = hazard_multiplier
+        return resource_multiplier, hazard_multiplier
+
     def _distribute_chunk(self, exclude_positions: set | None = None):
-        if self._chunk_index >= len(self._resource_chunk_plan):
+        if self.refresh_chunk_steps <= 0:
+            return
+
+        if self._chunk_index >= self._chunks_per_cycle:
             return
 
         exclude_positions = set(exclude_positions or set())
         exclude_positions.add(tuple(self.agent_pos))
 
+        resource_multiplier, hazard_multiplier = self._compute_cell_density_adjustments()
+        adjusted_resource_target = int(round(self._resource_base_target * resource_multiplier))
+        adjusted_hazard_target = int(round(self._hazard_base_target * hazard_multiplier))
+
+        self._trim_points(self.resources, max(0, len(self.resources) - adjusted_resource_target))
+        self._trim_points(self.hazards, max(0, len(self.hazards) - adjusted_hazard_target))
+
+        remaining_chunks = max(1, self._chunks_per_cycle - self._chunk_index)
+
+        needed_resources = max(0, adjusted_resource_target - len(self.resources))
+        needed_hazards = max(0, adjusted_hazard_target - len(self.hazards))
+
+        base_res, rem_res = divmod(needed_resources, remaining_chunks)
+        base_haz, rem_haz = divmod(needed_hazards, remaining_chunks)
+
+        resources_to_spawn = base_res + (1 if rem_res > 0 else 0)
+        hazards_to_spawn = base_haz + (1 if rem_haz > 0 else 0)
+
         resource_blocked = exclude_positions | set(self.resources.keys())
         new_resources = self._sample_weighted_positions(
-            self._resource_chunk_plan[self._chunk_index],
+            resources_to_spawn,
             blocked=resource_blocked,
             frontier_weight=1.6,
             revisit_weight=1.0,
@@ -219,7 +263,7 @@ class GridEnvironment:
 
         hazard_blocked = exclude_positions | set(self.hazards.keys())
         new_hazards = self._sample_weighted_positions(
-            self._hazard_chunk_plan[self._chunk_index],
+            hazards_to_spawn,
             blocked=hazard_blocked,
             frontier_weight=2.2,
             revisit_weight=0.8,
@@ -258,8 +302,8 @@ class GridEnvironment:
         extra = min(80, max(((self.step_count - 1200) // 300), 0))
         base_resource_density = 0.18
         growth_factor = 0.75 + 0.45 * explored_ratio
-        resource_target = area * base_resource_density * growth_factor
-        resource_target += extra * (0.5 + 0.5 * success_ratio)
+        resource_target_base = area * base_resource_density * growth_factor
+        resource_target_base += extra * (0.5 + 0.5 * success_ratio)
 
         base_hazard_density = 0.22
         hazard_adjust = 1.0 - 0.6 * (0.5 - success_ratio)
@@ -267,37 +311,28 @@ class GridEnvironment:
         caution_factor = 0.9 + 0.2 * (1.0 - explored_ratio)
         hazard_density = base_hazard_density * hazard_adjust * caution_factor
         hazard_density = max(0.14, min(0.28, hazard_density))
-        hazard_target = area * hazard_density
-        hazard_target += extra * (0.6 + 0.4 * (1.0 - success_ratio))
+        hazard_target_base = area * hazard_density
+        hazard_target_base += extra * (0.6 + 0.4 * (1.0 - success_ratio))
 
-        resource_multiplier = 1.0
-        hazard_multiplier = 1.0
-        baseline = self._cell_density_baseline
-        density = self._cell_density
-        if baseline is not None and baseline > 1e-6:
-            relative_delta = (density - baseline) / max(baseline, 1e-6)
-            relative_delta = max(-0.6, min(0.6, relative_delta))
-            adjust_strength = 0.5
-            resource_multiplier = 1.0 - adjust_strength * relative_delta
-            hazard_multiplier = 1.0 + adjust_strength * relative_delta
-            resource_multiplier = max(0.7, min(1.3, resource_multiplier))
-            hazard_multiplier = max(0.7, min(1.3, hazard_multiplier))
-        self._cell_adjust_resource = resource_multiplier
-        self._cell_adjust_hazard = hazard_multiplier
+        resource_multiplier, hazard_multiplier = self._compute_cell_density_adjustments()
 
-        resource_target = int(resource_target * resource_multiplier)
-        hazard_target = int(hazard_target * hazard_multiplier)
+        resource_target = int(round(resource_target_base * resource_multiplier))
+        hazard_target = int(round(hazard_target_base * hazard_multiplier))
         resource_target = max(0, resource_target)
         hazard_target = max(0, hazard_target)
+
+        self._resource_base_target = max(0.0, resource_target_base)
+        self._hazard_base_target = max(0.0, hazard_target_base)
 
         self._trim_points(self.resources, max(0, len(self.resources) - resource_target))
         self._trim_points(self.hazards, max(0, len(self.hazards) - hazard_target))
 
-        to_add_res = max(0, resource_target - len(self.resources))
-        to_add_haz = max(0, hazard_target - len(self.hazards))
-
-        self._resource_chunk_plan = self._build_chunk_plan(to_add_res)
-        self._hazard_chunk_plan = self._build_chunk_plan(to_add_haz)
+        self._chunks_per_cycle = max(
+            1,
+            self.refresh_cycle_steps // self.refresh_chunk_steps
+            if self.refresh_chunk_steps > 0
+            else 1,
+        )
         self._chunk_index = 0
         self._cycle_anchor_step = step
 
@@ -516,8 +551,7 @@ class GridEnvironment:
         elif refresh_triggered and self.refresh_cycle_steps > 0:
             done = True
         elif not self.resources:
-            if self._chunk_index < len(self._resource_chunk_plan) or \
-               self._chunk_index < len(self._hazard_chunk_plan):
+            if self.refresh_chunk_steps > 0 and self._chunk_index < self._chunks_per_cycle:
                 self._distribute_chunk(exclude_positions={tuple(self.agent_pos)})
 
         return next_state, reward, done, {}
