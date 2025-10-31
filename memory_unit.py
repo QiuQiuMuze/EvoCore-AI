@@ -1,3 +1,5 @@
+"""Local replay buffer; clone-time memory fusion follows the 0.7/0.3 rule in docs/theory.md (Eq.\ (5))."""
+
 import random
 import torch
 import torch.nn.functional as F
