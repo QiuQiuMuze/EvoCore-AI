@@ -1,3 +1,5 @@
+"""Transformer logits consumed by the RL loss in docs/theory.md (Eq.\ (8)); entropy comes from the agent wrapper."""
+
 import torch
 import torch.nn as nn
 from typing import Optional
